@@ -1,8 +1,8 @@
 import {ethers} from "ethers";
 import {Conflux, format} from "js-conflux-sdk";
 import {gql, GraphQLClient} from "graphql-request";
-import { AbortController } from "node-abort-controller";
-import { formatsByCoinType } from '@web3identity/address-encoder';
+import {AbortController} from "node-abort-controller";
+import {formatsByCoinType} from '@web3identity/address-encoder';
 import {fmtAddr, StatApp} from "../../StatApp";
 import {abi as abiENSChecker} from "../abi/ENSChecker";
 import {abi as abiENS} from "../abi/ENS";
@@ -11,6 +11,9 @@ import {abi as abiBaseRegistrar} from "../abi/BaseRegistrar";
 import {abi as abiResolver} from "../abi/Resolver";
 import {abi as abiReverseRecords} from "../abi/ReverseRecords";
 import {CONST} from "../common/constant";
+import {ENS, NameTag} from "../../model/NameTag";
+import {Op, QueryTypes} from "sequelize";
+import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 
 const lodash = require('lodash');
 const CFX_COIN_TYPE = 503;
@@ -25,6 +28,8 @@ export class ENSCheckerQuery {
     protected baseRegistrar;
     protected reverseRecords;
     protected graphql;
+
+    private verifiedLabelTokens: Record<string, string> = {};
 
     public constructor(cfx: Conflux) {
         const config: ENSOptions | undefined = CONST.ENS[StatApp.networkId];
@@ -56,6 +61,8 @@ export class ENSCheckerQuery {
         this.baseRegistrar = this.cfx.Contract({abi: abiBaseRegistrar, address: config.baseRegistrar});
         this.reverseRecords = this.cfx.Contract({abi: abiReverseRecords, address: config.reverseRecords});
         this.graphql = new GraphQLClient(config.ensSubGraphUrl);
+
+        this.scheduleVerifiedLabelTokens().then();
     }
 
     public async addr(name: string) {
@@ -83,9 +90,38 @@ export class ENSCheckerQuery {
             return {};
         });
 
-        return Object.fromEntries(hexes
+        const ensMap = Object.fromEntries(hexes
             .map((hex, index) => names[index] ? [hex, {name: names[index]}] : undefined)
             .filter(Boolean)
+        );
+
+        const localMap = await ENS.findAll({where: {address: {[Op.in]: hexes}}, raw: true})
+            .then(list => Object.fromEntries(list.map(ens => [ens.address, {
+                name: ens.name,
+                censorStatus: ens.censorStatus
+            }])));
+
+        const toUpsert = [];
+        const toDelete = [];
+        for (const address of hexes) {
+            const name = ensMap[address]?.name;
+            const {name: localName, censorStatus} = localMap[address] || {};
+            if (name) {
+                if (!localName || localName !== name) {
+                    toUpsert.push({address, name, censorStatus: CONST.CENSOR_STATUS.TO_CENSOR, updatedAt: new Date()});
+                } else if (censorStatus === CONST.CENSOR_STATUS.REJECT || censorStatus === CONST.CENSOR_STATUS.SUSPECT) {
+                    delete ensMap[address];
+                }
+            } else if (localName) {
+                toDelete.push(address)
+            }
+        }
+
+        await ENS.bulkCreate(toUpsert, {updateOnDuplicate: ["name", "censorStatus", "updatedAt"]});
+        toDelete.length && await ENS.destroy({where: {address: {[Op.in]: toDelete}}});
+
+        return Object.fromEntries(
+            Object.entries(ensMap).filter(([hex]) => !this.verifiedLabelTokens[hex])
         );
     }
 
@@ -215,6 +251,37 @@ export class ENSCheckerQuery {
     private extractLabelFromName(name) {
         const index = name.lastIndexOf('.');
         return index >= 0 ? name.substr(0, index) : name;
+    }
+
+    private async scheduleVerifiedLabelTokens(interval: number = 1000 * 3) {
+        const that = this;
+
+        async function repeat() {
+            await that.loadVerifiedLabelTokens().catch(e => {
+                safeAddErrorLog('ENSCheckerQuery', 'loadVerifiedLabelTokens', e).then();
+                console.log('Schedule load verified label tokens fail', e);
+            });
+            setTimeout(repeat, interval);
+        }
+
+        repeat().then();
+        console.log(`[load_verified_label_tokens]schedule in ${interval / 1000}s interval`);
+    }
+
+    private async loadVerifiedLabelTokens() {
+        const nameTags = await NameTag.sequelize.query(`
+            select nt.base32,nt.labels 
+            from name_tag nt 
+            join token t on nt.base32 = t.base32 
+            where nt.labels like "%Verified%"
+        `, {
+            type: QueryTypes.SELECT,
+        });
+
+        this.verifiedLabelTokens = Object.fromEntries(nameTags
+            .filter((item: any) => item.labels.split(",").includes("Verified"))
+            .map((item: any) => [format.hexAddress(item.base32), item.labels])
+        );
     }
 }
 
