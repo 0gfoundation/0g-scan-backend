@@ -24,6 +24,7 @@ import {ContractQuery} from "./ContractQuery";
 import {CONST} from "./common/constant";
 import {splitFullyQualifiedName} from "./common/utils";
 import {ContractImpl} from "../model/ContractImpl";
+import {AddrAATx} from "../model/eip4337model";
 
 const lodash = require('lodash');
 const BigFixed = require('bigfixed');
@@ -96,6 +97,7 @@ export class AccountQuery {
                 nftAssetTab: 0,
                 minedBlockTab: 0,
                 authorizationsTab: 0,
+                aaTxTab: 0,
             };
         }
 
@@ -108,6 +110,7 @@ export class AccountQuery {
             nftAssetTab2: {model: Erc1155Data, field: 'addressId'},
             minedBlockTab: {model: FullMinerBlock, field: 'minerId'},
             authorizationsTab: {model: AuthAction, field: 'author', value: `0x${addressInfo.hex}`},
+            aaTxTab: {model: AddrAATx, field: 'senderId'},
         } as any;
 
         await Promise.all(Object.keys(tabSwitches).map((tab) => {
