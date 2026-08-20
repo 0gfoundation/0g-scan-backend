@@ -5,7 +5,7 @@ import {
 } from "../../model/Balance";
 import {StatApp} from "../../StatApp";
 import {DynamicBalanceModel} from "./DynamicBalanceModel";
-const BigFixed = require('bigfixed');
+import {formatUnits} from "ethers";
 
 /**
  * Scan all address's balance of configured contracts.
@@ -14,6 +14,7 @@ const BigFixed = require('bigfixed');
 export class BalanceWatcher{
     //
     static watcherMap = new Map<string, BalanceWatcher>()
+    static fractionDecimalsCache = new Map<string, number>()
     //
     public cfx: Conflux;
     protected fraction = BigInt(1e+18) // hard code, please search 1e+18 globally when fixing it.
@@ -49,7 +50,34 @@ export class BalanceWatcher{
     }
 
     public static drip2cfx(drip, fraction) {
-        return BigFixed(drip).div(BigFixed(fraction))
+        const decimals = BalanceWatcher.fractionToDecimals(fraction)
+        return formatUnits(BigInt(drip), decimals)
+    }
+
+    private static fractionToDecimals(fraction): number {
+        const key = BigInt(fraction).toString()
+        const cached = BalanceWatcher.fractionDecimalsCache.get(key)
+        if (cached !== undefined) {
+            return cached
+        }
+
+        let value = BigInt(key)
+        if (value <= 0n) {
+            throw new Error(`invalid fraction: ${fraction}`)
+        }
+
+        let decimals = 0
+        while (value > 1n && value % 10n === 0n) {
+            value /= 10n
+            decimals += 1
+        }
+
+        if (value !== 1n) {
+            throw new Error(`fraction must be power of 10: ${fraction}`)
+        }
+
+        BalanceWatcher.fractionDecimalsCache.set(key, decimals)
+        return decimals
     }
 }
 export class CfxWatcher extends BalanceWatcher{
@@ -60,13 +88,16 @@ export class CfxWatcher extends BalanceWatcher{
         try {
             // @ts-ignore
             const accountInfo:any = await this.cfx.getAccount(format.address(hex, StatApp.networkId))
-            if (accountInfo.balance < 1 && accountInfo.stakingBalance < 1) {
+            const balanceDrip = BigInt(accountInfo.balance)
+            const stakingDrip = BigInt(accountInfo.stakingBalance)
+
+            if (balanceDrip < 1n && stakingDrip < 1n) {
                 await CfxBalance.destroy({where: {addressId: addrId}})
                 return Promise.resolve();
             }
-            const cfx:any = BalanceWatcher.drip2cfx(accountInfo.balance, this.fraction)
-            const staking:any = BalanceWatcher.drip2cfx(accountInfo.stakingBalance, this.fraction)
-            const total = cfx.add(staking)
+            const cfx = BalanceWatcher.drip2cfx(balanceDrip, this.fraction)
+            const staking = BalanceWatcher.drip2cfx(stakingDrip, this.fraction)
+            const total = BalanceWatcher.drip2cfx(balanceDrip + stakingDrip, this.fraction)
             await CfxBalance.upsert({addressId: addrId, balance:cfx, stakingBalance: staking,
                 total: total})
         } catch (err) {
