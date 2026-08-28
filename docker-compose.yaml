@@ -2,112 +2,92 @@
 
 services:
   api:
-    image: scan:latest
-    command: npm run api
-    restart: unless-stopped
-    network_mode: host
+    image: node:20.11.1
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./scan-api/config/local.js:/scan/scan-api/config/local.js
-      - ./log/api:/scan/log
-      - ./cache:/scan/cache
+      - ./:/scan
+      - ./log/api:/log
+      - ./data/api:/data
+    network_mode: host
+    restart: always
+#    command: node /scan/scan-api
+    command: node /scan/scan-api/starter.js
   open_api:
-    image: scan:latest
-    command: npm run open_api
-    restart: unless-stopped
-    network_mode: host
+    image: node:20.11.1
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/scan
+    working_dir: /scan
+    network_mode: host
+    restart: always
+    command: node ./open-api/ApiServer.js
   compiler:
-    image: scan:latest
-    command: npm run compiler
-    restart: unless-stopped
-    network_mode: host
+    image: node:20.11.1
     volumes:
-      - ./log/compiler:/scan/log
-      - ./cache:/scan/cache
+      - ./:/scan
+      - ./log/compiler:/log
+      - ./data/compiler:/cache
+    network_mode: host
+    restart: always
+    command: node /scan/scan-compiler
   block:
-    image: scan:latest
-    command: npm run block
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/FullBlockSync.js
   token_transfer: # token transfer sync
-    image: scan:latest
-    command: npm run token_transfer
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/TokenTransferSync.js useConfigRpc -1 10000
   token_x: # token misc: holder, total supply; T3525; approval sync;
-    image: scan:latest
-    command: npm run token_x
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/TokenMiscSync.js
   cfx_transfer: # cfx transfer sync
-    image: scan:latest
-    command: npm run cfx_transfer
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/CfxTransferSync.js useConfigRpc -1 10000
   pos:
-    image: scan:latest
-    command: npm run pos
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/service/pos/PosSync.js
   epoch:
-    image: scan:latest
-    command: npm run epoch
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
-      - ./public:/scan/public
-      - ./public/images:/scan/public/images
+      - ./:/stat-root
+    command: node /stat-root/stat/FullEpochSync.js
   stat_task:
-    image: scan:latest
-    command: npm run stat_task
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/StatTask.js
   nft_meta:
-    image: scan:latest
-    command: npm run nft_meta
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/service/nftchecker/NftMetaStorage.js metadata
   prune:
-    image: scan:latest
-    command: npm run prune
-    restart: unless-stopped
+    image: node:20.11.1
     network_mode: host
+    restart: always
     volumes:
-      - ./stat/config/Prod.js:/scan/stat/config/Prod.js
-      - ./log:/scan/log
-      - ./cache:/scan/cache
+      - ./:/stat-root
+    command: node /stat-root/stat/service/prune/PruneService.js all 0

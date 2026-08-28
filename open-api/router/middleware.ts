@@ -8,6 +8,8 @@ import {KnownError} from "../common/RestTool";
 import {CODE_PARAMETER_ERROR, CODE_PARAMETER_ERROR_MSG, CODE_RATE_LIMITED} from "../common/Def";
 import {getClientIP} from "../../stat/router/RateLimiter";
 import {safeAddErrorLog} from "../../stat/monitor/ErrorMonitor";
+import {Errors} from "../../stat/service/common/LogicError";
+
 
 const yamljs = require('yamljs');
 const swStats = require('swagger-stats');
@@ -78,7 +80,7 @@ export async function handleException(ctx, next) {
             setBody(ctx, ctx.request.query, CODE_PARAMETER_ERROR, CODE_PARAMETER_ERROR_MSG)
             return
         }
-        if (err instanceof InvalidParamError) {
+        if (err instanceof InvalidParamError  || err instanceof Errors.ParameterError) {
             setBody(ctx, ctx.request.query, CODE_PARAMETER_ERROR, err.message)
             return
         }
@@ -88,6 +90,7 @@ export async function handleException(ctx, next) {
         }
         setBody(ctx, undefined, 500, err.toString())
         if (err.code == 500) {
+		err['url'] = ctx.request.url;
             safeAddErrorLog('open', `open-500-${err.message}`, err);
         }
         console.log(`api error ${ctx.request.url}`, err)

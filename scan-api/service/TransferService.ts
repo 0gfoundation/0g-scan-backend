@@ -45,6 +45,14 @@ export class TransferService {
   }
 
   async countAndList(options) {
+    const {
+      app: {tool},
+    } = this;	  
+    if (options.transferType === CONST.TRANSFER_TYPE.CFX) {
+      tool.checkExist(options, {
+        address: false, tokenId: false, tokenArray: false,
+      });
+    }	  
     let result;
 
     if (options.transactionHash !== undefined) {
