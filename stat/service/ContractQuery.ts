@@ -991,17 +991,33 @@ export class ContractQuery {
 
     _handleHttpError(url, error) {
         const err = new Error(error.message || 'HTTP request failed')
-        err['code'] = error.status
+        const responseStatus = error?.status || error?.response?.status
+        err['code'] = responseStatus
         err['stack'] = error.stack
         err['location'] = __filename
+        err['url'] = url
+
+        const responseBody = error?.response?.body || error?.response?.text
+        if (responseBody !== undefined) {
+            try {
+                const bodyText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody)
+                err['remoteResponseBody'] = bodyText.length > 1000 ? `${bodyText.substring(0, 1000)}...` : bodyText
+            } catch (e) {
+                err['remoteResponseBody'] = '[unserializable response body]'
+            }
+        }
+
+        if (error?.response?.headers) {
+            err['remoteResponseHeaders'] = error.response.headers
+        }
 
         if (err['code'] === 404) {
             return null
         }
 
-        if (err['code'] === 502 ||
-            err['code'] === 503 ||
-            err['code'] === undefined) {
+        if (err['code'] === undefined ||
+            (err['code'] >= 500 && err['code'] <= 504)) {
+            safeAddErrorLog('ContractQuery', 'contract-verification-http-5xx', err).then();
             console.log(`Business is busy, url ${url}`)
             return null
         }
