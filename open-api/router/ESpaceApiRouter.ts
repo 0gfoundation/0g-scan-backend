@@ -65,6 +65,14 @@ import {
     listCoreTransactionStat,
 } from "../service/OpenStatService";
 import {
+    getPartnerChainSummary,
+    getPartnerTvlSnapshot,
+    listPartnerChainMetrics,
+    listPartnerTvlHistory,
+    listPartnerContracts,
+    registerPartnerContracts,
+} from "../service/OpenPartnerChainService";
+import {
     calCount,
     checkPresent,
     mustBeAddressParamIfPresent, mustBeDateParamIfPresent,
@@ -1074,6 +1082,15 @@ export function registerRouter(router: Router) {
 
     // token
     router.get('/token/tokeninfos', listTokens);
+
+    // partner chain metrics (Solutions Hub). Envelope and date/amount
+    // conventions follow the Router's admin usage APIs, not the scan defaults.
+    router.get('/partner/chain-metrics', listPartnerChainMetrics);
+    router.get('/partner/chain-metrics/summary', getPartnerChainSummary);
+    router.get('/partner/tvl', getPartnerTvlSnapshot);
+    router.get('/partner/tvl/history', listPartnerTvlHistory);
+    router.get('/partner/contracts', listPartnerContracts);
+    router.post('/partner/contracts', registerPartnerContracts);
 
     registerDataApi(router)
 }
