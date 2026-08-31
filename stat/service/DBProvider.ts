@@ -83,7 +83,14 @@ import {ContractImpl} from "../model/ContractImpl";
 import {VerifiedContracts} from "../model/VerifiedContracts";
 import {initBlockWithdrawModel} from "../model/ZG";
 import {DailyGasStat} from "../model/DailyGasStat";
-import {DailyPartnerAddr, DailyPartnerStat, DailyPartnerTvl, Partner, PartnerContract} from "../model/PartnerChain";
+import {
+    DailyPartnerAddr,
+    DailyPartnerStat,
+    DailyPartnerTvl,
+    Partner,
+    PartnerAudit,
+    PartnerContract,
+} from "../model/PartnerChain";
 
 let conf
 export function createDB(config) {
@@ -224,6 +231,7 @@ export async function initPartialModel(sequelize) {
     DailyPartnerStat.register(sequelize)
     DailyPartnerAddr.register(sequelize)
     DailyPartnerTvl.register(sequelize)
+    PartnerAudit.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)
@@ -340,6 +348,12 @@ async function migDB(seq: Sequelize) {
     const traceCreateContract = TraceCreateContract.getTableName().toString();
     await changeColumnIfNecessary(qi, traceCreateContract, 'codeHash', {
         type: DataTypes.CHAR(66), allowNull: true,
+    });
+
+    // rate_key predates scopes and already exists, so sync() will not add this
+    const rateKey = RateKey.getTableName().toString();
+    await addColumnIfNotExistsV2(qi, rateKey, 'scope', {
+        type: DataTypes.STRING(255), allowNull: false, defaultValue: '',
     });
 
     const kv = KV.getTableName().toString();

@@ -266,3 +266,56 @@ export class DailyPartnerAddr extends Model<IDailyPartnerAddr> implements IDaily
         })
     }
 }
+
+export interface IPartnerAudit {
+    id?: number
+    action: string
+    sourceId: string
+    actor: string
+    rateKeyId: number
+    detail: string
+    ip: string
+    createdAt?: Date
+}
+
+/**
+ * Write-operation log for the partner registry.
+ *
+ * Attribution decides whose numbers a transaction lands in, so a change here
+ * moves figures that are reported to partners. Self-service registration makes
+ * that reachable by more than one operator, and this table is what makes an
+ * unexpected number traceable back to who changed what.
+ */
+export class PartnerAudit extends Model<IPartnerAudit> implements IPartnerAudit {
+    id?: number;
+    action: string;
+    sourceId: string;
+    actor: string;
+    rateKeyId: number;
+    detail: string;
+    ip: string;
+
+    static register(seq: Sequelize) {
+        PartnerAudit.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            action: {type: DataTypes.STRING(32), allowNull: false},
+            sourceId: {type: DataTypes.STRING(LEN_SOURCE_ID), allowNull: false},
+            // the key's remark, so the log stays readable without joining
+            actor: {type: DataTypes.STRING(128), allowNull: false, defaultValue: ''},
+            rateKeyId: {type: DataTypes.BIGINT, allowNull: false, defaultValue: 0},
+            detail: {type: DataTypes.STRING(1024), allowNull: false, defaultValue: ''},
+            ip: {type: DataTypes.STRING(64), allowNull: false, defaultValue: ''},
+        }, {
+            sequelize: seq,
+            tableName: 'partner_audit',
+            // created only, never updated
+            timestamps: true,
+            updatedAt: false,
+            indexes: [{
+                name: 'idx_sourceId_createdAt', fields: ['sourceId', {name: 'createdAt', order: 'DESC'}],
+            }, {
+                name: 'idx_createdAt', fields: [{name: 'createdAt', order: 'DESC'}],
+            }]
+        })
+    }
+}

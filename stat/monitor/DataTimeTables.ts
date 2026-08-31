@@ -60,6 +60,7 @@ export const DataTimeTableList = {
 	'ens': {ignore: true },
 	'nft_id': {ignore: true },
 	'rate_key': {ignore: true },
+	'partner_audit': {ignore: true },
 	'search_text': {ignore: true },
 	'stat_token_transfer': {ignore: true },
 	'token2': {ignore: true },

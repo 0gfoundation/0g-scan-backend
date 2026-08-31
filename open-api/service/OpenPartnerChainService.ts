@@ -1,5 +1,4 @@
 import {Op} from "sequelize";
-import {Errors} from "../../stat/service/common/LogicError";
 import {getAddrId, idHex40Map} from "../../stat/model/HexMap";
 import {
     DailyPartnerAddr,
@@ -8,9 +7,11 @@ import {
     LEN_SOURCE_ID,
     NATIVE_TOKEN_ID,
     Partner,
+    PartnerAudit,
     PartnerContract,
 } from "../../stat/model/PartnerChain";
 import {getPartnerTvl} from "../../stat/service/partner/PartnerTvl";
+import {PartnerParamError, principalOf} from "../router/partnerAuth";
 
 /**
  * Partner chain-metrics endpoints for the Solutions Hub dashboard.
@@ -35,8 +36,8 @@ function listBody(ctx, data: any[], extra: object = {}) {
     ctx.body = {object: 'list', ...extra, data};
 }
 
-function fail(code: string): never {
-    throw new Errors.ParameterError(code);
+function fail(code: string, message?: string): never {
+    throw new PartnerParamError(code, message);
 }
 
 /** YYYY-MM-DD -> UTC midnight. Both bounds or neither, per the Router's contract. */
@@ -368,6 +369,23 @@ export async function registerPartnerContracts(ctx) {
         });
         created.push({address, created: isNew});
     }
+
+    const who = principalOf(ctx);
+    await PartnerAudit.create({
+        action: 'register_contract',
+        sourceId,
+        actor: who.actor,
+        rateKeyId: who.rateKeyId,
+        detail: JSON.stringify({
+            addresses: created.map(c => c.address),
+            created: created.filter(c => c.created).length,
+            effective_from: effectiveFrom.toISOString(),
+        }).slice(0, 1024),
+        ip: who.ip,
+    }).catch(e => {
+        // the registration already happened; losing the log must not 500 the caller
+        console.log(`failed to write partner audit:`, e);
+    });
 
     listBody(ctx, created, {source_id: sourceId});
 }

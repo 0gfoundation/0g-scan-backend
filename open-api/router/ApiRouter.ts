@@ -81,6 +81,7 @@ import {
     listPartnerContracts,
     registerPartnerContracts,
 } from "../service/OpenPartnerChainService";
+import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAuth";
 import {mustBeAddressParamIfPresent,} from "../../stat/service/common/utils";
 import {
     checkApiKey,
@@ -241,12 +242,14 @@ function registerRouter(router: Router) {
 
     // partner chain metrics (Solutions Hub). Envelope and date/amount
     // conventions follow the Router's admin usage APIs, not the scan defaults.
-    router.get('/partner/chain-metrics', listPartnerChainMetrics);
-    router.get('/partner/chain-metrics/summary', getPartnerChainSummary);
-    router.get('/partner/tvl', getPartnerTvlSnapshot);
-    router.get('/partner/tvl/history', listPartnerTvlHistory);
-    router.get('/partner/contracts', listPartnerContracts);
-    router.post('/partner/contracts', registerPartnerContracts);
+    const partnerRead = requireScope(SCOPE_PARTNER_READ);
+    const partnerWrite = requireScope(SCOPE_PARTNER_WRITE);
+    router.get('/partner/chain-metrics', partnerRead, listPartnerChainMetrics);
+    router.get('/partner/chain-metrics/summary', partnerRead, getPartnerChainSummary);
+    router.get('/partner/tvl', partnerRead, getPartnerTvlSnapshot);
+    router.get('/partner/tvl/history', partnerRead, listPartnerTvlHistory);
+    router.get('/partner/contracts', partnerRead, listPartnerContracts);
+    router.post('/partner/contracts', partnerWrite, registerPartnerContracts);
 
     registerDataApi(router)
 }
