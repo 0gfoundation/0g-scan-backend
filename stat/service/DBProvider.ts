@@ -83,6 +83,7 @@ import {ContractImpl} from "../model/ContractImpl";
 import {VerifiedContracts} from "../model/VerifiedContracts";
 import {initBlockWithdrawModel} from "../model/ZG";
 import {DailyGasStat} from "../model/DailyGasStat";
+import {DailyPartnerAddr, DailyPartnerStat, DailyPartnerTvl, Partner, PartnerContract} from "../model/PartnerChain";
 
 let conf
 export function createDB(config) {
@@ -216,6 +217,13 @@ export async function initPartialModel(sequelize) {
     NameTag.register(sequelize)
     VoteParams.register(sequelize)
     DailyBurntFeeStat.register(sequelize)
+    // partner chain metrics: registered in the partial set so the open-api
+    // process can serve them without pulling in the full sync model graph
+    Partner.register(sequelize)
+    PartnerContract.register(sequelize)
+    DailyPartnerStat.register(sequelize)
+    DailyPartnerAddr.register(sequelize)
+    DailyPartnerTvl.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)
