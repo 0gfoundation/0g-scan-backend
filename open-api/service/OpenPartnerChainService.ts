@@ -11,6 +11,7 @@ import {
     PartnerContract,
 } from "../../stat/model/PartnerChain";
 import {getPartnerTvl} from "../../stat/service/partner/PartnerTvl";
+import {ADDR_ROSTER_KEEP_DAYS} from "../../stat/service/partner/PartnerChainStat";
 import {PartnerParamError, principalOf} from "../router/partnerAuth";
 
 /**
@@ -83,6 +84,18 @@ function parseSourceIds(query, {required = false} = {}): string[] {
     return ids;
 }
 
+/**
+ * Earliest day the address roster still holds. Windows older than this can only
+ * be answered partially, which callers must be told about rather than left to
+ * infer from a number that looks complete.
+ */
+function rosterEarliestDay(): Date {
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() - ADDR_ROSTER_KEEP_DAYS);
+    return d;
+}
+
 function dayString(v: Date | string): string {
     return (v instanceof Date ? v.toISOString() : new Date(v).toISOString()).slice(0, 10);
 }
@@ -135,28 +148,56 @@ export async function listPartnerChainMetrics(ctx) {
 
 /**
  * GET /partner/chain-metrics/summary
- *   period      7d | 30d | 90d | all   (default 30d)
- *   source_id   optional filter, comma batch
+ *   period                 7d | 30d | 90d | all   (default 30d)
+ *   start_date / end_date  YYYY-MM-DD UTC inclusive, as an alternative to period
+ *   source_id              optional filter, comma batch
  *
- * One row per partner over the window, plus a distinct active-address count
- * that is computed from the daily roster -- per-day counts cannot be summed.
+ * One row per partner over the window. `active_addresses` is a distinct count
+ * over the whole window, which is why this endpoint exists at all -- it cannot
+ * be recomputed from the per-day series, since daily counts do not sum.
+ *
+ * That count is served from a roster kept for ADDR_ROSTER_KEEP_DAYS, so a
+ * window reaching further back is answered from partial data. Rather than
+ * quietly under-report, such a response carries
+ * `active_addresses_partial: true` along with the earliest date it does cover.
  */
 export async function getPartnerChainSummary(ctx) {
     const query = ctx.request.query;
     const sourceIds = parseSourceIds(query);
-    const period = (query.period || '30d').toString();
-    const days = {'7d': 7, '30d': 30, '90d': 90, 'all': 0}[period];
-    if (days === undefined) {
-        fail('invalid_period');
+    const {from: explicitFrom, to: explicitTo} = parseDateRange(query);
+
+    let period: string;
+    let from: Date = null;
+    let to: Date = null;
+
+    if (explicitFrom) {
+        // both given at once is ambiguous, and guessing which one the caller
+        // meant would silently return a window they did not ask for
+        if (query.period) {
+            fail('period_with_date_range',
+                'Send either `period` or a start_date/end_date pair, not both.');
+        }
+        period = 'custom';
+        from = explicitFrom;
+        to = explicitTo;
+    } else {
+        period = (query.period || '30d').toString();
+        const days = {'7d': 7, '30d': 30, '90d': 90, 'all': 0}[period];
+        if (days === undefined) {
+            fail('invalid_period');
+        }
+        if (days) {
+            from = new Date();
+            from.setUTCHours(0, 0, 0, 0);
+            from.setUTCDate(from.getUTCDate() - days);
+        }
     }
 
     const where: any = {};
-    let from: Date = null;
-    if (days) {
-        from = new Date();
-        from.setUTCHours(0, 0, 0, 0);
-        from.setUTCDate(from.getUTCDate() - days);
-        where.statTime = {[Op.gte]: from};
+    if (from || to) {
+        where.statTime = {};
+        from && (where.statTime[Op.gte] = from);
+        to && (where.statTime[Op.lt] = to);
     }
     if (sourceIds.length) {
         where.sourceId = {[Op.in]: sourceIds};
@@ -188,7 +229,12 @@ export async function getPartnerChainSummary(ctx) {
         }
     }
 
-    const activeMap = await distinctActiveAddresses(sourceIds, from);
+    const activeMap = await distinctActiveAddresses(sourceIds, from, to);
+
+    // `all`, or any window starting before the roster's horizon, is counted from
+    // less data than the caller asked for
+    const rosterFrom = rosterEarliestDay();
+    const activePartial = !from || from.getTime() < rosterFrom.getTime();
     const data = [...agg.values()].map(e => {
         const total = e.tx_success + e.tx_failed;
         return {
@@ -200,22 +246,31 @@ export async function getPartnerChainSummary(ctx) {
             gas_fee: e.gas_fee.toString(),
             gas_fee_failed: e.gas_fee_failed.toString(),
             active_addresses: activeMap.get(e.source_id) || 0,
+            active_addresses_partial: activePartial,
             tx_success_cumulative: e.tx_success_cumulative,
             gas_fee_cumulative: e.gas_fee_cumulative,
         };
     }).sort((a, b) => b.tx_success - a.tx_success);
 
-    listBody(ctx, data, {period});
+    listBody(ctx, data, {
+        period,
+        start_date: from ? dayString(from) : null,
+        // `to` is the exclusive bound; report the inclusive day the caller asked for
+        end_date: to ? dayString(new Date(to.getTime() - 86400_000)) : null,
+        active_addresses_covered_from: dayString(activePartial ? rosterFrom : from),
+    });
 }
 
 /** distinct addresses per partner over a window, from the daily roster */
-async function distinctActiveAddresses(sourceIds: string[], from: Date): Promise<Map<string, number>> {
+async function distinctActiveAddresses(sourceIds: string[], from: Date, to: Date): Promise<Map<string, number>> {
     const where: any = {};
     if (sourceIds.length) {
         where.sourceId = {[Op.in]: sourceIds};
     }
-    if (from) {
-        where.statTime = {[Op.gte]: from};
+    if (from || to) {
+        where.statTime = {};
+        from && (where.statTime[Op.gte] = from);
+        to && (where.statTime[Op.lt] = to);
     }
     const rows: any[] = await DailyPartnerAddr.findAll({
         attributes: [
