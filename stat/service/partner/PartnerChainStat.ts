@@ -1,7 +1,7 @@
 import {Op, QueryTypes} from "sequelize";
 import {FullTransaction} from "../../model/FullBlock";
 import {DailyPartnerAddr, DailyPartnerStat, PartnerContract} from "../../model/PartnerChain";
-import {fmtDtUTC, sqlLogFn} from "../../model/Utils";
+import {sqlLogFn} from "../../model/Utils";
 
 /**
  * Per-day aggregation of partner on-chain activity.
@@ -27,6 +27,20 @@ export const KEY_PARTNER_STAT_DAY = "KEY_PARTNER_STAT_DAY";
  * Keep enough headroom above the dashboard's 30d window to allow longer ones.
  */
 export const ADDR_ROSTER_KEEP_DAYS = 120;
+
+/**
+ * A UTC instant as a MySQL DATETIME literal.
+ *
+ * Deliberately not `fmtDtUTC`, which appends ` +00:00`. MySQL tolerates that
+ * suffix when coercing a string in a WHERE comparison -- which is the only way
+ * every other stat module uses `fmtDtUTC` -- but rejects it with
+ * ER_TRUNCATED_WRONG_VALUE when the value is written into a DATETIME column.
+ * Here the same string is both inserted as `statTime` and compared against
+ * `full_tx.createdAt`, so it has to be valid in both positions.
+ */
+function mysqlDtUTC(dt: Date): string {
+    return dt.toISOString().replace('T', ' ').replace(/\..*$/, '');
+}
 
 function rosterCutoff(now = new Date()): Date {
     const d = new Date(now);
@@ -106,8 +120,8 @@ export async function statPartnerDay(dayStart: Date, dayEnd: Date): Promise<stri
         return [];
     }
 
-    const begin = fmtDtUTC(dayStart);
-    const end = fmtDtUTC(dayEnd);
+    const begin = mysqlDtUTC(dayStart);
+    const end = mysqlDtUTC(dayEnd);
     const replacements = [begin, begin, end];
 
     await DailyPartnerStat.sequelize.query(sqlStat(), {
