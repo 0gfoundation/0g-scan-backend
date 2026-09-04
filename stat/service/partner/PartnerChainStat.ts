@@ -35,8 +35,6 @@ function rosterCutoff(now = new Date()): Date {
     return d;
 }
 
-const T_FULL_TX = FullTransaction.getTableName();
-
 /** joins a day of full_tx onto the contracts that were registered that day */
 const JOIN_ON = `
     join partner_contract pc
@@ -44,7 +42,22 @@ const JOIN_ON = `
       and t.createdAt >= pc.effectiveFrom
       and (pc.effectiveTo is null or t.createdAt < pc.effectiveTo)`;
 
-const SQL_STAT = `
+/**
+ * Both statements are assembled on first use rather than at import time.
+ * `getTableName()` reads `Model.sequelize`, which is only set once `register()`
+ * has run, while this module is loaded through StatTask's import chain long
+ * before `initModel()`. Evaluating it at module scope throws
+ * `Cannot read properties of undefined (reading 'getQueryInterface')` and takes
+ * the process down before it can connect to anything.
+ */
+let sqlStatCache: string = null;
+let sqlAddrRosterCache: string = null;
+
+function sqlStat(): string {
+    if (sqlStatCache !== null) {
+        return sqlStatCache;
+    }
+    sqlStatCache = `
 insert into ${DailyPartnerStat.getTableName()}
     (sourceId, statTime, txSuccess, txFailed, gasFeeSum, gasFeeFailed,
      activeAddr, nativeValue, createdAt, updatedAt)
@@ -57,7 +70,7 @@ select pc.sourceId,
        count(distinct case when t.status = 0 then t.fromId end) as activeAddr,
        sum(case when t.status = 0 then t.dripValue else 0 end) as nativeValue,
        now(), now()
-from ${T_FULL_TX} t ${JOIN_ON}
+from ${FullTransaction.getTableName()} t ${JOIN_ON}
 where t.createdAt >= ? and t.createdAt < ?
 group by pc.sourceId
 on duplicate key update
@@ -65,12 +78,20 @@ on duplicate key update
     gasFeeSum    = values(gasFeeSum),    gasFeeFailed = values(gasFeeFailed),
     activeAddr   = values(activeAddr),   nativeValue  = values(nativeValue),
     updatedAt    = values(updatedAt)`;
+    return sqlStatCache;
+}
 
-const SQL_ADDR_ROSTER = `
+function sqlAddrRoster(): string {
+    if (sqlAddrRosterCache !== null) {
+        return sqlAddrRosterCache;
+    }
+    sqlAddrRosterCache = `
 insert ignore into ${DailyPartnerAddr.getTableName()} (sourceId, statTime, addr)
 select distinct pc.sourceId, ?, t.fromId
-from ${T_FULL_TX} t ${JOIN_ON}
+from ${FullTransaction.getTableName()} t ${JOIN_ON}
 where t.createdAt >= ? and t.createdAt < ? and t.status = 0`;
+    return sqlAddrRosterCache;
+}
 
 /**
  * Aggregate one UTC day. Idempotent: re-running overwrites that day's rows,
@@ -89,14 +110,14 @@ export async function statPartnerDay(dayStart: Date, dayEnd: Date): Promise<stri
     const end = fmtDtUTC(dayEnd);
     const replacements = [begin, begin, end];
 
-    await DailyPartnerStat.sequelize.query(SQL_STAT, {
+    await DailyPartnerStat.sequelize.query(sqlStat(), {
         type: QueryTypes.INSERT, replacements, benchmark: true,
         logging: sqlLogFn(`[partner-stat]${begin}`),
     });
     // Skip days that a later prune would delete anyway -- a deep backfill would
     // otherwise write tens of millions of roster rows just to drop them.
     if (dayStart.getTime() >= rosterCutoff().getTime()) {
-        await DailyPartnerAddr.sequelize.query(SQL_ADDR_ROSTER, {
+        await DailyPartnerAddr.sequelize.query(sqlAddrRoster(), {
             type: QueryTypes.INSERT, replacements, benchmark: true,
             logging: sqlLogFn(`[partner-addr]${begin}`),
         });
