@@ -801,6 +801,9 @@ async function getCfxSupply(ctx) {
     setBody(ctx, totalEspaceTokens);
 }
 
+// `cfxbtc` / `cfxusd` are 0G prices despite the name. Downstream services read these
+// keys, so they are kept as they are: do not rename them to 0g* while renaming display
+// text elsewhere. Same for the `cfxprice` action that routes here.
 async function getCfxPrice(ctx) {
     setBody(ctx, {
         cfxbtc: `${TokenQuery.wrappedCFX.price / TokenQuery.wrappedBTC.price}`,
@@ -846,6 +849,9 @@ async function listDailyTx(ctx) {
     }));
 }
 
+// `transactionFee_CFX` carries a fee in whole 0G despite the name. Downstream services
+// read this key, so it is kept as it is: do not rename it to transactionFee_0G while
+// renaming display text elsewhere.
 async function listDailyTxnFee(ctx) {
     return listEvmTransactionStat(ctx, (item: any) => ({
         transactionFee_CFX: new Drip(item.gasFee).toCFX(),

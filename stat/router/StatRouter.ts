@@ -320,6 +320,10 @@ function addRoute(router: Router<any, {}>, statApp: StatApp) {
         ctx.body = statApp.txnQuery.topGasUsedCache[span||'24h'];
     })
 
+    // 'cfx' here is the native token, so 0G. The path and the `type` values below
+    // ('rank_address_by_cfx', 'rank_address_by_total_cfx', 'TOP_CFX_HOLD' in ApiDef) are
+    // the API contract and downstream services send them, so they are kept as they are.
+    // Only text a user reads says 0G -- see nativeTokenSymbol() in service/common/utils.
     router.get('/top-cfx-holder', async (ctx)=>{
         const useRemote = await KV.getString(USE_REMOTE_STAT, "");
         if (useRemote) {
