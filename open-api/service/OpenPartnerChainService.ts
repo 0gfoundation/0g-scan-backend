@@ -1,5 +1,5 @@
 import {Op} from "sequelize";
-import {getAddrId, idHex40Map} from "../../stat/model/HexMap";
+import {getAddrId, hex40IdMap, idHex40Map} from "../../stat/model/HexMap";
 import {
     DailyPartnerAddr,
     DailyPartnerStat,
@@ -32,9 +32,13 @@ import {PartnerParamError, principalOf} from "../router/partnerAuth";
 
 const MAX_SOURCE_IDS = 100;
 const MAX_RANGE_DAYS = 400;
+/** batch cap for address parameters, matching the admin usage APIs */
+const MAX_ADDRESSES = 100;
+const DEFAULT_LIMIT = 1000;
+const MAX_LIMIT = 1000;
 
 function listBody(ctx, data: any[], extra: object = {}) {
-    ctx.body = {object: 'list', ...extra, data};
+    ctx.body = {object: 'list', ...extra, count: data.length, data};
 }
 
 function fail(code: string, message?: string): never {
@@ -82,6 +86,50 @@ function parseSourceIds(query, {required = false} = {}): string[] {
         fail('invalid_source_id');
     }
     return ids;
+}
+
+/** `''` (a bare `?limit=`) counts as absent rather than as zero. */
+function optionalNumber(v: any): number | undefined {
+    const raw = (v ?? '').toString().trim();
+    return raw === '' ? undefined : Number(raw);
+}
+
+/**
+ * `limit` / `offset`, following the admin usage APIs' envelope.
+ *
+ * The default is the maximum rather than a small page size on purpose: these
+ * endpoints returned complete result sets before paging existed, so a low
+ * default would silently truncate every query already in use. `total` in the
+ * envelope is what makes any truncation visible.
+ */
+function parsePaging(query): {limit: number, offset: number} {
+    const limit = optionalNumber(query.limit) ?? DEFAULT_LIMIT;
+    const offset = optionalNumber(query.offset) ?? 0;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+        fail('invalid_limit', `\`limit\` must be an integer between 1 and ${MAX_LIMIT}.`);
+    }
+    if (!Number.isInteger(offset) || offset < 0) {
+        fail('invalid_offset', '`offset` must be a non-negative integer.');
+    }
+    return {limit, offset};
+}
+
+/** `address` as a single value or a comma batch, normalised to lowercase. */
+function parseAddresses(query): string[] {
+    const raw = (query.address || '').trim();
+    if (!raw) {
+        return [];
+    }
+    const list = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (list.length > MAX_ADDRESSES) {
+        fail('too_many_addresses', `At most ${MAX_ADDRESSES} addresses per request.`);
+    }
+    for (const a of list) {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(a)) {
+            fail(`invalid_address:${a}`);
+        }
+    }
+    return list.map(a => a.toLowerCase());
 }
 
 /**
@@ -140,10 +188,11 @@ export async function listPartnerChainMetrics(ctx) {
         where.statTime = {[Op.gte]: from, [Op.lt]: to};
     }
 
-    const rows = await DailyPartnerStat.findAll({
-        where, order: [['statTime', 'asc'], ['sourceId', 'asc']], raw: true,
+    const {limit, offset} = parsePaging(query);
+    const {rows, count} = await DailyPartnerStat.findAndCountAll({
+        where, order: [['statTime', 'asc'], ['sourceId', 'asc']], raw: true, limit, offset,
     });
-    listBody(ctx, rows.map(toRow));
+    listBody(ctx, rows.map(toRow), {total: count, limit, offset});
 }
 
 /**
@@ -252,12 +301,18 @@ export async function getPartnerChainSummary(ctx) {
         };
     }).sort((a, b) => b.tx_success - a.tx_success);
 
-    listBody(ctx, data, {
+    // one row per partner, so paging applies to the aggregate rather than to
+    // the daily rows it was built from
+    const {limit, offset} = parsePaging(query);
+    listBody(ctx, data.slice(offset, offset + limit), {
         period,
         start_date: from ? dayString(from) : null,
         // `to` is the exclusive bound; report the inclusive day the caller asked for
         end_date: to ? dayString(new Date(to.getTime() - 86400_000)) : null,
         active_addresses_covered_from: dayString(activePartial ? rosterFrom : from),
+        total: data.length,
+        limit,
+        offset,
     });
 }
 
@@ -320,8 +375,10 @@ export async function listPartnerTvlHistory(ctx) {
     if (from) {
         where.statTime = {[Op.gte]: from, [Op.lt]: to};
     }
-    const rows = await DailyPartnerTvl.findAll({
-        where, order: [['statTime', 'asc'], ['sourceId', 'asc'], ['tokenId', 'asc']], raw: true,
+    const {limit, offset} = parsePaging(query);
+    const {rows, count} = await DailyPartnerTvl.findAndCountAll({
+        where, order: [['statTime', 'asc'], ['sourceId', 'asc'], ['tokenId', 'asc']],
+        raw: true, limit, offset,
     });
     listBody(ctx, rows.map((r: any) => ({
         source_id: r.sourceId,
@@ -335,24 +392,59 @@ export async function listPartnerTvlHistory(ctx) {
         price_usd: r.priceUsd == null ? null : String(r.priceUsd),
         value_usd_micro: r.valueUsdMicro == null ? null : intString(r.valueUsdMicro),
         price_source: r.priceSource || '',
-    })));
+    })), {total: count, limit, offset});
 }
 
 /**
  * GET /partner/contracts
- *   source_id  optional filter
+ *   source_id  optional filter, comma batch
+ *   address    optional filter, comma batch (max 100) -- reverse lookup
  *
  * The registry is the only place a partner is linked to on-chain contracts --
  * the Router side attributes by request header and knows nothing about them.
+ *
+ * Addresses that resolve to no mapping are reported in `unmatched` rather than
+ * dropped, so a caller can tell "not registered to any partner" apart from
+ * "registered but has no metrics yet". An address the indexer has never seen
+ * lands there too: for this endpoint that is a legitimate answer, not the
+ * `unknown_address` error the write path returns.
  */
 export async function listPartnerContracts(ctx) {
-    const sourceIds = parseSourceIds(ctx.request.query);
+    const query = ctx.request.query;
+    const sourceIds = parseSourceIds(query);
+    const addresses = parseAddresses(query);
     const where: any = {};
     if (sourceIds.length) {
         where.sourceId = {[Op.in]: sourceIds};
     }
-    const rows = await PartnerContract.findAll({
-        where, order: [['sourceId', 'asc'], ['id', 'asc']], raw: true,
+    const {limit, offset} = parsePaging(query);
+    let unmatched: string[] = [];
+    if (addresses.length) {
+        // one batched IN, not a lookup per address
+        const idByHex = await hex40IdMap(addresses);
+        // never seen on chain at all
+        unmatched = addresses.filter(a => !idByHex.has(a.slice(2)));
+        const ids = [...idByHex.values()];
+        if (!ids.length) {
+            // no id to match on; skip the query rather than emitting `IN ()`
+            listBody(ctx, [], {total: 0, limit, offset, unmatched});
+            return;
+        }
+        // known on chain but mapped to no partner. Resolved before paging so the
+        // answer does not change with `limit`.
+        const mapped = await PartnerContract.findAll({
+            where: {hex40id: {[Op.in]: ids}}, attributes: ['hex40id'], raw: true,
+        });
+        const mappedIds = new Set(mapped.map((r: any) => String(r.hex40id)));
+        for (const [hex, id] of idByHex) {
+            if (!mappedIds.has(String(id))) {
+                unmatched.push(`0x${hex}`);
+            }
+        }
+        where.hex40id = {[Op.in]: ids};
+    }
+    const {rows, count} = await PartnerContract.findAndCountAll({
+        where, order: [['sourceId', 'asc'], ['id', 'asc']], raw: true, limit, offset,
     });
     // BIGINT ids come back as string or number depending on the driver path,
     // so key the lookup on the string form rather than trusting either.
@@ -363,7 +455,7 @@ export async function listPartnerContracts(ctx) {
         address: byId.get(String(r.hex40id)) || '',
         effective_from: new Date(r.effectiveFrom).toISOString(),
         effective_to: r.effectiveTo ? new Date(r.effectiveTo).toISOString() : null,
-    })));
+    })), {total: count, limit, offset, ...(addresses.length ? {unmatched} : {})});
 }
 
 /**
