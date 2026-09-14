@@ -30,13 +30,21 @@ import {CONST} from "./common/constant";
  * but on 0G those last two terms already sit inside `balance(0x0)`: staking burns on the
  * eSpace side into 0x0 and mints on the consensus side, unstaking emits a block withdrawal
  * and burns on the consensus side. So `balance(0x0)` is the cumulative amount ever staked
- * and `totalIssued` over-reports the real supply by exactly that balance. Subtracting it
- * brings the denominator back to the genesis supply, which is the same number
- * `scan-api/router/supply.ts` publishes as `/supply/total`.
+ * and `totalIssued` counts part of it a second time.
+ *
+ * Only the part that actually came back -- as a block withdrawal or as consensus layer
+ * balance -- is the double count, so that is all we take off. The remainder of
+ * `balance(0x0)` was burned and credited nowhere yet (pending activation, slashed, or not
+ * reported by `effective_balance`), and subtracting it would remove supply that was never
+ * added. This also keeps the denominator usable where the block withdrawal sync is not
+ * running or `validatorRpc` is unset and both terms read 0, instead of reporting shares
+ * above 100%.
  */
 export function rankTotalSupplyDrip(supplyInfo: any): bigint | undefined {
     if (supplyInfo?.calculateEvmPosSupply) {
-        return BigInt(supplyInfo.totalIssued) - BigInt(supplyInfo.nullAddressBalance || 0);
+        const staked = BigInt(supplyInfo.nullAddressBalance || 0);
+        const credited = BigInt(supplyInfo.sumBlockWithdrawal || 0) + BigInt(supplyInfo.totalStakes || 0);
+        return BigInt(supplyInfo.totalIssued) - (credited < staked ? credited : staked);
     }
     // Conflux eSpace, or any node that answers cfx_getSupplyInfo itself.
     const total = supplyInfo?.totalEspaceTokens || supplyInfo?.totalCirculating;
