@@ -1,6 +1,7 @@
 import {QueryTypes} from "sequelize";
 import {scientificToBigInt} from "../watcher/BalanceService";
 import {DailyPartnerTvl, NATIVE_TOKEN_ID} from "../../model/PartnerChain";
+import {nativeTokenSymbol} from "../common/utils";
 
 /**
  * Current TVL snapshot per partner: what its registered contracts hold right now.
@@ -245,7 +246,11 @@ export async function snapshotPartnerTvl(sequelize, statTime: Date, now = new Da
             rows.push({
                 sourceId: p.source_id, statTime, asOf: now,
                 tokenId: NATIVE_TOKEN_ID, amount: p.native_amount, decimals: 18,
-                symbol: '', priceUsd: null, valueUsdMicro: null, priceSource: '',
+                // `is_native` already identifies this row, but the history
+                // endpoint flattens native and token holdings into one shape, so
+                // a blank symbol leaves the most common row unlabelled
+                symbol: nativeTokenSymbol(),
+                priceUsd: null, valueUsdMicro: null, priceSource: '',
             });
         }
         for (const t of p.tokens) {
