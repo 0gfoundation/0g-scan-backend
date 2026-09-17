@@ -1,5 +1,5 @@
 import {Op} from "sequelize";
-import {getAddrId, hex40IdMap, idHex40Map} from "../../stat/model/HexMap";
+import {hex40IdMap, idHex40Map} from "../../stat/model/HexMap";
 import {
     DailyPartnerAddr,
     DailyPartnerStat,
@@ -34,6 +34,12 @@ const MAX_SOURCE_IDS = 100;
 const MAX_RANGE_DAYS = 400;
 /** batch cap for address parameters, matching the admin usage APIs */
 const MAX_ADDRESSES = 100;
+/**
+ * Write batches get their own, larger cap: registration is expected to be
+ * driven by automation on the caller's side, while the read filter stays at the
+ * admin APIs' 100 for consistency with them.
+ */
+const MAX_REGISTER_ADDRESSES = 500;
 const DEFAULT_LIMIT = 1000;
 const MAX_LIMIT = 1000;
 
@@ -114,22 +120,34 @@ function parsePaging(query): {limit: number, offset: number} {
     return {limit, offset};
 }
 
+/**
+ * Shape and batch-size validation, shared by the read filter and the write path.
+ *
+ * Rejects the whole list before anything is looked up or written: a caller
+ * sending one malformed address in a batch of 500 should get a 400 naming it,
+ * not a partial result.
+ */
+function validateAddressList(list: any[], cap: number): string[] {
+    if (list.length > cap) {
+        fail('too_many_addresses', `At most ${cap} addresses per request.`);
+    }
+    for (const a of list) {
+        // a blank or malformed entry would resolve to no id and be reported as
+        // `unknown_address`, which misdescribes it -- reject the shape up front
+        if (typeof a !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(a.trim())) {
+            fail(`invalid_address:${a}`);
+        }
+    }
+    return list.map(a => a.trim().toLowerCase());
+}
+
 /** `address` as a single value or a comma batch, normalised to lowercase. */
 function parseAddresses(query): string[] {
     const raw = (query.address || '').trim();
     if (!raw) {
         return [];
     }
-    const list = raw.split(',').map(s => s.trim()).filter(Boolean);
-    if (list.length > MAX_ADDRESSES) {
-        fail('too_many_addresses', `At most ${MAX_ADDRESSES} addresses per request.`);
-    }
-    for (const a of list) {
-        if (!/^0x[0-9a-fA-F]{40}$/.test(a)) {
-            fail(`invalid_address:${a}`);
-        }
-    }
-    return list.map(a => a.toLowerCase());
+    return validateAddressList(raw.split(',').map(s => s.trim()).filter(Boolean), MAX_ADDRESSES);
 }
 
 /**
@@ -472,50 +490,69 @@ export async function registerPartnerContracts(ctx) {
     if (!sourceId || sourceId.length > LEN_SOURCE_ID) {
         fail('invalid_source_id');
     }
-    const addresses: string[] = Array.isArray(body.addresses) ? body.addresses : [];
-    if (!addresses.length) {
+    const rawList: any[] = Array.isArray(body.addresses) ? body.addresses : [];
+    if (!rawList.length) {
         fail('missing_addresses');
     }
+    // duplicates within one batch would otherwise be looked up and counted twice
+    const addresses = [...new Set(validateAddressList(rawList, MAX_REGISTER_ADDRESSES))];
     const effectiveFrom = body.effective_from
         ? new Date(body.effective_from) : new Date('1970-01-01T00:00:00.000Z');
     if (isNaN(effectiveFrom.getTime())) {
         fail('invalid_date');
     }
 
-    const resolved: {address: string, hex40id: number}[] = [];
-    for (const address of addresses) {
-        // getAddrId falls back to its own sentinel on a blank input, which would
-        // sail past the !hex40id check below, so reject the shape up front
-        if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address.trim())) {
-            fail(`invalid_address:${address}`);
-        }
-        const hex40id = await getAddrId(address.trim().toLowerCase(), undefined);
-        if (!hex40id || hex40id < 0) {
+    // one query for the batch rather than a lookup per address
+    const idByHex = await hex40IdMap(addresses);
+    const resolved = addresses.map(address => {
+        const hex40id = idByHex.get(address.slice(2));
+        if (!hex40id) {
             // an address the indexer has never seen cannot be attributed
             fail(`unknown_address:${address}`);
         }
-        resolved.push({address: address.trim().toLowerCase(), hex40id});
-    }
-
-    await Partner.findOrCreate({
-        where: {sourceId}, defaults: {sourceId, name: (body.name || '').toString()},
+        return {address, hex40id};
     });
+    const ids = resolved.map(r => r.hex40id);
 
-    const created = [];
-    for (const {address, hex40id} of resolved) {
-        const conflict = await PartnerContract.findOne({
-            where: {hex40id, sourceId: {[Op.ne]: sourceId}, effectiveTo: null},
+    /*
+     * Everything that writes happens in one transaction, and the conflict check
+     * sits inside it. A rejected batch must leave nothing behind: the previous
+     * shape created the partner record up front and then wrote mappings one at a
+     * time, so a clash on the 50th address left the first 49 registered plus a
+     * partner row -- which is exactly the failure a bulk caller would hit.
+     */
+    const created = await PartnerContract.sequelize.transaction(async (dbTx) => {
+        const clashes: any[] = await PartnerContract.findAll({
+            where: {hex40id: {[Op.in]: ids}, sourceId: {[Op.ne]: sourceId}, effectiveTo: null},
+            attributes: ['hex40id'], raw: true, transaction: dbTx,
         });
-        if (conflict) {
+        if (clashes.length) {
+            const taken = new Set(clashes.map((c: any) => String(c.hex40id)));
             // overlapping windows would double count in the daily aggregation
-            fail(`address_owned_by_other_partner:${address}`);
+            const first = resolved.find(r => taken.has(String(r.hex40id)));
+            fail(`address_owned_by_other_partner:${first.address}`);
         }
-        const [, isNew] = await PartnerContract.findOrCreate({
-            where: {sourceId, hex40id, effectiveFrom},
-            defaults: {sourceId, hex40id, effectiveFrom},
+
+        await Partner.findOrCreate({
+            where: {sourceId}, defaults: {sourceId, name: (body.name || '').toString()},
+            transaction: dbTx,
         });
-        created.push({address, created: isNew});
-    }
+
+        const already: any[] = await PartnerContract.findAll({
+            where: {sourceId, effectiveFrom, hex40id: {[Op.in]: ids}},
+            attributes: ['hex40id'], raw: true, transaction: dbTx,
+        });
+        const have = new Set(already.map((e: any) => String(e.hex40id)));
+        const fresh = resolved.filter(r => !have.has(String(r.hex40id)));
+        if (fresh.length) {
+            await PartnerContract.bulkCreate(
+                fresh.map(r => ({sourceId, hex40id: r.hex40id, effectiveFrom})) as any,
+                {transaction: dbTx},
+            );
+        }
+        // re-registering an existing mapping stays a success with created:false
+        return resolved.map(r => ({address: r.address, created: !have.has(String(r.hex40id))}));
+    });
 
     const who = principalOf(ctx);
     await PartnerAudit.create({
