@@ -32,6 +32,7 @@ import {
     mustBeEnumParamIfPresent,
     mustBeHex64ParamIfPresent,
     mustBeIntParamIfPresent,
+    nativeTokenSymbol,
 } from "../service/common/utils";
 import {limitListOnBody} from "../service/pos/PosStat";
 import {checkRate, getClientIP, loadRateConfig} from "./RateLimiter";
@@ -382,7 +383,9 @@ function addRoute(router: Router<any, {}>, statApp: StatApp) {
         const {limit: size} = paginateCore(ctx.request.query, {limitMax: 5000});
 
         const {type, lang} = ctx.request.query || {type: 'cfxSend', limit: 10, lang: 'cn'};
-        const name = `${type}`
+        // The `type` values keep saying cfx -- they are request values downstream services
+        // send -- but the name of the file someone downloads is display text.
+        const name = `${type}`.replace(/cfx/gi, nativeTokenSymbol().toLowerCase());
         const key = `top-cfx-holder_${type}_${size}`;
 
         let list = dbCache.get(key);
@@ -402,7 +405,7 @@ function addRoute(router: Router<any, {}>, statApp: StatApp) {
         ctx.set('Content-type', 'text/csv')
         const s = []
         if (StatApp.isEVM) {
-            s.push(lang === 'cn' ? '序号,地址,地址名称,余额百分比,交易数'
+            s.push(lang === 'cn' ? '序号,地址,地址名称,余额,百分比,交易数'
                 : 'rank,address,address name,balance,percent,transactionCount')
         } else {
             s.push(lang === 'cn' ? '序号,地址,地址名称,余额,质押,总和,百分比,交易数'
