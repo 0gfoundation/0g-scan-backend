@@ -608,18 +608,26 @@ function nextUtcMidnight(now = new Date()): Date {
 
 /**
  * DELETE /partner/contracts
- *   {source_id, addresses: ["0x..", ..], effective_to?}
+ *   {source_id, addresses: ["0x..", ..], delete_on?}
  *
  * Closes a mapping's window instead of deleting the row. The aggregation joins
  * on `effectiveTo is null or t.createdAt < effectiveTo`, so attribution stops
  * from that instant onward while the history that was correct at the time stays
  * attributed -- and the row remains as the record of who was credited when.
  *
- * `effective_to` defaults to the next UTC midnight so the current day is
+ * The request field is `delete_on`, not `effective_to`, even though it is what
+ * the `effectiveTo` column ends up holding. `GET /partner/contracts` already
+ * returns `effective_to` as a property of the mapping, where a far-future value
+ * reads as "valid for a long time"; the same name on this call means the
+ * opposite -- when attribution *stops*. Sending `effective_to` here is rejected
+ * rather than quietly falling back to the default.
+ *
+ * `delete_on` defaults to the next UTC midnight so the current day is
  * attributed in full and the window closes on the same boundary the daily job
- * works in. Pass an explicit timestamp for a real hand-off; a mid-day value
- * gives that day partial attribution, which is correct for a hand-off and
- * usually not what you want when undoing a mistake.
+ * works in. The write itself is immediate; nothing is queued. Pass an explicit
+ * timestamp for a real hand-off; a mid-day value gives that day partial
+ * attribution, which is correct for a hand-off and usually not what you want
+ * when undoing a mistake.
  *
  * Days already written to `daily_partner_stat` are NOT recomputed. Undoing a
  * wrong mapping is therefore two operations: this call, then a backfill over
@@ -639,9 +647,23 @@ export async function deregisterPartnerContracts(ctx) {
         fail('missing_addresses');
     }
     const addresses = [...new Set(validateAddressList(rawList, MAX_REGISTER_ADDRESSES))];
-    const effectiveTo = body.effective_to ? new Date(body.effective_to) : nextUtcMidnight();
+    if (body.effective_to !== undefined) {
+        fail('use_delete_on',
+            'On this call the field is `delete_on` -- the instant attribution stops. ' +
+            '`effective_to` is what `GET /partner/contracts` reports about a mapping, ' +
+            'where a far-future value means the opposite.');
+    }
+    const effectiveTo = body.delete_on ? new Date(body.delete_on) : nextUtcMidnight();
     if (isNaN(effectiveTo.getTime())) {
         fail('invalid_date');
+    }
+    // A `delete_on` far in the future leaves the window open and de-registers
+    // nothing, while still answering 200 -- the worst kind of failure. Reject it
+    // rather than let a caller who meant "indefinitely" get a silent no-op.
+    if (effectiveTo.getTime() - Date.now() > MAX_RANGE_DAYS * 86400_000) {
+        fail('delete_on_too_far',
+            `\`delete_on\` is more than ${MAX_RANGE_DAYS} days out, which would leave the ` +
+            'mapping attributed. Omit the field to stop at the next UTC midnight.');
     }
 
     const idByHex = await hex40IdMap(addresses);
@@ -674,7 +696,14 @@ export async function deregisterPartnerContracts(ctx) {
                 transaction: dbTx,
             });
         }
-        // an already-closed window is left alone, so a retry is a safe no-op
+        /*
+         * An already-closed window is left alone, so a retry is a safe no-op.
+         *
+         * The response says `effective_to` while the request said `delete_on`
+         * on purpose: the request expresses intent, the response reports the
+         * mapping's resulting state -- the same field, with the same meaning,
+         * that `GET /partner/contracts` returns for it.
+         */
         return resolved.map(r => ({
             address: r.address,
             closed: open.has(String(r.hex40id)),
