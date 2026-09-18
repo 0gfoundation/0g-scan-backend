@@ -80,6 +80,7 @@ import {
     listPartnerTvlHistory,
     listPartnerContracts,
     registerPartnerContracts,
+    deregisterPartnerContracts,
 } from "../service/OpenPartnerChainService";
 import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAuth";
 import {mustBeAddressParamIfPresent,} from "../../stat/service/common/utils";
@@ -250,6 +251,7 @@ function registerRouter(router: Router) {
     router.get('/partner/tvl/history', partnerRead, listPartnerTvlHistory);
     router.get('/partner/contracts', partnerRead, listPartnerContracts);
     router.post('/partner/contracts', partnerWrite, registerPartnerContracts);
+    router.delete('/partner/contracts', partnerWrite, deregisterPartnerContracts);
 
     registerDataApi(router)
 }

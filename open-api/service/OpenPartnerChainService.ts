@@ -540,7 +540,7 @@ export async function registerPartnerContracts(ctx) {
 
         const already: any[] = await PartnerContract.findAll({
             where: {sourceId, effectiveFrom, hex40id: {[Op.in]: ids}},
-            attributes: ['hex40id'], raw: true, transaction: dbTx,
+            attributes: ['hex40id', 'effectiveTo'], raw: true, transaction: dbTx,
         });
         const have = new Set(already.map((e: any) => String(e.hex40id)));
         const fresh = resolved.filter(r => !have.has(String(r.hex40id)));
@@ -550,8 +550,31 @@ export async function registerPartnerContracts(ctx) {
                 {transaction: dbTx},
             );
         }
-        // re-registering an existing mapping stays a success with created:false
-        return resolved.map(r => ({address: r.address, created: !have.has(String(r.hex40id))}));
+
+        /*
+         * A row that already exists but whose window was closed has to be
+         * reopened. Without this, re-registering something previously
+         * de-registered matched here, was reported as an idempotent
+         * `created: false`, and stayed de-registered -- the caller sees success
+         * while the aggregation keeps ignoring the contract. The default
+         * `effectiveFrom` is the epoch, so this is the path any plain
+         * re-registration takes.
+         */
+        const shut = already.filter((e: any) => e.effectiveTo !== null).map((e: any) => e.hex40id);
+        if (shut.length) {
+            await PartnerContract.update({effectiveTo: null}, {
+                where: {sourceId, effectiveFrom, hex40id: {[Op.in]: shut}}, transaction: dbTx,
+            });
+        }
+        const reopened = new Set(shut.map(String));
+
+        // re-registering a mapping that is already open stays a success with
+        // created:false and reactivated:false
+        return resolved.map(r => ({
+            address: r.address,
+            created: !have.has(String(r.hex40id)),
+            reactivated: reopened.has(String(r.hex40id)),
+        }));
     });
 
     const who = principalOf(ctx);
@@ -563,6 +586,7 @@ export async function registerPartnerContracts(ctx) {
         detail: JSON.stringify({
             addresses: created.map(c => c.address),
             created: created.filter(c => c.created).length,
+            reactivated: created.filter(c => c.reactivated).length,
             effective_from: effectiveFrom.toISOString(),
         }).slice(0, 1024),
         ip: who.ip,
@@ -572,4 +596,107 @@ export async function registerPartnerContracts(ctx) {
     });
 
     listBody(ctx, created, {source_id: sourceId});
+}
+
+/** The next UTC midnight -- the boundary the daily aggregation works in. */
+function nextUtcMidnight(now = new Date()): Date {
+    const d = new Date(now);
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d;
+}
+
+/**
+ * DELETE /partner/contracts
+ *   {source_id, addresses: ["0x..", ..], effective_to?}
+ *
+ * Closes a mapping's window instead of deleting the row. The aggregation joins
+ * on `effectiveTo is null or t.createdAt < effectiveTo`, so attribution stops
+ * from that instant onward while the history that was correct at the time stays
+ * attributed -- and the row remains as the record of who was credited when.
+ *
+ * `effective_to` defaults to the next UTC midnight so the current day is
+ * attributed in full and the window closes on the same boundary the daily job
+ * works in. Pass an explicit timestamp for a real hand-off; a mid-day value
+ * gives that day partial attribution, which is correct for a hand-off and
+ * usually not what you want when undoing a mistake.
+ *
+ * Days already written to `daily_partner_stat` are NOT recomputed. Undoing a
+ * wrong mapping is therefore two operations: this call, then a backfill over
+ * the affected range.
+ *
+ * Once the window is closed the conflict check stops seeing the row, so another
+ * partner can claim the same contract.
+ */
+export async function deregisterPartnerContracts(ctx) {
+    const body = ctx.request.body || {};
+    const sourceId = (body.source_id || '').trim();
+    if (!sourceId || sourceId.length > LEN_SOURCE_ID) {
+        fail('invalid_source_id');
+    }
+    const rawList: any[] = Array.isArray(body.addresses) ? body.addresses : [];
+    if (!rawList.length) {
+        fail('missing_addresses');
+    }
+    const addresses = [...new Set(validateAddressList(rawList, MAX_REGISTER_ADDRESSES))];
+    const effectiveTo = body.effective_to ? new Date(body.effective_to) : nextUtcMidnight();
+    if (isNaN(effectiveTo.getTime())) {
+        fail('invalid_date');
+    }
+
+    const idByHex = await hex40IdMap(addresses);
+    const resolved = addresses.map(address => {
+        const hex40id = idByHex.get(address.slice(2));
+        if (!hex40id) {
+            fail(`unknown_address:${address}`);
+        }
+        return {address, hex40id};
+    });
+    const ids = resolved.map(r => r.hex40id);
+
+    const closed = await PartnerContract.sequelize.transaction(async (dbTx) => {
+        const rows: any[] = await PartnerContract.findAll({
+            where: {sourceId, hex40id: {[Op.in]: ids}},
+            attributes: ['hex40id', 'effectiveTo'], raw: true, transaction: dbTx,
+        });
+        const mine = new Set(rows.map((r: any) => String(r.hex40id)));
+        // an address this partner was never credited for is a caller mistake,
+        // not a no-op -- reject the batch rather than half-applying it
+        const notMine = resolved.filter(r => !mine.has(String(r.hex40id)));
+        if (notMine.length) {
+            fail(`not_registered:${notMine[0].address}`);
+        }
+        const open = new Set(rows.filter((r: any) => r.effectiveTo === null)
+            .map((r: any) => String(r.hex40id)));
+        if (open.size) {
+            await PartnerContract.update({effectiveTo}, {
+                where: {sourceId, hex40id: {[Op.in]: [...open].map(Number)}, effectiveTo: null},
+                transaction: dbTx,
+            });
+        }
+        // an already-closed window is left alone, so a retry is a safe no-op
+        return resolved.map(r => ({
+            address: r.address,
+            closed: open.has(String(r.hex40id)),
+            effective_to: effectiveTo.toISOString(),
+        }));
+    });
+
+    const who = principalOf(ctx);
+    await PartnerAudit.create({
+        action: 'deregister_contract',
+        sourceId,
+        actor: who.actor,
+        rateKeyId: who.rateKeyId,
+        detail: JSON.stringify({
+            addresses: closed.map(c => c.address),
+            closed: closed.filter(c => c.closed).length,
+            effective_to: effectiveTo.toISOString(),
+        }).slice(0, 1024),
+        ip: who.ip,
+    }).catch(e => {
+        console.log(`failed to write partner audit:`, e);
+    });
+
+    listBody(ctx, closed, {source_id: sourceId});
 }
