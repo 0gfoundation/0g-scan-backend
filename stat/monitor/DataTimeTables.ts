@@ -46,7 +46,9 @@ export const DataTimeTableList = {
 	tx_receiver_hourly: {ignore: false,},
 	tx_sender_daily: {ignore: false,},
 	tx_sender_hourly: {ignore: false,},
-	unique_addr: {ignore: true,},
+	// timestamps:false，没有 createdAt，必须指定 time，否则查询报错
+	// 这是 unique_addr_hourly / _Daily 的源头表，它停了下游必然跟着停
+	unique_addr: {ignore: false, time: 'timeStart'},
 	unique_addr_daily: {ignore: false,},
 	unique_addr_hourly: {ignore: false,},
 
