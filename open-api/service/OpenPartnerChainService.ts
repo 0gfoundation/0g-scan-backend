@@ -43,8 +43,14 @@ const MAX_REGISTER_ADDRESSES = 500;
 const DEFAULT_LIMIT = 1000;
 const MAX_LIMIT = 1000;
 
-function listBody(ctx, data: any[], extra: object = {}) {
-    ctx.body = {object: 'list', ...extra, count: data.length, data};
+/*
+ * `count` is the number of rows this response carries, which is `data.length`
+ * everywhere except `/partner/contracts`: there the rows are nested one level
+ * down, so it passes the row count explicitly. Keeping `count` a row count is
+ * what makes the documented `count < total` truncation check work.
+ */
+function listBody(ctx, data: any[], extra: object = {}, rowCount?: number) {
+    ctx.body = {object: 'list', ...extra, count: rowCount ?? data.length, data};
 }
 
 function fail(code: string, message?: string): never {
@@ -461,6 +467,19 @@ export async function listPartnerContracts(ctx) {
         }
         where.hex40id = {[Op.in]: ids};
     }
+    /*
+     * Paging stays on address rows -- `limit` / `offset` / `total` / `count`
+     * mean exactly what they meant before the rows were nested, so a caller's
+     * existing paging keeps working and the query keeps its row bound. The
+     * grouping is applied to the page that comes back, not to the whole
+     * result set.
+     *
+     * The trade-off, agreed with the caller: a partner holding more addresses
+     * than one page can carry is split across two consecutive pages, arriving
+     * as two objects with the same `source_id`. Narrow with `source_id` to get
+     * one partner whole. The (sourceId, id) order is total, so the split point
+     * is deterministic and the two halves are contiguous.
+     */
     const {rows, count} = await PartnerContract.findAndCountAll({
         where, order: [['sourceId', 'asc'], ['id', 'asc']], raw: true, limit, offset,
     });
@@ -468,12 +487,24 @@ export async function listPartnerContracts(ctx) {
     // so key the lookup on the string form rather than trusting either.
     const hexMap = await idHex40Map(rows.map(r => r.hex40id), true);
     const byId = new Map([...hexMap].map(([id, hex]) => [String(id), hex]));
-    listBody(ctx, rows.map(r => ({
-        source_id: r.sourceId,
-        address: byId.get(String(r.hex40id)) || '',
-        effective_from: new Date(r.effectiveFrom).toISOString(),
-        effective_to: r.effectiveTo ? new Date(r.effectiveTo).toISOString() : null,
-    })), {total: count, limit, offset, ...(addresses.length ? {unmatched} : {})});
+
+    // Map keeps insertion order, and rows arrive ordered by sourceId, so the
+    // groups come out in sourceId order without a second sort.
+    const grouped = new Map<string, any>();
+    for (const r of rows) {
+        let g = grouped.get(r.sourceId);
+        if (!g) {
+            g = {source_id: r.sourceId, addresses: []};
+            grouped.set(r.sourceId, g);
+        }
+        g.addresses.push({
+            address: byId.get(String(r.hex40id)) || '',
+            effective_from: new Date(r.effectiveFrom).toISOString(),
+            effective_to: r.effectiveTo ? new Date(r.effectiveTo).toISOString() : null,
+        });
+    }
+    listBody(ctx, [...grouped.values()],
+        {total: count, limit, offset, ...(addresses.length ? {unmatched} : {})}, rows.length);
 }
 
 /**
