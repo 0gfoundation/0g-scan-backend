@@ -91,6 +91,7 @@ import {
     PartnerAudit,
     PartnerContract,
 } from "../model/PartnerChain";
+import {StakingDelegation, StakingEvent, StakingValidator} from "../model/Staking";
 
 let conf
 export function createDB(config) {
@@ -232,6 +233,10 @@ export async function initPartialModel(sequelize) {
     DailyPartnerAddr.register(sequelize)
     DailyPartnerTvl.register(sequelize)
     PartnerAudit.register(sequelize)
+    // 0G validator/delegation index, written by token_x, read by open-api
+    StakingValidator.register(sequelize)
+    StakingDelegation.register(sequelize)
+    StakingEvent.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)

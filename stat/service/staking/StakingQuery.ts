@@ -1,0 +1,427 @@
+import {ethers} from "ethers";
+import {fn, col, literal, Op, QueryTypes, WhereOptions} from "sequelize";
+import {
+    IStakingValidator,
+    StakingDelegation,
+    StakingEvent,
+    StakingEventType,
+    StakingValidator,
+} from "../../model/Staking";
+
+/**
+ * Read side of the 0G validator/delegation index, for open-api.
+ *
+ * Conventions:
+ *   - amounts are wei integer strings, percentages are strings with 2 decimals
+ *   - a delegation's token value is `shares * (tokens + rewards) / delegatorShares`,
+ *     the same formula as `getDelegatedTokens` on chain, from the validator row
+ *     the refresher keeps current
+ *   - self-delegation is the owner's delegation
+ *   - "delegated amount" sums only Delegate events: undelegations and slashing
+ *     are not subtracted, and the initial self-stake at initialization (and at
+ *     genesis) is not a Delegate event
+ */
+
+const ZERO = BigInt(0);
+const HUNDRED = BigInt(100);
+
+export const ACTIVE_BEACON_STATUS = ['active_ongoing', 'active_exiting', 'active_slashed'];
+
+export const EVENT_TYPE_NAMES: {[name: string]: StakingEventType} = {
+    delegate: StakingEventType.Delegate,
+    undelegate: StakingEventType.Undelegate,
+    validator_created: StakingEventType.ValidatorCreated,
+    validator_initialized: StakingEventType.ValidatorInitialized,
+    validator_exited: StakingEventType.ValidatorExited,
+    ownership_transferred: StakingEventType.OwnershipTransferred,
+    commission_rate_changed: StakingEventType.CommissionRateChanged,
+    withdrawal_fee_changed: StakingEventType.WithdrawalFeeInGweiChanged,
+    withdraw_commission: StakingEventType.WithdrawCommission,
+    withdraw_tip_fee: StakingEventType.WithdrawTipFee,
+    exited: StakingEventType.Exited,
+    slash_detected: StakingEventType.SlashDetected,
+};
+const EVENT_NAME_OF: {[t: number]: string} = Object.fromEntries(
+    Object.entries(EVENT_TYPE_NAMES).map(([k, v]) => [v, k]));
+
+const checksum = (a: string) => a ? ethers.utils.getAddress(a) : a;
+const big = (v: any) => BigInt(v ?? 0);
+
+/** a / b as a percentage string with 2 decimals, truncated; '0.00' when b is 0 */
+function percent(a: bigint, b: bigint): string {
+    if (b === ZERO) {
+        return '0.00';
+    }
+    const bp = a * HUNDRED * HUNDRED / b;
+    const s = bp.toString().padStart(3, '0');
+    return `${s.slice(0, -2)}.${s.slice(-2)}`;
+}
+
+function poolTokens(v: IStakingValidator): bigint {
+    return big(v.tokens) + big(v.rewards);
+}
+
+function sharesToTokens(shares: bigint, v: IStakingValidator): bigint {
+    const total = big(v.delegatorShares);
+    return total === ZERO ? ZERO : shares * poolTokens(v) / total;
+}
+
+export function isActive(v: IStakingValidator) {
+    return ACTIVE_BEACON_STATUS.includes(v.beaconStatus);
+}
+
+function formatValidator(v: IStakingValidator) {
+    return {
+        address: checksum(v.address),
+        pubkey: v.pubkey,
+        moniker: v.moniker,
+        identity: v.identity,
+        website: v.website,
+        securityContact: v.securityContact,
+        details: v.details,
+        owner: checksum(v.owner),
+        operator: checksum(v.operator),
+        isGenesis: !!v.isGenesis,
+        active: isActive(v),
+        beaconStatus: v.beaconStatus,
+        bondStatus: v.bondStatus,
+        /** tokens + pending rewards, i.e. what the delegators' shares are worth */
+        stakedAmount: poolTokens(v).toString(),
+        tokens: String(v.tokens),
+        rewards: String(v.rewards),
+        delegatorShares: String(v.delegatorShares),
+        commission: String(v.commission),
+        /** raw commissionRate / 10_000, as a percentage */
+        commissionRate: percent(BigInt(v.commissionRate ?? 0), BigInt(1_000_000)),
+        /** raw annualPercentageYield / 100, as a percentage */
+        apy: percent(big(v.apy), BigInt(10_000)),
+        withdrawalFeeInGwei: String(v.withdrawalFeeInGwei),
+        createdBlock: v.createdBlock,
+        createdAt: v.createdAt,
+        exitedBlock: v.exitedBlock,
+        refreshedBlock: v.refreshedBlock,
+        refreshedAt: v.refreshedAt,
+    };
+}
+
+async function delegatorCounts(validators?: string[]): Promise<Map<string, number>> {
+    const where: WhereOptions = {shares: {[Op.gt]: 0}};
+    if (validators) {
+        where['validator'] = {[Op.in]: validators};
+    }
+    const rows: any[] = await StakingDelegation.findAll({
+        attributes: ['validator', [fn('count', col('id')), 'cnt']], where, group: ['validator'], raw: true,
+    });
+    return new Map(rows.map(r => [r.validator, Number(r.cnt)]));
+}
+
+/** owner's current shares per validator */
+async function selfShares(validators: IStakingValidator[]): Promise<Map<string, bigint>> {
+    const pairs = validators.filter(v => v.owner).map(v => ({validator: v.address, delegator: v.owner}));
+    if (!pairs.length) {
+        return new Map();
+    }
+    const rows = await StakingDelegation.findAll({
+        attributes: ['validator', 'shares'], raw: true, where: {[Op.or]: pairs},
+    });
+    return new Map(rows.map(r => [r.validator, big(r.shares)]));
+}
+
+export async function getStakingSummary() {
+    const validators = await StakingValidator.findAll({raw: true});
+    const total = validators.reduce((s, v) => s + poolTokens(v), ZERO);
+    const [{cnt}]: any = await StakingDelegation.findAll({
+        attributes: [[fn('count', literal('distinct delegator')), 'cnt']], where: {shares: {[Op.gt]: 0}}, raw: true,
+    });
+    const delegations = await StakingDelegation.count({where: {shares: {[Op.gt]: 0}}});
+    return {
+        totalStaked: total.toString(),
+        validatorCount: validators.length,
+        activeValidatorCount: validators.filter(isActive).length,
+        /** distinct addresses with non-zero shares on any validator */
+        delegatorCount: Number(cnt),
+        /** (validator, delegator) pairs with non-zero shares */
+        delegationCount: delegations,
+    };
+}
+
+export type ValidatorSort = 'staked' | 'commission' | 'delegators' | 'apy';
+
+export async function listValidators(opt: {status?: 'active' | 'inactive', term?: string, sort?: ValidatorSort, asc?: boolean}) {
+    const all = await StakingValidator.findAll({raw: true});
+    const grandTotal = all.reduce((s, v) => s + poolTokens(v), ZERO);
+    const counts = await delegatorCounts();
+    const self = await selfShares(all);
+    const term = (opt.term || '').toLowerCase();
+    let list = all.filter(v => {
+        if (opt.status === 'active' && !isActive(v)) return false;
+        if (opt.status === 'inactive' && isActive(v)) return false;
+        return !term || v.address.includes(term) || (v.moniker || '').toLowerCase().includes(term);
+    });
+    const key: {[k in ValidatorSort]: (v: IStakingValidator) => bigint} = {
+        staked: poolTokens,
+        commission: v => BigInt(v.commissionRate ?? 0),
+        delegators: v => BigInt(counts.get(v.address) ?? 0),
+        apy: v => big(v.apy),
+    };
+    const k = key[opt.sort || 'staked'];
+    list.sort((a, b) => {
+        const d = k(a) - k(b);
+        return (d > ZERO ? 1 : d < ZERO ? -1 : 0) * (opt.asc ? 1 : -1);
+    });
+    let cumulative = ZERO;
+    return {
+        total: list.length,
+        list: list.map(v => {
+            cumulative += poolTokens(v);
+            const selfTokens = sharesToTokens(self.get(v.address) ?? ZERO, v);
+            return {
+                ...formatValidator(v),
+                delegatorCount: counts.get(v.address) ?? 0,
+                selfStakedAmount: selfTokens.toString(),
+                /** share of the total staked on all validators */
+                stakedPercent: percent(poolTokens(v), grandTotal),
+                cumulativePercent: percent(cumulative, grandTotal),
+            };
+        }),
+    };
+}
+
+export async function getValidator(address: string) {
+    const v = await StakingValidator.findOne({where: {address}, raw: true});
+    if (!v) {
+        return null;
+    }
+    const counts = await delegatorCounts([address]);
+    const self = sharesToTokens((await selfShares([v])).get(address) ?? ZERO, v);
+    return {
+        ...formatValidator(v),
+        delegatorCount: counts.get(address) ?? 0,
+        selfStakedAmount: self.toString(),
+        selfStakedPercent: percent(self, poolTokens(v)),
+    };
+}
+
+export async function listValidatorDelegators(address: string, skip: number, limit: number, asc = false) {
+    const v = await StakingValidator.findOne({where: {address}, raw: true});
+    if (!v) {
+        return null;
+    }
+    const where = {validator: address, shares: {[Op.gt]: 0}};
+    const [total, rows] = await Promise.all([
+        StakingDelegation.count({where}),
+        StakingDelegation.findAll({
+            where, raw: true, offset: skip, limit, order: [['shares', asc ? 'asc' : 'desc'], ['id', 'asc']],
+        }),
+    ]);
+    const delegateCounts = new Map<string, number>();
+    if (rows.length) {
+        const cnt: any[] = await StakingEvent.findAll({
+            attributes: ['account', [fn('count', col('id')), 'cnt']], raw: true, group: ['account'],
+            where: {validator: address, eventType: StakingEventType.Delegate, account: {[Op.in]: rows.map(r => r.delegator)}},
+        });
+        cnt.forEach(r => delegateCounts.set(r.account, Number(r.cnt)));
+    }
+    const totalShares = big(v.delegatorShares);
+    return {
+        total,
+        list: rows.map(r => ({
+            delegator: checksum(r.delegator),
+            isSelf: r.delegator === v.owner,
+            shares: String(r.shares),
+            amount: sharesToTokens(big(r.shares), v).toString(),
+            sharePercent: percent(big(r.shares), totalShares),
+            delegateCount: delegateCounts.get(r.delegator) ?? 0,
+            firstBlock: r.firstBlock,
+            firstAt: r.firstAt,
+            lastAt: r.lastAt,
+        })),
+    };
+}
+
+export async function listStakingEvents(opt: {
+    validator?: string, delegator?: string, types?: StakingEventType[],
+    start?: Date, end?: Date, skip: number, limit: number,
+}) {
+    const where: WhereOptions = {};
+    if (opt.validator) where['validator'] = opt.validator;
+    if (opt.delegator) where['account'] = opt.delegator;
+    if (opt.types?.length) where['eventType'] = {[Op.in]: opt.types};
+    if (opt.start || opt.end) {
+        where['createdAt'] = {...(opt.start ? {[Op.gte]: opt.start} : {}), ...(opt.end ? {[Op.lt]: opt.end} : {})};
+    }
+    const [total, rows] = await Promise.all([
+        StakingEvent.count({where}),
+        StakingEvent.findAll({
+            where, raw: true, offset: opt.skip, limit: opt.limit,
+            order: [['blockNumber', 'desc'], ['logIndex', 'desc']],
+        }),
+    ]);
+    return {
+        total,
+        list: rows.map(r => ({
+            type: EVENT_NAME_OF[r.eventType],
+            validator: checksum(r.validator),
+            account: checksum(r.account),
+            counterparty: checksum(r.counterparty),
+            amount: r.amount == null ? null : String(r.amount),
+            shares: r.shares == null ? null : String(r.shares),
+            extra: r.extra,
+            blockNumber: Number(r.blockNumber),
+            blockHash: r.blockHash,
+            txHash: r.txHash,
+            logIndex: r.logIndex,
+            timestamp: Math.floor(new Date(r.createdAt).getTime() / 1000),
+        })),
+    };
+}
+
+export type DelegatorValidatorSort = 'amount' | 'commission' | 'apy' | 'first';
+
+export async function listDelegatorValidators(delegator: string, sort: DelegatorValidatorSort = 'amount', asc = false) {
+    const rows = await StakingDelegation.findAll({where: {delegator, shares: {[Op.gt]: 0}}, raw: true});
+    const validators = new Map((await StakingValidator.findAll({
+        where: {address: {[Op.in]: rows.map(r => r.validator)}}, raw: true,
+    })).map(v => [v.address, v]));
+    const list = rows.filter(r => validators.has(r.validator)).map(r => {
+        const v = validators.get(r.validator);
+        return {r, v, amount: sharesToTokens(big(r.shares), v)};
+    });
+    const key: {[k in DelegatorValidatorSort]: (x: typeof list[0]) => bigint} = {
+        amount: x => x.amount,
+        commission: x => BigInt(x.v.commissionRate ?? 0),
+        apy: x => big(x.v.apy),
+        first: x => BigInt(x.r.firstBlock),
+    };
+    list.sort((a, b) => {
+        const d = key[sort](a) - key[sort](b);
+        return (d > ZERO ? 1 : d < ZERO ? -1 : 0) * (asc ? 1 : -1);
+    });
+    return {
+        totalAmount: list.reduce((s, x) => s + x.amount, ZERO).toString(),
+        list: list.map(({r, v, amount}) => ({
+            validator: formatValidator(v),
+            shares: String(r.shares),
+            amount: amount.toString(),
+            firstBlock: r.firstBlock,
+            firstAt: r.firstAt,
+            lastAt: r.lastAt,
+        })),
+    };
+}
+
+export async function getStakeBreakdown() {
+    const validators = await StakingValidator.findAll({raw: true});
+    const self = await selfShares(validators);
+    let total = ZERO, selfTotal = ZERO;
+    for (const v of validators) {
+        total += poolTokens(v);
+        selfTotal += sharesToTokens(self.get(v.address) ?? ZERO, v);
+    }
+    return {
+        totalStaked: total.toString(),
+        selfStaked: selfTotal.toString(),
+        selfStakedPercent: percent(selfTotal, total),
+        delegatedByOthers: (total - selfTotal).toString(),
+        delegatedByOthersPercent: percent(total - selfTotal, total),
+    };
+}
+
+/** UTC day or hour bucket of a DATETIME column, as a string that sorts */
+function bucketExpr(interval: 'day' | 'hour') {
+    return interval === 'day'
+        ? `date_format(createdAt, '%Y-%m-%d')`
+        : `date_format(createdAt, '%Y-%m-%d %H:00')`;
+}
+
+/**
+ * Delegate amounts per validator per UTC day for the last `days` days
+ * (today included), top `top` validators per day plus an "others" entry.
+ */
+export async function getDelegationActivity(days: number, top: number) {
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    start.setUTCDate(start.getUTCDate() - (days - 1));
+    const t = StakingEvent.getTableName();
+    const rows: any[] = await StakingEvent.sequelize.query(
+        `select ${bucketExpr('day')} as bucket, validator, sum(amount) as amount, count(*) as cnt
+         from ${t} where eventType = ? and createdAt >= ? group by bucket, validator`,
+        {type: QueryTypes.SELECT, replacements: [StakingEventType.Delegate, start]});
+    const monikers = new Map((await StakingValidator.findAll({attributes: ['address', 'moniker'], raw: true}))
+        .map(v => [v.address, v.moniker]));
+    const result = [];
+    for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(start.getTime() + i * 86400_000);
+        const bucket = d.toISOString().slice(0, 10);
+        const dayRows = rows.filter(r => r.bucket === bucket)
+            .map(r => ({validator: r.validator, amount: big(r.amount), count: Number(r.cnt)}))
+            .sort((a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0));
+        const dayTotal = dayRows.reduce((s, r) => s + r.amount, ZERO);
+        const shown = dayRows.slice(0, top).map(r => ({
+            validator: checksum(r.validator), moniker: monikers.get(r.validator) ?? '',
+            amount: r.amount.toString(), count: r.count, percent: percent(r.amount, dayTotal),
+        }));
+        const rest = dayRows.slice(top);
+        if (rest.length) {
+            const restAmount = rest.reduce((s, r) => s + r.amount, ZERO);
+            shown.push({
+                validator: null, moniker: 'others', amount: restAmount.toString(),
+                count: rest.reduce((s, r) => s + r.count, 0), percent: percent(restAmount, dayTotal),
+            });
+        }
+        result.push({date: bucket, timestamp: d.getTime() / 1000, totalAmount: dayTotal.toString(), validators: shown});
+    }
+    return {list: result};
+}
+
+/** Delegate amount into one validator over [start, end), optionally bucketed. */
+export async function sumValidatorDelegations(validator: string, start: Date, end: Date, interval?: 'day' | 'hour') {
+    const t = StakingEvent.getTableName();
+    const replacements = [validator, StakingEventType.Delegate, start, end];
+    const cond = `validator = ? and eventType = ? and createdAt >= ? and createdAt < ?`;
+    const [sum]: any[] = await StakingEvent.sequelize.query(
+        `select sum(amount) as amount, count(*) as cnt from ${t} where ${cond}`,
+        {type: QueryTypes.SELECT, replacements});
+    const ret: any = {
+        validator: checksum(validator),
+        start: start.getTime() / 1000, end: end.getTime() / 1000,
+        amount: big(sum?.amount).toString(), count: Number(sum?.cnt ?? 0),
+    };
+    if (interval) {
+        const rows: any[] = await StakingEvent.sequelize.query(
+            `select ${bucketExpr(interval)} as bucket, sum(amount) as amount, count(*) as cnt
+             from ${t} where ${cond} group by bucket order by bucket`,
+            {type: QueryTypes.SELECT, replacements});
+        ret.interval = interval;
+        ret.list = rows.map(r => ({bucket: r.bucket, amount: big(r.amount).toString(), count: Number(r.cnt)}));
+    }
+    return ret;
+}
+
+/** Delegate amount by one delegator across all validators, optionally within [start, end). */
+export async function sumDelegatorDelegations(delegator: string, start?: Date, end?: Date) {
+    const t = StakingEvent.getTableName();
+    const replacements: any[] = [delegator, StakingEventType.Delegate];
+    let cond = `account = ? and eventType = ?`;
+    if (start) {
+        cond += ` and createdAt >= ?`;
+        replacements.push(start);
+    }
+    if (end) {
+        cond += ` and createdAt < ?`;
+        replacements.push(end);
+    }
+    const rows: any[] = await StakingEvent.sequelize.query(
+        `select validator, sum(amount) as amount, count(*) as cnt from ${t} where ${cond} group by validator`,
+        {type: QueryTypes.SELECT, replacements});
+    const list = rows.map(r => ({validator: checksum(r.validator), amount: big(r.amount), count: Number(r.cnt)}))
+        .sort((a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0));
+    return {
+        delegator: checksum(delegator),
+        start: start ? start.getTime() / 1000 : null,
+        end: end ? end.getTime() / 1000 : null,
+        amount: list.reduce((s, r) => s + r.amount, ZERO).toString(),
+        count: list.reduce((s, r) => s + r.count, 0),
+        list: list.map(r => ({...r, amount: r.amount.toString()})),
+    };
+}

@@ -928,8 +928,248 @@ paths:
             "application/json":
               schema:
                 $ref: "#/components/schemas/StringArray"
+  /staking/summary:
+    get:
+      tags:
+        - 'Staking'
+      description: "Totals over all validators. Amounts are integer strings in wei (1 0G = 1e18). `delegatorCount` counts distinct addresses with non-zero shares; `delegationCount` counts (validator, delegator) pairs."
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validators:
+    get:
+      tags:
+        - 'Staking'
+      description: "All validators, not paged. `stakedAmount` is tokens + pending rewards, which is what the delegators' shares are worth. `stakedPercent` is the share of the total staked on all validators, `cumulativePercent` the running total in the returned order."
+      parameters:
+        - name: status
+          in: query
+          description: "`active` or `inactive`, by beacon chain status. Omit for all."
+          required: false
+          schema:
+            type: string
+            enum: [active, inactive]
+        - name: term
+          in: query
+          description: "Case-insensitive substring of the moniker or the address."
+          required: false
+          schema:
+            type: string
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [staked, commission, delegators, apy]
+            default: staked
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator:
+    get:
+      tags:
+        - 'Staking'
+      description: "One validator, including its self-stake (the owner's delegation)."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/delegators:
+    get:
+      tags:
+        - 'Staking'
+      description: "Delegators of a validator with non-zero shares, by shares. `amount` is the current token value of the shares."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/delegations/sum:
+    get:
+      tags:
+        - 'Staking'
+      description: "Sum of Delegate amounts into a validator over [start, end). Only Delegate events count: undelegations and slashing are not subtracted, and the initial self-stake is not included. With `interval`, also returns per-bucket sums (UTC)."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive."
+          required: true
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now. The range is limited to 366 days, 31 days with `interval=hour`."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [day, hour]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/delegator/validators:
+    get:
+      tags:
+        - 'Staking'
+      description: "Validators a delegator has non-zero shares on, with the current token value of each."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [amount, commission, apy, first]
+            default: amount
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/delegator/delegations/sum:
+    get:
+      tags:
+        - 'Staking'
+      description: "Sum of a delegator's Delegate amounts across all validators, with a per-validator breakdown. Only Delegate events count; undelegations are not subtracted. Attributed to the delegator, not the payer. Without start/end, covers all history."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive."
+          required: false
+          schema:
+            type: integer
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/events:
+    get:
+      tags:
+        - 'Staking'
+      description: "Staking events, newest first. `slash_detected` rows are synthetic: slashing happens in a system call whose logs are not retrievable, so it is recorded when the operator's shares are seen to drop."
+      parameters:
+        - name: validator
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: delegator
+          in: query
+          description: "The delegator for delegate/undelegate, the owner or operator for other events."
+          required: false
+          schema:
+            type: string
+        - name: type
+          in: query
+          description: "Comma separated: delegate, undelegate, validator_created, validator_initialized, validator_exited, ownership_transferred, commission_rate_changed, withdrawal_fee_changed, withdraw_commission, withdraw_tip_fee, exited, slash_detected."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/charts/breakdown:
+    get:
+      tags:
+        - 'Staking'
+      description: "Total staked, split into owners' self-stake and delegations by others."
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/charts/activity:
+    get:
+      tags:
+        - 'Staking'
+      description: "Delegate amounts per UTC day for the last `days` days (today included, latest first), top 10 validators per day plus `others`."
+      parameters:
+        - name: days
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+            maximum: 30
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
 components:
   schemas:
+    StakingResult:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        result:
+          type: object
     CommonResponse:
       type: object
       properties:
@@ -2878,6 +3118,20 @@ components:
       required: true
       schema:
         type: string
+    stakingAddressParam:
+      name: address
+      in: query
+      required: true
+      schema:
+        type: string
+    stakingOrderParam:
+      name: order
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
     skipParam:
       name: skip
       in: query

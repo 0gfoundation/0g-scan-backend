@@ -20,6 +20,22 @@ export interface ConfluxOption {
 export interface EtherOption {
     url: string,
 }
+/** 0G validator/delegation index, see document/staking/PLAN.md */
+export interface StakingOption {
+    enabled?: boolean, // default false
+    contract?: string, // default: STAKING_CONTRACT_ADDRESS from ValidatorContract.sol
+    /**
+     * Which built-in genesis validator list to seed: 'mainnet' | 'none'
+     * (GENESIS_VALIDATORS in StakingAbi.ts). Required when enabled: validators
+     * registered via genesis deposits emit no event, so the sync refuses to
+     * start without an explicit choice.
+     */
+    genesis?: string,
+    startBlock?: number, // first block to scan, default 1
+    confirmations?: number, // only used when the RPC has no `finalized` tag, default 3
+    logRange?: number, // blocks per eth_getLogs window, default 2000
+    refreshIntervalMs?: number, // default 60s
+}
 export interface ConsortiumBridgeOption {
     port: number,
     retry: number,
@@ -104,6 +120,7 @@ export interface StatConfig{
     // Named for the validators endpoint it used to point at, which fed a staked figure
     // nothing publishes any more.
     validatorRpc?: string,
+    staking?: StakingOption,
 
     syncIPFSGateway: boolean,
     syncIPFSGatewayDelay: number,
