@@ -38,7 +38,10 @@ export async function listAccountAssets(ctx) {
                 symbol: nativeTokenSymbol(),
                 decimals: 18,
                 iconUrl: TokenQuery.wrappedCFX?.iconUrl,
-                priceInUSDT: formatPrice(TokenQuery.wrappedCFX?.price),
+                // `formatPrice` goes straight to `.indexOf`, and the wrapped native token
+                // is unset wherever `wrappedCFX` is left at its placeholder address, so
+                // guard the call the way the other two callers already do.
+                priceInUSDT: TokenQuery.wrappedCFX?.price ? formatPrice(TokenQuery.wrappedCFX.price) : undefined,
                 quoteUrl: TokenQuery.wrappedCFX?.quoteUrl,
             };
         }
