@@ -19,32 +19,17 @@ import {Errors} from "./common/LogicError";
 import { ethers } from "ethers";
 import {ResultCache, TopUniqueCache} from "../model/ResultCache";
 import {safeAddErrorLog} from "../monitor/ErrorMonitor";
-import {HomepageDashboard} from "./HomepageDashboard";
+import {creditedStakeDrip, HomepageDashboard} from "./HomepageDashboard";
 import {CONST} from "./common/constant";
 
 /**
- * Denominator of the native token rankings, in drip. Undefined until the homepage
- * dashboard has filled in its first supply snapshot.
- *
- * `calculateEvmPosSupply()` reports `totalIssued = genesis + blockWithdraw + totalStakes`,
- * but on 0G those last two terms already sit inside `balance(0x0)`: staking burns on the
- * eSpace side into 0x0 and mints on the consensus side, unstaking emits a block withdrawal
- * and burns on the consensus side. So `balance(0x0)` is the cumulative amount ever staked
- * and `totalIssued` counts part of it a second time.
- *
- * Only the part that actually came back -- as a block withdrawal or as consensus layer
- * balance -- is the double count, so that is all we take off. The remainder of
- * `balance(0x0)` was burned and credited nowhere yet (pending activation, slashed, or not
- * reported by `effective_balance`), and subtracting it would remove supply that was never
- * added. This also keeps the denominator usable where the block withdrawal sync is not
- * running or `validatorRpc` is unset and both terms read 0, instead of reporting shares
- * above 100%.
+ * Denominator of the native token rankings, in drip -- the same figure /supply/total
+ * publishes. Undefined until the homepage dashboard has filled in its first supply
+ * snapshot. See `creditedStakeDrip` for why only part of `balance(0x0)` comes off.
  */
 export function rankTotalSupplyDrip(supplyInfo: any): bigint | undefined {
     if (supplyInfo?.calculateEvmPosSupply) {
-        const staked = BigInt(supplyInfo.nullAddressBalance || 0);
-        const credited = BigInt(supplyInfo.sumBlockWithdrawal || 0) + BigInt(supplyInfo.totalStakes || 0);
-        return BigInt(supplyInfo.totalIssued) - (credited < staked ? credited : staked);
+        return BigInt(supplyInfo.totalIssued) - creditedStakeDrip(supplyInfo);
     }
     // Conflux eSpace, or any node that answers cfx_getSupplyInfo itself.
     const total = supplyInfo?.totalEspaceTokens || supplyInfo?.totalCirculating;
