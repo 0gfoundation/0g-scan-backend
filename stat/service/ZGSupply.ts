@@ -6,7 +6,6 @@ import {
 	getLatestBlockWithdraw,
 	initBlockWithdrawModel, sumEffectiveBalanceBigInt, ValidatorResponse,
 	WithdrawalCreationAttributes,
-	splitBlockRewards,
 	WithdrawalParser,
 	WithdrawalUtils
 } from "../model/ZG";
@@ -23,7 +22,6 @@ const ctx = {
 	preEntry: null as BlockWithdrawCreationAttributes,
 	eth: undefined as JsonRpcProvider,
 	cumulative: 0n,
-	cumulativeReward: 0n,
 }
 
 async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
@@ -44,10 +42,8 @@ async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
 			wIndex: w.index, validatorIndex: w.validatorIndex,
 		} as WithdrawalCreationAttributes
 	})
-	// Split before the zero filter: the reward triple is positional, and a zero component
-	// still occupies its slot. Dropping it first would shift the ones behind it.
 	return {
-		withdrawData: wd, withdraws: beans, rewards: splitBlockRewards(wd.withdrawals)
+		withdrawData: wd, withdraws: beans
 	}
 }
 
@@ -63,14 +59,6 @@ async function setupPreBlock() {
 		console.log(`first block number is `, firstBlk.number);
 	} else {
 		ctx.cumulative = parseEther(ctx.preEntry.cumulativeAmount).toBigInt()
-		// Null on every row written before rewards were tracked. Resuming from 0 there
-		// would report issuance as if the chain had just started, so refuse to continue a
-		// table that has not been backfilled rather than publish a wrong total.
-		if (ctx.preEntry.cumulativeReward == null) {
-			throw new Error(`block_withdraws has no cumulativeReward at block ${ctx.preEntry.blockNumber};`
-				+ ` backfill the reward columns before resuming, or drop the table to resync from genesis`);
-		}
-		ctx.cumulativeReward = parseEther(ctx.preEntry.cumulativeReward).toBigInt()
 	}
 }
 
@@ -90,10 +78,10 @@ async function sync(seq?: Sequelize) {
 	while (true) {
 		const wantBlockNo = ctx.preEntry.blockNumber + 1;
 		let failed = false
-		const {withdrawData, rewards} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
+		const {withdrawData} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
 			console.log(`failed to get block withdraws at ${wantBlockNo}:`, e)
 			failed = true;
-			return {withdrawData: null, rewards: null}
+			return {withdrawData: null}
 		});
 		if (failed || !withdrawData) {
 			await sleep(5_000);
@@ -103,20 +91,14 @@ async function sync(seq?: Sequelize) {
 			blockNumber: withdrawData.blockNumber,
 			sumAmount: withdrawData.totalAmount,
 			withdrawalsRoot: withdrawData.withdrawalsRoot,
-			nativeReward: rewards.nativeReward,
-			restakingReward: rewards.restakingReward,
-			baseInflation: rewards.baseInflation,
 		} as BlockWithdrawCreationAttributes;
 		// we have decimal in DB
 		const drip = ctx.cumulative + BigInt(withdrawData.totalAmount);
 		newBean.cumulativeAmount = formatEther(drip);
-		const rewardDrip = ctx.cumulativeReward + BigInt(rewards.blockReward);
-		newBean.cumulativeReward = formatEther(rewardDrip);
 
 		await BlockWithdrawModel.create(newBean).then(()=>{
 			ctx.preEntry = newBean;
 			ctx.cumulative = drip;
-			ctx.cumulativeReward = rewardDrip;
 		}).catch(async e=>{
 			console.log(`failed to save block withdraw model:`, e)
 			await sleep(5_000);
@@ -128,24 +110,13 @@ async function sync(seq?: Sequelize) {
 	}
 }
 
-const ZGGenesisSupply = BigInt(parseEther(1e9.toString()));
+// 1e9 at genesis, of which 2,000 0G (4 validators x 500) was staked at genesis and so
+// sits in the consensus layer: it is counted by `totalStakes`, not here.
+const ZGGenesisSupply = BigInt(parseEther('999998000'));
 
 export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<SupplyInfo & any> {
 	// circulating supply = genesis supply + block withdraw - balance(0x0)
-	let blockWithdraw = BigInt(0);
-	// Issuance, which is what `genesis + this` measures. `sumBlockWithdrawal` cannot stand
-	// in for it: that figure also carries validator exits, which return principal rather
-	// than create supply. Reported alongside for now so it can be checked against the
-	// published figures before anything switches over to it; null until the sync has
-	// written the reward columns.
-	let blockReward: bigint = undefined;
-	if (NoCoreSpace && BlockWithdrawModel.sequelize) {
-		const bw = await getLatestBlockWithdraw();
-		blockWithdraw = BigInt(parseEther(bw?.cumulativeAmount || "0")) * BigInt(1e9);
-		if (bw?.cumulativeReward != null) {
-			blockReward = BigInt(parseEther(bw.cumulativeReward)) * BigInt(1e9);
-		}
-	}
+	const {total: blockWithdraw, rewards: blockReward, message: withdrawalMessage} = await sumWithdrawals();
 	const sumContracts = await sumSpecialContractBalance(getCfxSdk()).catch(e=>{
 		console.log(`failed to sum contract balance:`, e);
 		return BigInt(0);
@@ -157,6 +128,10 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 	return {
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
+		// Issuance alone, the part of sumBlockWithdrawal that was minted rather than
+		// returning stake. `genesisSupply + this` is a second, independent reading of the
+		// total: it shares no term with the formula above beyond genesis, so the two
+		// drifting apart means one of the inputs is wrong.
 		sumBlockReward: blockReward,
 		genesisSupply: ZGGenesisSupply,
 		totalCirculating: remain,
@@ -164,11 +139,19 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		totalIssued: issued,
 		totalStakes,
 		validatorMessage,
+		withdrawalMessage,
 		// do not care fields below
 		totalCollateral: undefined,
 		totalEspaceTokens: undefined,
 		totalStaking: undefined,
 	};
+}
+
+// `fetch` reports every transport failure as the same flat "fetch failed"; the reason --
+// ECONNREFUSED, ENOTFOUND, a certificate error -- is only on `cause`, so carry it through
+// or these messages say nothing about what to go and fix.
+function fetchFailure(e: any): string {
+	return e?.cause ? `${e.message} (${e.cause.code || e.cause.message || e.cause})` : e?.message;
 }
 
 async function sumValidatorBalance(rpc?: string) {
@@ -181,7 +164,7 @@ async function sumValidatorBalance(rpc?: string) {
 
 	const data =  await fetch(rpcUsed).then(res=>res.json()).catch(e=>{
 		console.log(`failed to fetch validator info:`, e)
-		ret.message = `failed to fetch validator info: ` + e.message;
+		ret.message = `failed to fetch validator info: ` + fetchFailure(e);
 		return null as ValidatorResponse;
 	})
 	if (!data) {
@@ -189,6 +172,63 @@ async function sumValidatorBalance(rpc?: string) {
 	}
 
 	return {balance: sumEffectiveBalanceBigInt(data) * BigInt(1e9), message: undefined };
+}
+
+/**
+ * The consensus layer keeps its own running totals of what it has paid out to the
+ * execution layer, on the same host as `validatorRpc`:
+ *
+ *     .../eth/v1/beacon/states/head/validators        <- validatorRpc, configured
+ *     .../eth/v1/beacon/blocks/head/total_withdrawals <- derived from it
+ *
+ * `total` is every withdrawal ever credited and `rewards` is the issuance inside it --
+ * the first three withdrawals of each block, which are minted rather than returning
+ * stake. Set `withdrawalRpc` to override when the two do not sit under one host.
+ */
+export function withdrawalRpcUrl(): string {
+	if (ConfigInstance.withdrawalRpc) {
+		return ConfigInstance.withdrawalRpc;
+	}
+	const validatorRpc = ConfigInstance.validatorRpc || '';
+	const derived = validatorRpc.replace(/\/states\/[^/]+\/validators\/?$/, '/blocks/head/total_withdrawals');
+	// Unchanged means it did not look like the validators endpoint. Report nothing rather
+	// than guess a URL and let the caller log why.
+	return derived === validatorRpc ? '' : derived;
+}
+
+/**
+ * Cumulative withdrawals and cumulative issuance, in drip.
+ *
+ * This used to come from `block_withdraws`, filled by this file's own `sync()` scanning
+ * one block at a time. That has no compose service, so nothing restarted it after the
+ * April 2026 migration and it silently froze at block ~30.9M: by October the stored total
+ * was 311M against the chain's 462M, and the published supply was 150M light. The
+ * consensus layer already keeps both totals, so read them instead of recomputing them.
+ */
+async function sumWithdrawals() {
+	const ret = {total: BigInt(0), rewards: BigInt(0), message: ""};
+	const url = withdrawalRpcUrl();
+	if (!url) {
+		ret.message = "withdrawal RPC is not set, and validatorRpc is not the validators endpoint";
+		return ret;
+	}
+
+	const data = await fetch(url).then(res => res.json()).catch(e => {
+		console.log(`failed to fetch withdrawal totals:`, e)
+		ret.message = `failed to fetch withdrawal totals: ` + fetchFailure(e);
+		return null as any;
+	})
+	if (!data?.data?.total) {
+		ret.message = ret.message || `withdrawal totals missing from ${url}`;
+		return ret;
+	}
+
+	// Gwei on the wire, like every other consensus layer figure here.
+	return {
+		total: BigInt(data.data.total) * BigInt(1e9),
+		rewards: BigInt(data.data.rewards || 0) * BigInt(1e9),
+		message: undefined,
+	};
 }
 
 async function sumSpecialContractBalance(cfx:Conflux) {

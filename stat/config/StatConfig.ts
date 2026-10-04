@@ -100,6 +100,9 @@ export interface StatConfig{
     reportUrl: string,
     // evm pos validator information api
     validatorRpc?: string,
+    // Cumulative withdrawals + issuance. Derived from validatorRpc when unset -- see
+    // withdrawalRpcUrl(). Only needed if the two endpoints are not on one host.
+    withdrawalRpc?: string,
 
     syncIPFSGateway: boolean,
     syncIPFSGatewayDelay: number,

@@ -199,49 +199,6 @@ export const createWithdrawalRecords = async (
 	return withdrawalRecords;
 };
 
-// A withdrawal the consensus layer emits for itself rather than for a validator exit
-// carries uint64 max in both index fields.
-export const WITHDRAWAL_SENTINEL_INDEX = 18446744073709551615;
-
-export interface BlockRewards {
-	nativeReward: number;
-	restakingReward: number;
-	baseInflation: number;
-	blockReward: number;
-	/** Withdrawals that pay a validator exit -- principal coming back, not new supply. */
-	unstakes: WithdrawalParsed[];
-}
-
-/**
- * Split a block's withdrawals into newly issued supply and returning stake.
- *
- * The first three entries are the reward triple -- native reward, restaking reward, base
- * inflation, in that order -- and they are newly minted, so their sum is what the chain
- * issued in this block. Anything else is a validator exit paying principal back to the
- * execution layer, which is not new supply.
- *
- * Both the position and the sentinel index have to agree before an entry counts as a
- * reward: position alone would miscount a block that somehow emits fewer than three, and
- * the sentinel alone would not say which of the three a given entry is.
- */
-export function splitBlockRewards(withdrawals: WithdrawalParsed[]): BlockRewards {
-	const isReward = (w: WithdrawalParsed, position: number) =>
-		position < 3 && w.validatorIndex === WITHDRAWAL_SENTINEL_INDEX;
-	const amountAt = (position: number) =>
-		withdrawals[position] && isReward(withdrawals[position], position) ? withdrawals[position].amount : 0;
-
-	const nativeReward = amountAt(0);
-	const restakingReward = amountAt(1);
-	const baseInflation = amountAt(2);
-	return {
-		nativeReward,
-		restakingReward,
-		baseInflation,
-		blockReward: nativeReward + restakingReward + baseInflation,
-		unstakes: withdrawals.filter((w, position) => !isReward(w, position)),
-	};
-}
-
 export class WithdrawalUtils {
 	/**
 	 * Filter out zero-amount withdrawals
@@ -289,12 +246,6 @@ interface BlockWithdrawAttributes {
 	sumAmount: number; // Current block's total withdrawal amount
 	cumulativeAmount: string; // Cumulative amount across blocks
 	withdrawalsRoot: string;
-	// The reward triple of this block, and the running total of their sum. `sumAmount`
-	// mixes these with validator exits, so only `cumulativeReward` measures issuance.
-	nativeReward?: number;
-	restakingReward?: number;
-	baseInflation?: number;
-	cumulativeReward?: string;
 	createdAt?: Date;
 	updatedAt?: Date;
 }
@@ -309,10 +260,6 @@ export class BlockWithdrawModel extends Model<BlockWithdrawAttributes, BlockWith
 	public sumAmount!: number;
 	public cumulativeAmount!: string;
 	public withdrawalsRoot!: string;
-	public nativeReward: number;
-	public restakingReward: number;
-	public baseInflation: number;
-	public cumulativeReward: string;
 	public readonly createdAt!: Date;
 	public readonly updatedAt!: Date;
 }
@@ -340,26 +287,6 @@ export const initBlockWithdrawModel = (sequelize: Sequelize): typeof BlockWithdr
 				type: DataTypes.DECIMAL(36, 18), // 36 total digits, 18 decimal places
 				allowNull: false,
 				comment: 'Cumulative withdrawal amount up to this block'
-			},
-			nativeReward: {
-				type: DataTypes.BIGINT,
-				allowNull: true,
-				comment: 'withdrawals[0]: native staking reward minted in this block'
-			},
-			restakingReward: {
-				type: DataTypes.BIGINT,
-				allowNull: true,
-				comment: 'withdrawals[1]: restaking reward minted in this block'
-			},
-			baseInflation: {
-				type: DataTypes.BIGINT,
-				allowNull: true,
-				comment: 'withdrawals[2]: base inflation minted in this block'
-			},
-			cumulativeReward: {
-				type: DataTypes.DECIMAL(36, 18),
-				allowNull: true,
-				comment: 'Cumulative block reward up to this block -- issuance, excluding validator exits'
 			},
 			withdrawalsRoot: {
 				type: DataTypes.STRING(66), // SHA-256 hash length

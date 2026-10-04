@@ -1,5 +1,5 @@
 import * as KoaRouter from "koa-router";
-import {creditedStakeDrip, HomepageDashboard} from "../../stat/service/HomepageDashboard";
+import {nullStakeDrip, HomepageDashboard} from "../../stat/service/HomepageDashboard";
 const {router_get} = require("../../koaflow/src/koaHelper");
 const {Drip} = require('js-conflux-sdk');
 const {formatDecimal} = require('../../stat/service/common/utils');
@@ -17,7 +17,7 @@ router_get(router, '/circulating',
 			return "";
 		}
 
-		return formatDecimal(Drip(`${BigInt(totalCirculating) - creditedStakeDrip(supplyInfo)}`).toCFX(), 2);
+		return formatDecimal(Drip(`${BigInt(totalCirculating) - nullStakeDrip(supplyInfo)}`).toCFX(), 2);
 	},
 );
 
@@ -30,7 +30,7 @@ router_get(router, '/total',
 		if (totalIssued == 0) {
 			return ""
 		}
-		return formatDecimal(Drip(`${BigInt(totalIssued) - creditedStakeDrip(data)}`).toCFX(), 2);
+		return formatDecimal(Drip(`${BigInt(totalIssued) - nullStakeDrip(data)}`).toCFX(), 2);
 	},
 );
 

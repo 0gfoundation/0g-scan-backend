@@ -148,35 +148,28 @@ export class HomepageDashboard {
 }
 
 /**
- * How much of `balance(0x0)` has been credited back into the reported supply, in drip.
- * Subtract it from a gross figure to get a net one:
+ * `balance(0x0)` in drip, which comes off the gross figures to give the published ones:
  *
- *     total       = totalIssued      - creditedStakeDrip(supplyInfo)
- *     circulating = totalCirculating - creditedStakeDrip(supplyInfo)
+ *     total       = total_CL + total_EL
+ *     total_CL    = totalStakes
+ *     total_EL    = genesisSupply + sumBlockWithdrawal - nullAddressBalance
+ *     circulating = total - sumContracts
  *
- * On 0G, staking burns into 0x0 on the eSpace side and mints on the consensus side, and
- * unstaking emits a block withdrawal and burns on the consensus side. So `balance(0x0)`
- * is the cumulative amount ever staked, and `calculateEvmPosSupply()`'s
- * `totalIssued = genesis + blockWithdraw + totalStakes` counts part of it a second time.
+ * i.e. `total = totalIssued - nullStakeDrip()` and
+ * `circulating = totalCirculating - nullStakeDrip()`, since `calculateEvmPosSupply()`
+ * reports `totalIssued = genesis + blockWithdraw + totalStakes` and
+ * `totalCirculating = totalIssued - sumContracts`. On 0G staking burns into 0x0 on the
+ * execution side and mints on the consensus side, so 0x0 is taken off the execution
+ * layer in full.
  *
- * Only the part that actually came back -- as a block withdrawal or as consensus layer
- * balance -- is that double count, so that is all we take off. The rest of
- * `balance(0x0)` was burned and credited nowhere yet (pending activation, slashed, or not
- * reported by `effective_balance`); subtracting it would remove supply that was never
- * added. The clamp is what keeps these figures sane when `validatorRpc` or the block
- * withdrawal sync drops out and those terms read 0 -- without it, a `totalStakes` of 0
- * once took the published circulating supply down by 73%.
+ * The whole balance is subtracted whatever the other terms read. When `validatorRpc`
+ * fails, `totalStakes` reads 0 and these figures drop by the staked amount -- that was
+ * seen on mainnet (circulating 707M -> 190M) -- so watch `validatorMessage`.
  *
- * Core space is unchanged: there `getSupplyInfo()` answers for itself, there is no double
- * count to clamp, and the whole zero address balance comes off as it always did.
+ * Core space is the same subtraction: there `getSupplyInfo()` answers for itself.
  */
-export function creditedStakeDrip(supplyInfo: any): bigint {
-    const staked = BigInt(supplyInfo?.nullAddressBalance || 0);
-    if (!supplyInfo?.calculateEvmPosSupply) {
-        return staked;
-    }
-    const credited = BigInt(supplyInfo.sumBlockWithdrawal || 0) + BigInt(supplyInfo.totalStakes || 0);
-    return credited < staked ? credited : staked;
+export function nullStakeDrip(supplyInfo: any): bigint {
+    return BigInt(supplyInfo?.nullAddressBalance || 0);
 }
 
 export async function patchSupplyInfo(supplyInfo: SupplyInfo, balanceOfZero: bigint): Promise<SupplyInfo&any> {
