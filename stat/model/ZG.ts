@@ -328,6 +328,8 @@ export interface ValidatorResponse {
 export interface ValidatorData {
 	index: string;
 	balance: string;
+	/** Stake queued to leave. Counted separately: it does not move `balance`. */
+	pending_balance_to_withdraw?: string | null;
 	symbiotic_balance: string | null;
 	status: string;
 	validator: Validator;
@@ -355,15 +357,20 @@ export interface Validator {
  * independent readings of the total (this formula, and genesis + cumulative rewards) from
  * 1.24% apart to 0.005%.
  *
- * `pending_balance_to_withdraw` is not added: measured against the same check it makes
- * the gap wider, so `balance` already covers it. Slashing needs nothing either -- the
- * consensus layer takes it off `balance` directly.
+ * `pending_balance_to_withdraw` is added on top. It does not move `balance`, so stake
+ * queued to leave is held in neither field alone and is simply missed by summing one of
+ * them. It is small and moves with the exit queue -- a few hundred to a few thousand 0G
+ * -- which is well inside the noise of the check above, so that check neither confirms
+ * nor refutes including it; it is here because the two fields count different tokens.
+ *
+ * Slashing needs nothing: the consensus layer takes it off `balance` directly, which is
+ * why validators can report slashed false while the balances already reflect it.
  */
 export function sumValidatorBalanceBigInt(response: ValidatorResponse): bigint {
 	let total = 0n;
 
 	for (const data of response.data) {
-		total += BigInt(data.balance);
+		total += BigInt(data.balance) + BigInt(data.pending_balance_to_withdraw || 0);
 	}
 
 	return total;
