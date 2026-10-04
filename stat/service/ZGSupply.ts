@@ -4,7 +4,7 @@ import {
 	BlockWithdrawCreationAttributes,
 	BlockWithdrawModel,
 	getLatestBlockWithdraw,
-	initBlockWithdrawModel, sumEffectiveBalanceBigInt, ValidatorResponse,
+	initBlockWithdrawModel, sumValidatorBalanceBigInt, ValidatorResponse,
 	WithdrawalCreationAttributes,
 	WithdrawalParser,
 	WithdrawalUtils
@@ -171,7 +171,7 @@ async function sumValidatorBalance(rpc?: string) {
 		return ret;
 	}
 
-	return {balance: sumEffectiveBalanceBigInt(data) * BigInt(1e9), message: undefined };
+	return {balance: sumValidatorBalanceBigInt(data) * BigInt(1e9), message: undefined };
 }
 
 /**

@@ -345,12 +345,25 @@ export interface Validator {
 }
 
 // Sum effective balance as BigInt (recommended for large numbers)
-export function sumEffectiveBalanceBigInt(response: ValidatorResponse): bigint {
+/**
+ * What the validators actually hold, in Gwei.
+ *
+ * `balance` and not `validator.effective_balance`: effective balance only follows the
+ * real one through a hysteresis band, so once a block's rewards are swept out it stays
+ * sitting above what the validator holds. On mainnet that bias ran to 13.6M 0G, and it
+ * went straight into the published supply -- totalling `balance` instead brings the two
+ * independent readings of the total (this formula, and genesis + cumulative rewards) from
+ * 1.24% apart to 0.005%.
+ *
+ * `pending_balance_to_withdraw` is not added: measured against the same check it makes
+ * the gap wider, so `balance` already covers it. Slashing needs nothing either -- the
+ * consensus layer takes it off `balance` directly.
+ */
+export function sumValidatorBalanceBigInt(response: ValidatorResponse): bigint {
 	let total = 0n;
 
 	for (const data of response.data) {
-		const balance = BigInt(data.validator.effective_balance);
-		total += balance;
+		total += BigInt(data.balance);
 	}
 
 	return total;
