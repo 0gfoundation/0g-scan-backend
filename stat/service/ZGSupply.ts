@@ -1,114 +1,113 @@
-import {JsonRpcProvider} from "@ethersproject/providers/src.ts/json-rpc-provider";
-import {getCfxSdk, initEthSdk} from "./common/utils";
-import {
-	BlockWithdrawCreationAttributes,
-	BlockWithdrawModel,
-	getLatestBlockWithdraw,
-	initBlockWithdrawModel, sumValidatorBalanceBigInt, ValidatorResponse,
-	WithdrawalCreationAttributes,
-	WithdrawalParser,
-	WithdrawalUtils
-} from "../model/ZG";
-import {init} from "./tool/FixDailyTokenStat";
-import {KV} from "../model/KV";
-import {Sequelize} from "sequelize";
-import {regExitHook, sleep} from "./tool/ProcessTool";
-import {formatEther, parseEther} from "ethers/lib/utils";
+import {getCfxSdk} from "./common/utils";
+import {parseEther} from "ethers/lib/utils";
 import {SupplyInfo} from "js-conflux-sdk/dist/types/rpc/types/formatter";
-import {ConfigInstance, NoCoreSpace} from "../config/StatConfig";
+import {ConfigInstance} from "../config/StatConfig";
 import {Conflux} from "js-conflux-sdk";
 
-const ctx = {
-	preEntry: null as BlockWithdrawCreationAttributes,
-	eth: undefined as JsonRpcProvider,
-	cumulative: 0n,
-}
-
-async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
-	// raw rpc
-	const rawBlock = await p.send('eth_getBlockByNumber', ['0x'+blockNumber.toString(16), false])
-	if (!rawBlock) {
-		return {message: `getting block returns null`};
-	}
-	const wd =  WithdrawalParser.parseWithdrawalsData(rawBlock)
-	// console.log(`withdrawals data`, wd)
-
-	const nonZeroWithdrawals = WithdrawalUtils.filterNonZeroWithdrawals(wd.withdrawals);
-	// each withdraw
-	const beans = nonZeroWithdrawals.map(w=>{
-		return {
-			id: 0, blockNo: wd.blockNumber,
-			address: w.address, amount: w.amount,
-			wIndex: w.index, validatorIndex: w.validatorIndex,
-		} as WithdrawalCreationAttributes
-	})
-	return {
-		withdrawData: wd, withdraws: beans
-	}
-}
-
-async function setupPreBlock() {
-	ctx.preEntry = await getLatestBlockWithdraw();
-	if (!ctx.preEntry) {
-		const firstBlk = await ctx.eth.getBlock("earliest");
-		ctx.preEntry = {
-			blockNumber: firstBlk.number - 1, sumAmount: 0, cumulativeAmount: '0',
-			withdrawalsRoot: '',
-		}
-		// no record in DB,
-		console.log(`first block number is `, firstBlk.number);
-	} else {
-		ctx.cumulative = parseEther(ctx.preEntry.cumulativeAmount).toBigInt()
-	}
-}
-
-async function sync(seq?: Sequelize) {
-	let useSeq = seq;
-	if (!useSeq) {
-		const cfg = await init();
-		useSeq = KV.sequelize;
-		regExitHook();
-	}
-	// initWithdrawalModel(useSeq);
-	initBlockWithdrawModel(useSeq);
-	await useSeq.sync({});
-
-	await setupPreBlock();
-	let round = 0;
-	while (true) {
-		const wantBlockNo = ctx.preEntry.blockNumber + 1;
-		let failed = false
-		const {withdrawData} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
-			console.log(`failed to get block withdraws at ${wantBlockNo}:`, e)
-			failed = true;
-			return {withdrawData: null}
-		});
-		if (failed || !withdrawData) {
-			await sleep(5_000);
-			continue;
-		}
-		const newBean = {
-			blockNumber: withdrawData.blockNumber,
-			sumAmount: withdrawData.totalAmount,
-			withdrawalsRoot: withdrawData.withdrawalsRoot,
-		} as BlockWithdrawCreationAttributes;
-		// we have decimal in DB
-		const drip = ctx.cumulative + BigInt(withdrawData.totalAmount);
-		newBean.cumulativeAmount = formatEther(drip);
-
-		await BlockWithdrawModel.create(newBean).then(()=>{
-			ctx.preEntry = newBean;
-			ctx.cumulative = drip;
-		}).catch(async e=>{
-			console.log(`failed to save block withdraw model:`, e)
-			await sleep(5_000);
-		});
-
-		if ((round ++) % 1000 === 0) {
-			console.log(`${new Date().toISOString()} reach block `, ctx.preEntry.blockNumber);
-		}
-	}
-}
+/*
+ * block_withdraws and the block-by-block sync below are retired, kept commented rather
+ * than deleted because the table still exists and still holds rows up to block ~30.9M.
+ *
+ * This walked one block at a time building its own cumulative withdrawal total. It had no
+ * compose service, so nothing restarted it after the April 2026 migration; it froze on
+ * 2026-04-30 and went unnoticed for 157 days, by which point the stored total was 311M
+ * against the chain's 462M and the published supply was 150M light. The consensus layer
+ * publishes the same totals directly, so there is nothing left for this to compute.
+ *
+ * Do not restart it: resuming from the stored cursor means rescanning 15M blocks to
+ * arrive at a figure nothing reads.
+ */
+// const ctx = {
+// 	preEntry: null as BlockWithdrawCreationAttributes,
+// 	eth: undefined as JsonRpcProvider,
+// 	cumulative: 0n,
+// }
+//
+// async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
+// 	// raw rpc
+// 	const rawBlock = await p.send('eth_getBlockByNumber', ['0x'+blockNumber.toString(16), false])
+// 	if (!rawBlock) {
+// 		return {message: `getting block returns null`};
+// 	}
+// 	const wd =  WithdrawalParser.parseWithdrawalsData(rawBlock)
+// 	// console.log(`withdrawals data`, wd)
+//
+// 	const nonZeroWithdrawals = WithdrawalUtils.filterNonZeroWithdrawals(wd.withdrawals);
+// 	// each withdraw
+// 	const beans = nonZeroWithdrawals.map(w=>{
+// 		return {
+// 			id: 0, blockNo: wd.blockNumber,
+// 			address: w.address, amount: w.amount,
+// 			wIndex: w.index, validatorIndex: w.validatorIndex,
+// 		} as WithdrawalCreationAttributes
+// 	})
+// 	return {
+// 		withdrawData: wd, withdraws: beans
+// 	}
+// }
+//
+// async function setupPreBlock() {
+// 	ctx.preEntry = await getLatestBlockWithdraw();
+// 	if (!ctx.preEntry) {
+// 		const firstBlk = await ctx.eth.getBlock("earliest");
+// 		ctx.preEntry = {
+// 			blockNumber: firstBlk.number - 1, sumAmount: 0, cumulativeAmount: '0',
+// 			withdrawalsRoot: '',
+// 		}
+// 		// no record in DB,
+// 		console.log(`first block number is `, firstBlk.number);
+// 	} else {
+// 		ctx.cumulative = parseEther(ctx.preEntry.cumulativeAmount).toBigInt()
+// 	}
+// }
+//
+// async function sync(seq?: Sequelize) {
+// 	let useSeq = seq;
+// 	if (!useSeq) {
+// 		const cfg = await init();
+// 		useSeq = KV.sequelize;
+// 		regExitHook();
+// 	}
+// 	// initWithdrawalModel(useSeq);
+// 	initBlockWithdrawModel(useSeq);
+// 	await useSeq.sync({});
+//
+// 	await setupPreBlock();
+// 	let round = 0;
+// 	while (true) {
+// 		const wantBlockNo = ctx.preEntry.blockNumber + 1;
+// 		let failed = false
+// 		const {withdrawData} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
+// 			console.log(`failed to get block withdraws at ${wantBlockNo}:`, e)
+// 			failed = true;
+// 			return {withdrawData: null}
+// 		});
+// 		if (failed || !withdrawData) {
+// 			await sleep(5_000);
+// 			continue;
+// 		}
+// 		const newBean = {
+// 			blockNumber: withdrawData.blockNumber,
+// 			sumAmount: withdrawData.totalAmount,
+// 			withdrawalsRoot: withdrawData.withdrawalsRoot,
+// 		} as BlockWithdrawCreationAttributes;
+// 		// we have decimal in DB
+// 		const drip = ctx.cumulative + BigInt(withdrawData.totalAmount);
+// 		newBean.cumulativeAmount = formatEther(drip);
+//
+// 		await BlockWithdrawModel.create(newBean).then(()=>{
+// 			ctx.preEntry = newBean;
+// 			ctx.cumulative = drip;
+// 		}).catch(async e=>{
+// 			console.log(`failed to save block withdraw model:`, e)
+// 			await sleep(5_000);
+// 		});
+//
+// 		if ((round ++) % 1000 === 0) {
+// 			console.log(`${new Date().toISOString()} reach block `, ctx.preEntry.blockNumber);
+// 		}
+// 	}
+// }
 
 // The whole genesis allocation. The 2,000 0G staked at genesis is part of it wherever it
 // now sits: which ledger holds a token does not change whether it exists, and the formula
@@ -121,8 +120,6 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		console.log(`failed to sum contract balance:`, e);
 		return BigInt(0);
 	})
-	const {balance: totalStakes, message: validatorMessage} = await sumValidatorBalance();
-
 	//     total       = genesis + everything minted since
 	//     circulating = total - the contracts holding supply back
 	//
@@ -135,15 +132,6 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 	const issued = ZGGenesisSupply + blockReward;
 	const remain = issued - sumContracts.valueOf();
 
-	// The ledger-by-ledger reading of the same total: start from what genesis put on the
-	// execution layer, add what the consensus layer has paid out, take off what is burned
-	// into 0x0, add what the consensus layer still holds. It shares only genesis with the
-	// figure above, so the two drifting apart means one of these inputs has gone bad --
-	// which is how summing `effective_balance` instead of `balance` was caught, at 1.24%.
-	// Reported, not published: it is the check, not the answer.
-	const fromLedgers = ZGGenesisSupply - BigInt(parseEther('2000'))
-		+ blockWithdraw - balanceOfZero + totalStakes;
-
 	return {
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
@@ -152,9 +140,6 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		totalCirculating: remain,
 		calculateEvmPosSupply: true,
 		totalIssued: issued,
-		totalIssuedFromLedgers: fromLedgers,
-		totalStakes,
-		validatorMessage,
 		withdrawalMessage,
 		// do not care fields below
 		totalCollateral: undefined,
@@ -170,62 +155,45 @@ function fetchFailure(e: any): string {
 	return e?.cause ? `${e.message} (${e.cause.code || e.cause.message || e.cause})` : e?.message;
 }
 
-async function sumValidatorBalance(rpc?: string) {
-	const ret = {balance: BigInt(0), message: ""};
-	const rpcUsed = rpc || ConfigInstance.validatorRpc || ''
-	if (!rpcUsed) {
-		ret.message = "validator RPC is not set"
-		return ret;
-	}
-
-	const data =  await fetch(rpcUsed).then(res=>res.json()).catch(e=>{
-		console.log(`failed to fetch validator info:`, e)
-		ret.message = `failed to fetch validator info: ` + fetchFailure(e);
-		return null as ValidatorResponse;
-	})
-	if (!data) {
-		return ret;
-	}
-
-	return {balance: sumValidatorBalanceBigInt(data) * BigInt(1e9), message: undefined };
-}
-
-/**
- * The consensus layer keeps its own running totals of what it has paid out to the
- * execution layer, on the same host as `validatorRpc`:
+/*
+ * Summing validator balances is retired with the cross check it fed, kept commented in
+ * case the staked figure is wanted again as a reported number. `validatorRpc` no longer
+ * points at the validators endpoint -- see sumWithdrawals below.
  *
- *     .../eth/v1/beacon/states/head/validators        <- validatorRpc, configured
- *     .../eth/v1/beacon/blocks/head/total_withdrawals <- derived from it
- *
- * `total` is every withdrawal ever credited and `rewards` is the issuance inside it --
- * the first three withdrawals of each block, which are minted rather than returning
- * stake. Set `withdrawalRpc` to override when the two do not sit under one host.
+ * async function sumValidatorBalance(rpc?: string) {
+ * 	const ret = {balance: BigInt(0), message: ""};
+ * 	const rpcUsed = rpc || ConfigInstance.validatorRpc || ''
+ * 	if (!rpcUsed) {
+ * 		ret.message = "validator RPC is not set"
+ * 		return ret;
+ * 	}
+ * 	const data = await fetch(rpcUsed).then(res=>res.json()).catch(e=>{
+ * 		ret.message = `failed to fetch validator info: ` + fetchFailure(e);
+ * 		return null as ValidatorResponse;
+ * 	})
+ * 	if (!data) return ret;
+ * 	return {balance: sumValidatorBalanceBigInt(data) * BigInt(1e9), message: undefined };
+ * }
  */
-export function withdrawalRpcUrl(): string {
-	if (ConfigInstance.withdrawalRpc) {
-		return ConfigInstance.withdrawalRpc;
-	}
-	const validatorRpc = ConfigInstance.validatorRpc || '';
-	const derived = validatorRpc.replace(/\/states\/[^/]+\/validators\/?$/, '/blocks/head/total_withdrawals');
-	// Unchanged means it did not look like the validators endpoint. Report nothing rather
-	// than guess a URL and let the caller log why.
-	return derived === validatorRpc ? '' : derived;
-}
 
 /**
- * Cumulative withdrawals and cumulative issuance, in drip.
+ * Cumulative withdrawals and cumulative issuance, in drip, straight from the consensus
+ * layer at `validatorRpc`:
  *
- * This used to come from `block_withdraws`, filled by this file's own `sync()` scanning
- * one block at a time. That has no compose service, so nothing restarted it after the
- * April 2026 migration and it silently froze at block ~30.9M: by October the stored total
- * was 311M against the chain's 462M, and the published supply was 150M light. The
- * consensus layer already keeps both totals, so read them instead of recomputing them.
+ *     http://<host>/eth/v1/beacon/blocks/head/total_withdrawals
+ *
+ * `total` is every withdrawal ever credited to the execution layer; `rewards` is the
+ * issuance inside it -- the first three withdrawals of each block, which are minted
+ * rather than returning stake. Only `rewards` reaches the published supply.
+ *
+ * This used to come from `block_withdraws`, filled by this file\'s own block-by-block
+ * sync. See the comment at the top of the file for why that is gone.
  */
 async function sumWithdrawals() {
 	const ret = {total: BigInt(0), rewards: BigInt(0), message: ""};
-	const url = withdrawalRpcUrl();
+	const url = ConfigInstance.validatorRpc || '';
 	if (!url) {
-		ret.message = "withdrawal RPC is not set, and validatorRpc is not the validators endpoint";
+		ret.message = "validatorRpc is not set";
 		return ret;
 	}
 
@@ -267,14 +235,7 @@ async function sumSpecialContractBalance(cfx:Conflux) {
 	return bArr.reduce((a, b)=>BigInt(a)+BigInt(b), BigInt(0));
 }
 
-async function main() {
-	const [,,cdm, arg1] = process.argv;
-	const url = ""
-	ctx.eth = await initEthSdk(arg1 || url);
-	// await getBlockWithdraws(eth, 1)
-	await sync()
-}
-
-if (module === require.main) {
-	main()
-}
+// The entry point existed only to run that sync, so there is nothing left to run.
+// if (module === require.main) {
+// 	main()
+// }

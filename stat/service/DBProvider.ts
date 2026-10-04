@@ -81,7 +81,7 @@ import {TxReceiverDaily, TxReceiverHourly, TxSenderDaily, TxSenderHourly} from "
 import {AuthAction, AuthBlockStub} from "../model/EIP7702model";
 import {ContractImpl} from "../model/ContractImpl";
 import {VerifiedContracts} from "../model/VerifiedContracts";
-import {initBlockWithdrawModel} from "../model/ZG";
+// import {initBlockWithdrawModel} from "../model/ZG"; // block_withdraws retired, see below
 import {DailyGasStat} from "../model/DailyGasStat";
 import {
     DailyPartnerAddr,
@@ -282,9 +282,12 @@ export async function initModel(sequelize: Sequelize) {
     NftTransfer.register(sequelize)
     AddressNfts.register(sequelize)
     EpochAddressIds.register(sequelize)
-    if (NoCoreSpace) {
-        initBlockWithdrawModel(sequelize);
-    }
+    // block_withdraws is retired -- the consensus layer publishes the withdrawal totals
+    // directly now, see stat/service/ZGSupply.ts. The table is left in the database with
+    // the rows it has; nothing reads it, so the model is no longer registered.
+    // if (NoCoreSpace) {
+    //     initBlockWithdrawModel(sequelize);
+    // }
     /*await checkApiLogIpField()*/
     console.log(`init models ok`);
     await dropEmptyTables();

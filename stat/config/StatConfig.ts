@@ -98,11 +98,12 @@ export interface StatConfig{
     recaptchaUrl:string,
     recaptchaToken:string,
     reportUrl: string,
-    // evm pos validator information api
+    // Consensus layer cumulative withdrawals and issuance, the only external input the
+    // published supply depends on:
+    //   http://<beacon host>/eth/v1/beacon/blocks/head/total_withdrawals
+    // Named for the validators endpoint it used to point at, which fed a staked figure
+    // nothing publishes any more.
     validatorRpc?: string,
-    // Cumulative withdrawals + issuance. Derived from validatorRpc when unset -- see
-    // withdrawalRpcUrl(). Only needed if the two endpoints are not on one host.
-    withdrawalRpc?: string,
 
     syncIPFSGateway: boolean,
     syncIPFSGatewayDelay: number,
