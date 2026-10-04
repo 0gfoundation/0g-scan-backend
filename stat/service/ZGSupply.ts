@@ -189,7 +189,7 @@ function fetchFailure(e: any): string {
  * This used to come from `block_withdraws`, filled by this file\'s own block-by-block
  * sync. See the comment at the top of the file for why that is gone.
  */
-async function sumWithdrawals() {
+export async function sumWithdrawals() {
 	const ret = {total: BigInt(0), rewards: BigInt(0), message: ""};
 	const url = ConfigInstance.validatorRpc || '';
 	if (!url) {

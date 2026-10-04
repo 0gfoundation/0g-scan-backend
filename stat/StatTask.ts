@@ -39,6 +39,7 @@ import {listenPort} from "./monitor/serverApi";
 import {buildTxSenderReceiverHourly} from "./PeriodTxnSummary";
 import {safeAddErrorLog} from "./monitor/ErrorMonitor";
 import {checkAllTableDataTime} from "./monitor/DataTimeChecker";
+import {checkIssuance} from "./monitor/IssuanceChecker";
 import {StatDailyGas} from "./service/timerstat/StatDailyGas";
 import {StatDailyPartner} from "./service/timerstat/StatDailyPartner";
 import {ContractQuery} from "./service/ContractQuery";
@@ -201,6 +202,10 @@ async function runAllPeriodicStat() {
 
     await checkAllTableDataTime().catch(e=>{
         safeAddErrorLog('stat-task', 'check-data-delay', e).then();
+    })
+
+    await checkIssuance().catch(e=>{
+        safeAddErrorLog('stat-task', 'check-issuance', e).then();
     })
 
     // next round
