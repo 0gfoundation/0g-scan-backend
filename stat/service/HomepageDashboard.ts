@@ -148,27 +148,26 @@ export class HomepageDashboard {
 }
 
 /**
- * `balance(0x0)` in drip, which comes off the gross figures to give the published ones:
+ * What comes off a gross supply figure to give the published one:
  *
- *     total       = total_CL + total_EL
- *     total_CL    = totalStakes
- *     total_EL    = genesisSupply + sumBlockWithdrawal - nullAddressBalance
- *     circulating = total - sumContracts
+ *     total       = totalIssued      - supplyDeductionDrip(supplyInfo)
+ *     circulating = totalCirculating - supplyDeductionDrip(supplyInfo)
  *
- * i.e. `total = totalIssued - nullStakeDrip()` and
- * `circulating = totalCirculating - nullStakeDrip()`, since `calculateEvmPosSupply()`
- * reports `totalIssued = genesis + blockWithdraw + totalStakes` and
- * `totalCirculating = totalIssued - sumContracts`. On 0G staking burns into 0x0 on the
- * execution side and mints on the consensus side, so 0x0 is taken off the execution
- * layer in full.
+ * On 0G that is nothing. `calculateEvmPosSupply()` counts from genesis and issuance
+ * alone -- `totalIssued = genesisSupply + sumBlockReward` -- so every token is already
+ * counted exactly once and there is nothing left to net out.
  *
- * The whole balance is subtracted whatever the other terms read. When `validatorRpc`
- * fails, `totalStakes` reads 0 and these figures drop by the staked amount -- that was
- * seen on mainnet (circulating 707M -> 190M) -- so watch `validatorMessage`.
- *
- * Core space is the same subtraction: there `getSupplyInfo()` answers for itself.
+ * Core space still subtracts the zero address balance: there `getSupplyInfo()` answers
+ * for itself, and that balance is supply held out of circulation rather than a ledger
+ * transfer.
  */
-export function nullStakeDrip(supplyInfo: any): bigint {
+export function supplyDeductionDrip(supplyInfo: any): bigint {
+    // Nothing: calculateEvmPosSupply() already counts every token exactly once, from
+    // genesis and issuance alone. Taking balance(0x0) off on top would remove staked
+    // supply that was never added.
+    if (supplyInfo?.calculateEvmPosSupply) {
+        return BigInt(0);
+    }
     return BigInt(supplyInfo?.nullAddressBalance || 0);
 }
 

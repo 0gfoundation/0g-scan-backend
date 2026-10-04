@@ -110,33 +110,49 @@ async function sync(seq?: Sequelize) {
 	}
 }
 
-// 1e9 at genesis, of which 2,000 0G (4 validators x 500) was staked at genesis and so
-// sits in the consensus layer: it is counted by `totalStakes`, not here.
-const ZGGenesisSupply = BigInt(parseEther('999998000'));
+// The whole genesis allocation. The 2,000 0G staked at genesis is part of it wherever it
+// now sits: which ledger holds a token does not change whether it exists, and the formula
+// below no longer counts any ledger separately.
+const ZGGenesisSupply = BigInt(parseEther('1000000000'));
 
 export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<SupplyInfo & any> {
-	// circulating supply = genesis supply + block withdraw - balance(0x0)
 	const {total: blockWithdraw, rewards: blockReward, message: withdrawalMessage} = await sumWithdrawals();
 	const sumContracts = await sumSpecialContractBalance(getCfxSdk()).catch(e=>{
 		console.log(`failed to sum contract balance:`, e);
 		return BigInt(0);
 	})
 	const {balance: totalStakes, message: validatorMessage} = await sumValidatorBalance();
-	const issued = ZGGenesisSupply + blockWithdraw + totalStakes;
-	// home dashboard service will do the algorithm : N - balanceOfZero;
+
+	//     total       = genesis + everything minted since
+	//     circulating = total - the contracts holding supply back
+	//
+	// Issuance is all that moves it, so nothing else has to be right for these to be
+	// right. Staking does not: burning into 0x0 to mint on the consensus layer moves a
+	// token between ledgers without creating or destroying one, which is why neither
+	// `totalStakes` nor `balance(0x0)` appears. They used to, and the published figures
+	// inherited every outage those two had -- a `validatorRpc` that stopped answering
+	// took circulating down 73% in October while the chain itself was fine.
+	const issued = ZGGenesisSupply + blockReward;
 	const remain = issued - sumContracts.valueOf();
+
+	// The ledger-by-ledger reading of the same total: start from what genesis put on the
+	// execution layer, add what the consensus layer has paid out, take off what is burned
+	// into 0x0, add what the consensus layer still holds. It shares only genesis with the
+	// figure above, so the two drifting apart means one of these inputs has gone bad --
+	// which is how summing `effective_balance` instead of `balance` was caught, at 1.24%.
+	// Reported, not published: it is the check, not the answer.
+	const fromLedgers = ZGGenesisSupply - BigInt(parseEther('2000'))
+		+ blockWithdraw - balanceOfZero + totalStakes;
+
 	return {
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
-		// Issuance alone, the part of sumBlockWithdrawal that was minted rather than
-		// returning stake. `genesisSupply + this` is a second, independent reading of the
-		// total: it shares no term with the formula above beyond genesis, so the two
-		// drifting apart means one of the inputs is wrong.
 		sumBlockReward: blockReward,
 		genesisSupply: ZGGenesisSupply,
 		totalCirculating: remain,
 		calculateEvmPosSupply: true,
 		totalIssued: issued,
+		totalIssuedFromLedgers: fromLedgers,
 		totalStakes,
 		validatorMessage,
 		withdrawalMessage,

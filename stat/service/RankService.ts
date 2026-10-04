@@ -19,17 +19,17 @@ import {Errors} from "./common/LogicError";
 import { ethers } from "ethers";
 import {ResultCache, TopUniqueCache} from "../model/ResultCache";
 import {safeAddErrorLog} from "../monitor/ErrorMonitor";
-import {nullStakeDrip, HomepageDashboard} from "./HomepageDashboard";
+import {supplyDeductionDrip, HomepageDashboard} from "./HomepageDashboard";
 import {CONST} from "./common/constant";
 
 /**
  * Denominator of the native token rankings, in drip -- the same figure /supply/total
  * publishes. Undefined until the homepage dashboard has filled in its first supply
- * snapshot. See `nullStakeDrip` for the formula.
+ * snapshot. See `supplyDeductionDrip` for the formula.
  */
 export function rankTotalSupplyDrip(supplyInfo: any): bigint | undefined {
     if (supplyInfo?.calculateEvmPosSupply) {
-        return BigInt(supplyInfo.totalIssued) - nullStakeDrip(supplyInfo);
+        return BigInt(supplyInfo.totalIssued) - supplyDeductionDrip(supplyInfo);
     }
     // Conflux eSpace, or any node that answers cfx_getSupplyInfo itself.
     const total = supplyInfo?.totalEspaceTokens || supplyInfo?.totalCirculating;
