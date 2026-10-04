@@ -6,6 +6,7 @@ import {
 	getLatestBlockWithdraw,
 	initBlockWithdrawModel, sumEffectiveBalanceBigInt, ValidatorResponse,
 	WithdrawalCreationAttributes,
+	splitBlockRewards,
 	WithdrawalParser,
 	WithdrawalUtils
 } from "../model/ZG";
@@ -22,6 +23,7 @@ const ctx = {
 	preEntry: null as BlockWithdrawCreationAttributes,
 	eth: undefined as JsonRpcProvider,
 	cumulative: 0n,
+	cumulativeReward: 0n,
 }
 
 async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
@@ -42,8 +44,10 @@ async function getBlockWithdraws(p: JsonRpcProvider, blockNumber: number) {
 			wIndex: w.index, validatorIndex: w.validatorIndex,
 		} as WithdrawalCreationAttributes
 	})
+	// Split before the zero filter: the reward triple is positional, and a zero component
+	// still occupies its slot. Dropping it first would shift the ones behind it.
 	return {
-		withdrawData: wd, withdraws: beans
+		withdrawData: wd, withdraws: beans, rewards: splitBlockRewards(wd.withdrawals)
 	}
 }
 
@@ -59,6 +63,14 @@ async function setupPreBlock() {
 		console.log(`first block number is `, firstBlk.number);
 	} else {
 		ctx.cumulative = parseEther(ctx.preEntry.cumulativeAmount).toBigInt()
+		// Null on every row written before rewards were tracked. Resuming from 0 there
+		// would report issuance as if the chain had just started, so refuse to continue a
+		// table that has not been backfilled rather than publish a wrong total.
+		if (ctx.preEntry.cumulativeReward == null) {
+			throw new Error(`block_withdraws has no cumulativeReward at block ${ctx.preEntry.blockNumber};`
+				+ ` backfill the reward columns before resuming, or drop the table to resync from genesis`);
+		}
+		ctx.cumulativeReward = parseEther(ctx.preEntry.cumulativeReward).toBigInt()
 	}
 }
 
@@ -78,10 +90,10 @@ async function sync(seq?: Sequelize) {
 	while (true) {
 		const wantBlockNo = ctx.preEntry.blockNumber + 1;
 		let failed = false
-		const {withdrawData} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
+		const {withdrawData, rewards} = await getBlockWithdraws(ctx.eth, wantBlockNo).catch(e=>{
 			console.log(`failed to get block withdraws at ${wantBlockNo}:`, e)
 			failed = true;
-			return {withdrawData: null}
+			return {withdrawData: null, rewards: null}
 		});
 		if (failed || !withdrawData) {
 			await sleep(5_000);
@@ -91,14 +103,20 @@ async function sync(seq?: Sequelize) {
 			blockNumber: withdrawData.blockNumber,
 			sumAmount: withdrawData.totalAmount,
 			withdrawalsRoot: withdrawData.withdrawalsRoot,
+			nativeReward: rewards.nativeReward,
+			restakingReward: rewards.restakingReward,
+			baseInflation: rewards.baseInflation,
 		} as BlockWithdrawCreationAttributes;
 		// we have decimal in DB
 		const drip = ctx.cumulative + BigInt(withdrawData.totalAmount);
 		newBean.cumulativeAmount = formatEther(drip);
+		const rewardDrip = ctx.cumulativeReward + BigInt(rewards.blockReward);
+		newBean.cumulativeReward = formatEther(rewardDrip);
 
 		await BlockWithdrawModel.create(newBean).then(()=>{
 			ctx.preEntry = newBean;
 			ctx.cumulative = drip;
+			ctx.cumulativeReward = rewardDrip;
 		}).catch(async e=>{
 			console.log(`failed to save block withdraw model:`, e)
 			await sleep(5_000);
@@ -115,9 +133,18 @@ const ZGGenesisSupply = BigInt(parseEther(1e9.toString()));
 export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<SupplyInfo & any> {
 	// circulating supply = genesis supply + block withdraw - balance(0x0)
 	let blockWithdraw = BigInt(0);
+	// Issuance, which is what `genesis + this` measures. `sumBlockWithdrawal` cannot stand
+	// in for it: that figure also carries validator exits, which return principal rather
+	// than create supply. Reported alongside for now so it can be checked against the
+	// published figures before anything switches over to it; null until the sync has
+	// written the reward columns.
+	let blockReward: bigint = undefined;
 	if (NoCoreSpace && BlockWithdrawModel.sequelize) {
 		const bw = await getLatestBlockWithdraw();
 		blockWithdraw = BigInt(parseEther(bw?.cumulativeAmount || "0")) * BigInt(1e9);
+		if (bw?.cumulativeReward != null) {
+			blockReward = BigInt(parseEther(bw.cumulativeReward)) * BigInt(1e9);
+		}
 	}
 	const sumContracts = await sumSpecialContractBalance(getCfxSdk()).catch(e=>{
 		console.log(`failed to sum contract balance:`, e);
@@ -130,6 +157,7 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 	return {
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
+		sumBlockReward: blockReward,
 		genesisSupply: ZGGenesisSupply,
 		totalCirculating: remain,
 		calculateEvmPosSupply: true,

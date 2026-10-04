@@ -81,7 +81,7 @@ import {TxReceiverDaily, TxReceiverHourly, TxSenderDaily, TxSenderHourly} from "
 import {AuthAction, AuthBlockStub} from "../model/EIP7702model";
 import {ContractImpl} from "../model/ContractImpl";
 import {VerifiedContracts} from "../model/VerifiedContracts";
-import {initBlockWithdrawModel} from "../model/ZG";
+import {BlockWithdrawModel, initBlockWithdrawModel} from "../model/ZG";
 import {DailyGasStat} from "../model/DailyGasStat";
 import {
     DailyPartnerAddr,
@@ -351,6 +351,18 @@ async function migDB(seq: Sequelize) {
     });
 
     // rate_key predates scopes and already exists, so sync() will not add this
+    if (NoCoreSpace) {
+        // sequelize.sync() creates block_withdraws but never alters it, so the reward
+        // columns have to be added here for a table that predates them. They stay
+        // nullable: the rows already in the table have no reward figure, and a default of
+        // 0 would read as "nothing was issued up to that block".
+        const blockWithdraws = BlockWithdrawModel.getTableName().toString();
+        await addColumnIfNotExistsV2(qi, blockWithdraws, 'nativeReward', {type: DataTypes.BIGINT});
+        await addColumnIfNotExistsV2(qi, blockWithdraws, 'restakingReward', {type: DataTypes.BIGINT});
+        await addColumnIfNotExistsV2(qi, blockWithdraws, 'baseInflation', {type: DataTypes.BIGINT});
+        await addColumnIfNotExistsV2(qi, blockWithdraws, 'cumulativeReward', {type: DataTypes.DECIMAL(36, 18)});
+    }
+
     const rateKey = RateKey.getTableName().toString();
     await addColumnIfNotExistsV2(qi, rateKey, 'scope', {
         type: DataTypes.STRING(255), allowNull: false, defaultValue: '',
