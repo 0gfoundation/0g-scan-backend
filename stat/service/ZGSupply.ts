@@ -2,6 +2,7 @@ import {getCfxSdk} from "./common/utils";
 import {parseEther} from "ethers/lib/utils";
 import {SupplyInfo} from "js-conflux-sdk/dist/types/rpc/types/formatter";
 import {ConfigInstance} from "../config/StatConfig";
+import {TOKEN_RELEASE_SCHEDULE} from "./TokenReleaseSchedule";
 import {Conflux} from "js-conflux-sdk";
 
 /*
@@ -109,6 +110,40 @@ import {Conflux} from "js-conflux-sdk";
 // 	}
 // }
 
+export interface ScheduleRow {
+	/** The schedule's own Timeline label: "TGE", then "1" upwards. Carried for reference. */
+	timeline?: string;
+	/** The date this unlock lands, YYYY-MM-DD. */
+	date: string;
+	/**
+	 * Cumulative token allocation unlocked by this date, in whole 0G -- the vesting
+	 * columns of the finance schedule, without its staking reward estimate. Rewards are
+	 * measured rather than estimated, so the estimate is left out and `sumBlockReward`
+	 * stands in its place.
+	 */
+	tokenAllocation: string;
+}
+
+/**
+ * The release schedule row in force: the latest unlock that has already happened.
+ *
+ * Past the final row the last one holds, so the table running out needs no special case --
+ * allocation is fully unlocked by then and only issuance still moves.
+ */
+export function releaseSchedule(now = new Date()): {row?: ScheduleRow, message?: string} {
+	// Dates are YYYY-MM-DD, so they sort and compare as plain strings. UTC, to keep the
+	// boundary off whatever timezone a host happens to be in.
+	const today = now.toISOString().slice(0, 10);
+	const row = TOKEN_RELEASE_SCHEDULE
+		.filter(r => r?.date && r.date <= today)
+		.sort((a, b) => a.date < b.date ? -1 : 1)
+		.pop();
+	if (!row) {
+		return {message: `no unlock on or before ${today}; earliest is ${TOKEN_RELEASE_SCHEDULE[0]?.date}`};
+	}
+	return {row};
+}
+
 // The whole genesis allocation. The 2,000 0G staked at genesis is part of it wherever it
 // now sits: which ledger holds a token does not change whether it exists, and the formula
 // below no longer counts any ledger separately.
@@ -121,18 +156,35 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		return BigInt(0);
 	})
 	//     total       = genesis + everything minted since
-	//     circulating = total - the contracts holding supply back
 	//
-	// Issuance is all that moves it, so nothing else has to be right for these to be
+	// Issuance is all that moves the total, so nothing else has to be right for it to be
 	// right. Staking does not: burning into 0x0 to mint on the consensus layer moves a
 	// token between ledgers without creating or destroying one, which is why neither
 	// `totalStakes` nor `balance(0x0)` appears. They used to, and the published figures
 	// inherited every outage those two had -- a `validatorRpc` that stopped answering
 	// took circulating down 73% in October while the chain itself was fine.
 	const issued = ZGGenesisSupply + blockReward;
-	const remain = issued - sumContracts.valueOf();
+
+	//     circulating = token allocation unlocked so far + everything minted so far
+	//
+	// Two halves, each from whoever actually knows it. Finance owns the allocation
+	// schedule -- vesting, treasury and unlock terms are written down there and nowhere
+	// else -- and the chain owns issuance, which it reports to the block. The schedule
+	// carries an estimate of issuance too, in its staking rewards column; that column is
+	// deliberately not used, since the real figure is right here.
+	//
+	// Not `total - sumContracts`, which is what this did before. That subtracted a list of
+	// nine contract addresses hard-coded in this file, last updated whenever it was
+	// written; against the September 2026 schedule it read 276M high, because addresses
+	// added since were never added to the list. The schedule already accounts for every
+	// locked allocation, so there is nothing left for that list to do.
+	const {row: schedule, message: scheduleMessage} = releaseSchedule();
+	const remain = schedule
+		? BigInt(parseEther(schedule.tokenAllocation)) + blockReward
+		: undefined;
 
 	return {
+		// Reported for reference only; no longer part of any published figure.
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
 		sumBlockReward: blockReward,
@@ -140,7 +192,11 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		totalCirculating: remain,
 		calculateEvmPosSupply: true,
 		totalIssued: issued,
+		scheduleTimeline: schedule?.timeline,
+		scheduleDate: schedule?.date,
+		scheduleTokenAllocation: schedule && BigInt(parseEther(schedule.tokenAllocation)),
 		withdrawalMessage,
+		scheduleMessage,
 		// do not care fields below
 		totalCollateral: undefined,
 		totalEspaceTokens: undefined,

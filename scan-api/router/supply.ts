@@ -13,7 +13,10 @@ router_get(router, '/circulating',
 		const supplyInfo = HomepageDashboard.getData()?.supplyInfo as any || {totalCirculating: 0};
 		const {totalCirculating} = supplyInfo;
 
-		if (totalCirculating == 0) {
+		// Falsy covers the first seconds after boot and, now, a release schedule that
+		// could not be resolved -- see scheduleMessage. Answer nothing rather than a
+		// number that is wrong by the whole locked allocation.
+		if (!totalCirculating) {
 			return "";
 		}
 
