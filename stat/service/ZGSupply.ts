@@ -1,4 +1,5 @@
 import {getCfxSdk} from "./common/utils";
+import {sumValidatorBalanceBigInt, ValidatorResponse} from "../model/ZG";
 import {parseEther} from "ethers/lib/utils";
 import {SupplyInfo} from "js-conflux-sdk/dist/types/rpc/types/formatter";
 import {ConfigInstance} from "../config/StatConfig";
@@ -151,6 +152,7 @@ const ZGGenesisSupply = BigInt(parseEther('1000000000'));
 
 export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<SupplyInfo & any> {
 	const {total: blockWithdraw, rewards: blockReward, message: withdrawalMessage} = await sumWithdrawals();
+	const {balance: totalStakes, message: validatorMessage} = await sumValidatorBalance();
 	const sumContracts = await sumSpecialContractBalance(getCfxSdk()).catch(e=>{
 		console.log(`failed to sum contract balance:`, e);
 		return BigInt(0);
@@ -188,6 +190,8 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		sumContracts,
 		sumBlockWithdrawal: blockWithdraw,
 		sumBlockReward: blockReward,
+		// Reported because the explorer charts it; no published figure depends on it.
+		totalStakes,
 		genesisSupply: ZGGenesisSupply,
 		totalCirculating: remain,
 		calculateEvmPosSupply: true,
@@ -196,6 +200,7 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		scheduleDate: schedule?.date,
 		scheduleTokenAllocation: schedule && BigInt(parseEther(schedule.tokenAllocation)),
 		withdrawalMessage,
+		validatorMessage,
 		scheduleMessage,
 		// do not care fields below
 		totalCollateral: undefined,
@@ -211,26 +216,50 @@ function fetchFailure(e: any): string {
 	return e?.cause ? `${e.message} (${e.cause.code || e.cause.message || e.cause})` : e?.message;
 }
 
-/*
- * Summing validator balances is retired with the cross check it fed, kept commented in
- * case the staked figure is wanted again as a reported number. `validatorRpc` no longer
- * points at the validators endpoint -- see sumWithdrawals below.
+/**
+ * The validators endpoint, derived from `validatorRpc` the way the withdrawals one used to
+ * be derived the other way round:
  *
- * async function sumValidatorBalance(rpc?: string) {
- * 	const ret = {balance: BigInt(0), message: ""};
- * 	const rpcUsed = rpc || ConfigInstance.validatorRpc || ''
- * 	if (!rpcUsed) {
- * 		ret.message = "validator RPC is not set"
- * 		return ret;
- * 	}
- * 	const data = await fetch(rpcUsed).then(res=>res.json()).catch(e=>{
- * 		ret.message = `failed to fetch validator info: ` + fetchFailure(e);
- * 		return null as ValidatorResponse;
- * 	})
- * 	if (!data) return ret;
- * 	return {balance: sumValidatorBalanceBigInt(data) * BigInt(1e9), message: undefined };
- * }
+ *     .../eth/v1/beacon/blocks/head/total_withdrawals  <- validatorRpc, configured
+ *     .../eth/v1/beacon/states/head/validators         <- derived from it
+ *
+ * Unchanged means it did not look like the withdrawals endpoint; report nothing rather
+ * than guess a URL.
  */
+export function validatorRpcUrl(): string {
+	const configured = ConfigInstance.validatorRpc || '';
+	const derived = configured.replace(/\/blocks\/[^/]+\/total_withdrawals\/?$/, '/states/head/validators');
+	return derived === configured ? '' : derived;
+}
+
+/**
+ * What the validators hold, in drip.
+ *
+ * Reported as `totalStakes` and used by nothing here: the published supply is genesis plus
+ * issuance, and staking moves tokens between ledgers without creating or destroying any.
+ * It is fetched because the explorer charts it -- dropping the field blanked
+ * /charts/supply, whose formatter takes a bigInt and got undefined.
+ */
+async function sumValidatorBalance() {
+	const ret = {balance: BigInt(0), message: ""};
+	const url = validatorRpcUrl();
+	if (!url) {
+		ret.message = "validatorRpc is not the withdrawals endpoint, so the validators one cannot be derived";
+		return ret;
+	}
+
+	const data = await fetch(url).then(res => res.json()).catch(e => {
+		console.log(`failed to fetch validator info:`, e)
+		ret.message = `failed to fetch validator info: ` + fetchFailure(e);
+		return null as ValidatorResponse;
+	})
+	if (!data?.data) {
+		ret.message = ret.message || `validator info missing from ${url}`;
+		return ret;
+	}
+
+	return {balance: sumValidatorBalanceBigInt(data) * BigInt(1e9), message: undefined};
+}
 
 /**
  * Cumulative withdrawals and cumulative issuance, in drip, straight from the consensus
