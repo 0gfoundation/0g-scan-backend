@@ -208,7 +208,9 @@ export function mustBeAddressParamIfPresent(obj, netId, isEVM, ...keys:string[])
         if (v === undefined || v === null) {
             continue;
         }
-        if (/0x[0-9a-fA-F]{40}/.test(v)) {
+        // Anchored: unanchored, any string merely containing an address passed, so
+        // "validated address" said nothing about the rest of the value.
+        if (typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)) {
             continue; // hex 40
         }
         if (!isValidCfxAddress(v)) {

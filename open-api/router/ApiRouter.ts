@@ -86,6 +86,7 @@ import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAu
 import {mustBeAddressParamIfPresent,} from "../../stat/service/common/utils";
 import {
     checkApiKey,
+    checkRate,
     checkRateByAddress,
     checkRateByLevel,
     loadRateConfig,
@@ -193,7 +194,8 @@ function registerRouter(router: Router) {
     router.get('/nft/balances', listAccountNFTs);
     router.get('/nft/tokens', checkRateByAddr, listNFTTokensPro);
     router.get('/nft/preview', getNFTPreview);
-    router.get('/nft/fts', listNFTTokensByFts);
+    // Per-IP on top of the level limiter: public, unauthenticated full-text search.
+    router.get('/nft/fts', checkRate, listNFTTokensByFts);
     router.get('/nft/owners', listNFTOwners);
     router.get('/nft/transfers', listNFTTransfers);
 

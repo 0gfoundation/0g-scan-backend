@@ -93,6 +93,7 @@ import {Errors} from "../../stat/service/common/LogicError";
 import {TokenQuery, TokenType} from "../../stat/service/TokenQuery";
 import {NFTType} from "../../stat/service/nftchecker/NFTCheckerService";
 import {HomepageDashboard} from "../../stat/service/HomepageDashboard";
+import {checkRate} from "../../stat/router/RateLimiter";
 import {rankTotalSupplyDrip} from "../../stat/service/RankService";
 
 const lodash = require('lodash');
@@ -1046,7 +1047,8 @@ export function registerRouter(router: Router) {
     router.get('/nft/balances', listAccountNFTs);
     router.get('/nft/tokens', listNFTTokensPro);
     router.get('/nft/preview', getNFTPreview);
-    router.get('/nft/fts', listNFTTokensByFts);
+    // Per-IP on top of the level limiter: public, unauthenticated full-text search.
+    router.get('/nft/fts', checkRate, listNFTTokensByFts);
     router.get('/nft/owners', listNFTOwners);
     router.get('/nft/transfers', listNFTTransfers);
 
