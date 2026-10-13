@@ -445,13 +445,29 @@ export function checkCodeFormat(codeFormat) {
     }
 }
 
+/**
+ * `versions` comes from `JSON.parse`, so it carries Object.prototype and a
+ * plain `versions[requestVersion]` lookup answers for keys nobody put there:
+ * `constructor`, `toString`, `__proto__` and `hasOwnProperty` all return a
+ * truthy inherited member and pass the check, handing a function or an object
+ * back as the compiler version. `valueOf` is the one that does not, purely
+ * because it begins with `v` and so takes the branch below instead.
+ *
+ * Reported by probe traffic on 2026-10-13 that tried `prototype` and `valueOf`
+ * -- both rejected, the second by that accident -- alongside `$(sleep 5)` and
+ * `; sleep 8`, which the whitelist rejects as it should.
+ */
+function ownVersion(versions, key) {
+    return Object.prototype.hasOwnProperty.call(versions, key) ? versions[key] : undefined
+}
+
 export function checkSolcVersion(requestVersion, versions) {
     if(!requestVersion) {
         throw new Error('solc version required')
     }
 
     if(!requestVersion.startsWith('v')) {
-        const version = versions[requestVersion]
+        const version = ownVersion(versions, requestVersion)
         if(!version) {
             throw new Error(`solc version ${requestVersion} not supported`)
         }
@@ -485,7 +501,8 @@ export function checkVyperVersion(requestVersion, versions) {
     }
 
     if(!requestVersion.startsWith('vyper')) {
-        const verInfo = versions[requestVersion]
+        // same inherited-key hazard as checkSolcVersion, see ownVersion above
+        const verInfo = ownVersion(versions, requestVersion)
         if(!verInfo) {
             throw new Error(`vyper version ${requestVersion} not supported`)
         }
@@ -500,7 +517,14 @@ export function checkVyperVersion(requestVersion, versions) {
 }
 
 export function convertVyperVersion(versionWithCommit, versions) {
-    return versions[versionWithCommit.split('+')[0]].desc
+    const key = versionWithCommit.split('+')[0]
+    // Was `versions[key].desc`: an unknown key threw TypeError on undefined and
+    // an inherited one read `.desc` off a function. Both become a stated error.
+    const verInfo = ownVersion(versions, key)
+    if(!verInfo) {
+        throw new Error(`vyper version ${key} not supported`)
+    }
+    return verInfo.desc
 }
 
 /**
