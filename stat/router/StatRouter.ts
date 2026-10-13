@@ -36,7 +36,7 @@ import {
 } from "../service/common/utils";
 import {limitListOnBody} from "../service/pos/PosStat";
 import {checkRate, getClientIP, loadRateConfig} from "./RateLimiter";
-import {Errors} from "../service/common/LogicError";
+import {DB_ERROR_PUBLIC_MESSAGE, Errors, isDatabaseError} from "../service/common/LogicError";
 import {RateLimiterMemory} from "rate-limiter-flexible";
 import {LIMIT_MAX_STAT, paginateCore, paginateCoreStat} from "./ParamChecker";
 import * as bodyParser from "koa-bodyparser";
@@ -902,7 +902,15 @@ export function register(app:Koa, statApp: StatApp) {
             ctx.body = StatApp.isEVM ? { status: '1', message: '', result: ctx.body } :
                 { code: 0, message: '', data: ctx.body };
         } catch (e) {
-            if(e.code === undefined){
+            if (isDatabaseError(e)) {
+                // See DB_ERROR_PUBLIC_MESSAGE. The branch below would wrap it as a
+                // BizError carrying the raw message, and BizError's status of 600
+                // keeps it out of the "unknown error" rewrite further down.
+                e['url'] = ctx.originalUrl;
+                console.log(`url ${ctx.originalUrl} \ndatabase error caught by router:`, e);
+                safeAddErrorLog('stat-router', 'stat-db-error', e).then()
+                e = new Errors.BizError(DB_ERROR_PUBLIC_MESSAGE);
+            } else if(e.code === undefined){
                 console.log(`url ${ctx.originalUrl} \nunhandled error caught by router:`, e);
                 e = new Errors.BizError(e.message);
             } else if (e.code === 'INVALID_ARGUMENT'
