@@ -377,7 +377,9 @@ async function listTransferCfx(ctx) {
     let options;
     const skip = (page - 1) * offset;
     if (txhash) {
-        options = {transactionHash: txhash};
+        // page/offset apply within the transaction, as on etherscan: one call can emit
+        // more internal transfers than a single page holds.
+        options = {transactionHash: txhash, skip, limit: offset};
     } else if (address) {
         options = {accountAddress: address, minEpochNumber: startblock, maxEpochNumber: endblock, sort,
             skip, limit: offset};
