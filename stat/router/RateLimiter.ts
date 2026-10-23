@@ -99,12 +99,28 @@ const burstyLimiter = new BurstyRateLimiter(
     })
 );
 
+/**
+ * Reverse proxies between the client and this process -- today just our own
+ * nginx. Each proxy appends the address it received the request from to
+ * X-Forwarded-For, so the client is the entry this many hops from the right.
+ * Everything further left was written by the client and is ignored.
+ */
+export const TRUSTED_PROXY_HOPS = 1;
+
+/** Make `ctx.ip` the rightmost trusted X-Forwarded-For hop. */
+export function trustProxy(app) {
+    app.proxy = true;
+    app.maxIpsCount = TRUSTED_PROXY_HOPS;
+}
+
+/**
+ * Client address for rate limiting and logs. Deliberately reads no CDN header
+ * (ali-cdn-real-ip, cf-connecting-ip, ...): no CDN fronts the API, so those
+ * are whatever the client chose to send. Requires `trustProxy(app)`.
+ */
 export function getClientIP(ctx) {
     if (!ctx) {
         return '-';
-    }
-    if (ctx.headers) {
-        return ctx.headers['ali-cdn-real-ip'] || ctx.headers['cf-connecting-ip'] || ctx.request?.ip;
     }
     return ctx.request?.ip || '~';
 }

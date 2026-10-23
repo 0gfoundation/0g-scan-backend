@@ -90,7 +90,8 @@ import {
     checkRateByAddress,
     checkRateByLevel,
     loadRateConfig,
-    loadRateKeyConfig
+    loadRateKeyConfig,
+    trustProxy
 } from "../../stat/router/RateLimiter";
 import {CIP1559StatType} from "../../stat/service/StatsQuery";
 import {NoCoreSpace} from "../../stat/config/StatConfig";
@@ -132,7 +133,7 @@ export async function register(app: Koa, apiServer: ApiServer, port:string|numbe
     let middleware = router.routes();
     app.use(middleware)
 
-    app.proxy = true
+    trustProxy(app)
     router.get('/', async (ctx)=>{
         return root(ctx, apiServer.config.serverTag, port)
     })

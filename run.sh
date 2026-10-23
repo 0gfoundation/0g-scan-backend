@@ -42,17 +42,25 @@ if [ -s "./scan.env" ]; then
 	if [ "$1" == "nginx" ]; then
 		echo """
 	# add these lines to /etc/nginx/sites-available/default, near the default 'location /' .
+	# X-Forwarded-For is overwritten, never appended: the backend takes the rightmost
+	# hop as the client IP and treats a request without it as local (/stat/devops).
         location /$SPACE/rpc {
                 proxy_pass $_RPC/;
         }
         location /$SPACE/v1/ {
                 proxy_pass http://127.0.0.1:$V1_PORT/v1/;
+                proxy_set_header X-Forwarded-For \$remote_addr;
+        }
+        location /$SPACE/stat/devops/ {
+                return 404;
         }
         location /$SPACE/stat/ {
                 proxy_pass http://127.0.0.1:$STAT_PORT/stat/;
+                proxy_set_header X-Forwarded-For \$remote_addr;
         }
         location /$SPACE/open/ {
                 proxy_pass http://127.0.0.1:$OPEN_PORT/open/;
+                proxy_set_header X-Forwarded-For \$remote_addr;
         }
 		"""
 		echo "you may need these urls to setup frontend:"

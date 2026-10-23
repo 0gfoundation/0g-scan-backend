@@ -35,7 +35,7 @@ import {
     nativeTokenSymbol,
 } from "../service/common/utils";
 import {limitListOnBody} from "../service/pos/PosStat";
-import {checkRate, getClientIP, loadRateConfig} from "./RateLimiter";
+import {checkRate, getClientIP, loadRateConfig, trustProxy} from "./RateLimiter";
 import {DB_ERROR_PUBLIC_MESSAGE, Errors, isDatabaseError} from "../service/common/LogicError";
 import {RateLimiterMemory} from "rate-limiter-flexible";
 import {LIMIT_MAX_STAT, paginateCore, paginateCoreStat} from "./ParamChecker";
@@ -929,7 +929,7 @@ export function register(app:Koa, statApp: StatApp) {
                 { code: e.code, message: e.message, data: e.partialData };
         }
     })
-    app.proxy = true
+    trustProxy(app)
     loadRateConfig().then()
     router.use(checkRate)
     addRoute(router, statApp);
