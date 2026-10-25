@@ -110,19 +110,13 @@ export const TRUSTED_PROXY_HOPS = 1;
 /** Make `ctx.ip` the rightmost trusted X-Forwarded-For hop. */
 export function trustProxy(app) {
     app.proxy = true;
-    // TODO: enable together with the nginx change that sets
-    // `proxy_set_header X-Forwarded-For $remote_addr` (see run.sh). Until then
-    // ctx.ip stays the leftmost entry, which the client can still forge. Turned
-    // on alone it is worse: if nginx sets no X-Forwarded-For, every request
-    // falls back to nginx's own 127.0.0.1 and all clients share one bucket.
-    // app.maxIpsCount = TRUSTED_PROXY_HOPS;
+    app.maxIpsCount = TRUSTED_PROXY_HOPS;
 }
 
 /**
  * Client address for rate limiting and logs. Deliberately reads no CDN header
  * (ali-cdn-real-ip, cf-connecting-ip, ...): no CDN fronts the API, so those
- * are whatever the client chose to send. Only as trustworthy as `ctx.ip`; see
- * the TODO in `trustProxy`.
+ * are whatever the client chose to send. Requires `trustProxy(app)`.
  */
 export function getClientIP(ctx) {
     if (!ctx) {

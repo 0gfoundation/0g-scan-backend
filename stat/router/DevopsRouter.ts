@@ -33,28 +33,25 @@ import {getClientIP} from "./RateLimiter";
 import {ConfigInstance} from "../config/StatConfig";
 import {appPorts, evmDiffPort} from "../monitor/serverApi";
 
-// TODO: once nginx always sets X-Forwarded-For (see run.sh), replace the
-// getClientIP check below with this one and enable the `/devops` gate in
-// addDevopsRouter. It goes by the socket, so no header can make a request
-// local; the X-Forwarded-For check is what tells nginx's relayed traffic,
-// which also arrives from 127.0.0.1, apart from a real local caller. Without
-// that header from nginx every public request would pass as local.
-//
-// export function isLocalRequest(ctx: Context) {
-//     if (ctx.get('x-forwarded-for') || ctx.get('x-real-ip')) {
-//         return false;
-//     }
-//     const peer = (ctx.req?.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-//     return peer === '127.0.0.1' || peer === '::1' || peer.startsWith('172.31.124.');
-// }
+/**
+ * Local means the TCP peer itself is local and no proxy relayed the request.
+ * This goes by the socket, never by getClientIP, so no header can make a
+ * request local. The X-Forwarded-For check is what rejects traffic nginx
+ * relays from 127.0.0.1 -- which only works because nginx always sets it.
+ */
+export function isLocalRequest(ctx: Context) {
+    if (ctx.get('x-forwarded-for') || ctx.get('x-real-ip')) {
+        return false;
+    }
+    const peer = (ctx.req?.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+    return peer === '127.0.0.1' || peer === '::1' || peer.startsWith('172.31.124.');
+}
 
 async function checkLocal(ctx: Context, next) {
-    const ip = getClientIP(ctx);
-    if (ip === '127.0.0.1' || ip === '::1'
-        || ip.startsWith('172.31.124') || ip === '::ffff:127.0.0.1') {
+    if (isLocalRequest(ctx)) {
         await next()
     } else {
-        ctx.body = {code: 401, message: `local address only. ${ip}`}
+        ctx.body = {code: 401, message: `local address only. ${getClientIP(ctx)}`}
     }
 }
 export async function proxyPath(ctx: any, next:any) {
@@ -70,10 +67,9 @@ export async function proxyPath(ctx: any, next:any) {
     await p(ctx,next)
 }
 export function addDevopsRouter(router: Router<any, {}>, statApp: StatApp) {
-    // TODO: gate every devops route -- they read raw tables and write the token
-    // blacklist. Needs the nginx change first; see isLocalRequest above. Must be
-    // registered before the routes below so it runs first.
-    // router.use('/devops', checkLocal)
+    // Every devops route: it reads raw tables and writes the token blacklist.
+    // Must be registered before the routes below so it runs first.
+    router.use('/devops', checkLocal)
     router.post('/devops/rpc-proxy', async (ctx, next)=>{
         const p = proxy({
             url:  'http://127.0.0.1/rpc-proxy', // config local nginx to do your job
@@ -229,7 +225,6 @@ export function addDevopsRouter(router: Router<any, {}>, statApp: StatApp) {
     )
 
     router.get('/devops/table-size',
-        checkLocal,
         async (ctx) => {
             ctx.body = {
                 code: 0,
