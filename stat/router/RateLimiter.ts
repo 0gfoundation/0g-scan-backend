@@ -100,23 +100,35 @@ const burstyLimiter = new BurstyRateLimiter(
 );
 
 /**
- * Reverse proxies between the client and this process -- today just our own
- * nginx. Each proxy appends the address it received the request from to
- * X-Forwarded-For, so the client is the entry this many hops from the right.
- * Everything further left was written by the client and is ignored.
+ * Reverse proxies between the client and this process. Each proxy appends the
+ * address it received the request from to X-Forwarded-For, so the client is
+ * the entry this many hops from the right. Everything further left was
+ * written by the client and is ignored. 1 fits the single nginx run.sh sets
+ * up; mainnet has more, see the TODO in `trustProxy`.
  */
 export const TRUSTED_PROXY_HOPS = 1;
 
 /** Make `ctx.ip` the rightmost trusted X-Forwarded-For hop. */
 export function trustProxy(app) {
     app.proxy = true;
-    app.maxIpsCount = TRUSTED_PROXY_HOPS;
+    // TODO: not safe on mainnet yet. A request there arrives with
+    // `X-Forwarded-For: <client>, <public nginx's peer>, 10.128.0.5`: the public
+    // nginx (chainscan-api.0g.ai) appends its peer, and the nginx beside these
+    // processes appends the public one's private address. So 1 would give every
+    // request 10.128.0.5 and one shared bucket. 2 is right for direct callers,
+    // but for the Vercel frontend the public nginx's peer is a Vercel egress
+    // address shared by many users -- and Vercel passes a client's own
+    // X-Forwarded-For through whenever it also sends x-vercel-forwarded-for, so
+    // neither header can be trusted there. Enable once the public nginx can
+    // tell Vercel traffic apart and write the real client in itself.
+    // app.maxIpsCount = TRUSTED_PROXY_HOPS;
 }
 
 /**
  * Client address for rate limiting and logs. Deliberately reads no CDN header
  * (ali-cdn-real-ip, cf-connecting-ip, ...): no CDN fronts the API, so those
- * are whatever the client chose to send. Requires `trustProxy(app)`.
+ * are whatever the client chose to send. Only as trustworthy as `ctx.ip`; see
+ * the TODO in `trustProxy`.
  */
 export function getClientIP(ctx) {
     if (!ctx) {
