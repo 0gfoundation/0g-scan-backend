@@ -85,7 +85,6 @@ import {
 import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAuth";
 import {mustBeAddressParamIfPresent,} from "../../stat/service/common/utils";
 import {
-    checkApiKey,
     checkRate,
     checkRateByAddress,
     checkRateByLevel,
@@ -136,16 +135,6 @@ export async function register(app: Koa, apiServer: ApiServer, port:string|numbe
     trustProxy(app)
     router.get('/', async (ctx)=>{
         return root(ctx, apiServer.config.serverTag, port)
-    })
-    router.get('/echo', (ctx)=>{
-        ctx.body = {ip: ctx.ip, header: ctx.headers}
-    })
-    router.get('/test-billing', async (ctx)=>{
-        const {ok:paid, result: billingResult} =
-            await checkApiKey('/test-billing', ctx?.request?.query?.apiKey || ctx?.headers['apiKey'],
-                ctx.request.query.dryRun
-            )
-        ctx.body = {paid, billingResult, query: ctx.request.query, header: ctx.headers, ip: ctx.ip}
     })
     router.get('/favicon.ico', (ctx) => ctx.status = 204/*No Content*/);
     router.get('/version', (ctx)=>{

@@ -22,7 +22,6 @@ import {CONST} from "../../stat/service/common/constant";
 import {nativeTokenSymbol} from "../../stat/service/common/utils";
 const lodash = require('lodash');
 import * as KoaRouter from "koa-router";
-import {getClientIP} from "../../stat/router/RateLimiter";
 import {safeAddErrorLog} from "../../stat/monitor/ErrorMonitor";
 import {getAccountQuery} from "../../stat/service/AccountQuery";
 import {fmtAddr} from "../../stat/StatApp";
@@ -84,14 +83,6 @@ router_get(router,'/', function (ctx) {
   const { app: { config: { machine } } } = this;
   return { message: `scan-api-v1, [${machine}]` };
 });
-router_get(router,'/echo', function (ctx) {
-  return {
-    "headers": ctx.headers,
-    "ip": getClientIP(ctx),
-    "time": new Date().toISOString(),
-    "service": "v1",
-  }
-})
 // --------------------------------- OpenAPI ----------------------------------
 
 // -------------------------------- Statistic ---------------------------------
