@@ -26,15 +26,18 @@ import {
  * look-alike events from arbitrary contracts out. The window's events, the
  * share deltas they imply and the cursor are written in one DB transaction.
  *
- * Reorgs are not handled: 0G finalizes through CometBFT, and the window never
- * goes past the RPC's `finalized` block (or `latest - confirmations` when the
- * node has no such tag).
+ * Reorgs are not handled: 0G finalizes every block through CometBFT, so the
+ * window runs up to `latest` (minus `confirmations`, 0 by default). The RPC's
+ * `finalized` tag is not used: it trails `latest` by ~10 blocks for nothing.
  */
 
 export const KEY_STAKING_CURSOR = 'STAKING_SYNC_BLOCK';
 const KEY_STAKING_GENESIS = 'STAKING_GENESIS_SEEDED';
-/** eth_getLogs address-array size; RPCs cap it at different values */
-const ADDRESS_CHUNK = 50;
+/**
+ * eth_getLogs address-array size. evmrpc.0g.ai took 1,000 without complaint
+ * (2026-11-04); other RPCs cap it differently, so stay well below that.
+ */
+const ADDRESS_CHUNK = 500;
 
 export function stakingOption(): Required<StakingOption> {
     const o = ConfigInstance.staking || {};
@@ -43,8 +46,9 @@ export function stakingOption(): Required<StakingOption> {
         contract: (o.contract || DEFAULT_STAKING_CONTRACT).toLowerCase(),
         genesis: o.genesis,
         startBlock: o.startBlock ?? 1,
-        confirmations: o.confirmations ?? 3,
-        logRange: o.logRange ?? 2000,
+        confirmations: o.confirmations ?? 0,
+        // the 0G RPC's eth_getLogs limit (`query exceeds max block range 100000`)
+        logRange: o.logRange ?? 100_000,
         refreshIntervalMs: o.refreshIntervalMs ?? 60 * SECOND,
     };
 }
@@ -52,7 +56,6 @@ export function stakingOption(): Required<StakingOption> {
 const ctx = {
     provider: null as JsonRpcProvider,
     validators: new Set<string>(),
-    hasFinalizedTag: null as boolean,
     range: 0,
 };
 
@@ -116,19 +119,7 @@ async function seedGenesis(network: string) {
 }
 
 async function safeHead(): Promise<number> {
-    const p = ctx.provider;
-    if (ctx.hasFinalizedTag !== false) {
-        const block = await p.send('eth_getBlockByNumber', ['finalized', false]).catch(() => null);
-        if (block?.number) {
-            ctx.hasFinalizedTag = true;
-            return parseInt(block.number, 16);
-        }
-        if (ctx.hasFinalizedTag === null) {
-            console.log(`staking sync: RPC has no finalized tag, using latest - ${stakingOption().confirmations}`);
-        }
-        ctx.hasFinalizedTag = false;
-    }
-    return (await p.getBlockNumber()) - stakingOption().confirmations;
+    return (await ctx.provider.getBlockNumber()) - stakingOption().confirmations;
 }
 
 async function getLogs(address: string | string[], topics: string[], from: number, to: number): Promise<RawLog[]> {

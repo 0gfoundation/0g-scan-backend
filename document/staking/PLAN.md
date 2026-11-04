@@ -30,7 +30,7 @@
 | 每个 validator 是 Staking 用 CREATE2 部署的 BeaconProxy，地址由 pubkey 决定 | `StakingContract.sol:322-339` | `Delegate` 等事件从各 validator 地址发出。**必须先有 validator 地址集合，再按集合过滤日志**，否则任何合约都能伪造同名事件（Xangle 就没做这层校验） |
 | `createValidator` 发 `ValidatorCreated`，`initializeValidator` 发 `ValidatorInitialized`，退出发 `ValidatorExited` | `StakingContract.sol` | 用事件发现 validator，不再像 Xangle 那样解析 tx input（Xangle 的 `0xf9673cc0` selector 不在 ABI 里，一旦命中游标会卡死） |
 | 委托人的份额只在 `Delegate` / `Undelegate` / `Slashed`（只扣 operator 的份额）时变化，**外加初始化时的自质押** | `ValidatorContract.sol:392-451, 532-577, 608-650` | Delegate / Undelegate / 初始化都能从日志拿到，shares **按事件增量维护**；`Slashed` 走系统调用、日志取不到（见下一行），operator 的份额靠 refresher 用链上值校正 |
-| 当前版本 `initilize` → `_selfDelegate` → `_delegate` **不发 `Delegate` 事件**；operator 的初始份额只体现在 Staking 的 `ValidatorInitialized(pubkey, validator, operator, amount)` 里。此时池子为空，`convertToShares` 按 1:1 返回 | `ValidatorContract.sol:100-108, 330-338` | 处理 `ValidatorInitialized` 时给 operator 记 `shares = amount`。Xangle 提到旧版初始化会发一条非 indexed 的 `Delegate`：如果同一笔交易里同一个 validator 已经有 `Delegate`，就不再重复记（第 0 步确认） |
+| 当前版本 `initilize` → `_selfDelegate` → `_delegate` **不发 `Delegate` 事件**；operator 的初始份额只体现在 Staking 的 `ValidatorInitialized(pubkey, validator, operator, amount)` 里。此时池子为空，`convertToShares` 按 1:1 返回 | `ValidatorContract.sol:100-108, 330-338` | 处理 `ValidatorInitialized` 时给 operator 记 `shares = amount`。Xangle 提到旧版初始化会发一条非 indexed 的 `Delegate`：如果同一笔交易里同一个 validator 已经有 `Delegate`，就不再重复记（第 0 步已确认：块 9,960,343 及以前的 35 笔初始化交易都带这条 Delegate） |
 | 委托人的代币价值 = `shares × (tokens + rewards) / delegatorShares` | `getDelegatedTokens`，`ValidatorContract.sol:348-354` | 奖励每块累积，价值不能从事件推出来。在查询时用 validator 行上定期刷新的 `tokens` / `rewards` / `delegatorShares` 计算。Xangle 只用了 `tokens`，**漏算了 `rewards`** |
 | 系统地址 `0xff…fE` 每块调用 Staking 的 fallback，转到出块 validator 的 fallback，触发 `DistributeRewards` 和提现队列处理（`PopWithdrawEntry`、失败时的 `PushWithdrawEntry(isFailed=true)`）；罚没 `slashValidator` 也只允许系统地址调用 | `StakingContract.sol:313-320, 393-400`，`ValidatorContract.sol:961-980` | **已确认：系统调用产生的日志 `eth_getLogs` 取不到**。所以奖励、队列出队、罚没都没有事件可收，只能从 view 调用的状态变化里看（见"事件清单"） |
 | `ValidatorInitialized` / `ValidatorExited` 由 Staking 合约在普通交易里发出（`initializeValidator` / `exitValidator`），日志取得到。罚没导致的退出（`slash(amount, exited=true)`）走系统调用，不发 `ValidatorExited` | `StakingContract.sol:291-310, 342-363`，`ValidatorContract.sol:532-577` | validator 的创建、退出高度和交易哈希都取自这两个事件。罚没导致的退出不在展示范围内，这类 validator 的退出信息为空 |
@@ -39,16 +39,37 @@
 | 有新旧两版事件签名 | Xangle 的 4 个 topic | V1：`Delegate(address,uint256,uint256)` / `Undelegate(address,uint256,uint256)`，delegator 可能是 indexed，也可能在 data 里。V2：`Delegate(address indexed payer, address indexed delegator, uint256, uint256)` / `Undelegate(address indexed delegator, address indexed withdrawal, uint256 shares, uint256 amount)` |
 | 创世 validator 由 genesis deposit 注册，没有 `ValidatorCreated` / `ValidatorInitialized` | Xangle `GenesisValidatorLoader`，exex `seed_genesis_validators` | 需要一次性导入 validator **和 operator 的初始份额**。exex 给出的主网数据：4 个 validator，operator 都是 `0x711b…2522`，各 500 0G。Xangle 只导入了 validator、没导入份额，这就是它 KNOWN_ISSUES §3.1 里"创世 validator 自质押显示为 0"的来源 |
 
-## 第 0 步：上链验证（开工前，约半天）
+## 第 0 步：上链验证（已完成，2026-11-04）
 
-以下几点决定后续设计，需要连主网 RPC 验证。开发环境的沙箱连不上 `evmrpc-mainnet.0g.ai`，要在本地或服务器上跑，探测脚本见附录 C。
+用 `https://evmrpc.0g.ai`（开发机能连；`evmrpc-mainnet.0g.ai` 仍连不上）验证，第 3、5、6 项由人工确认。
 
-1. ~~系统调用产生的 `DistributeRewards` / `PopWithdrawEntry` 能否用 `eth_getLogs` 取到？~~ **已确认取不到**（2026-09-29）。
-2. RPC 对 `eth_getLogs` 的块范围上限和结果条数上限是多少？`address` 传数组（约 100 个地址）行不行？
-3. 是否支持 `eth_getBlockByNumber("finalized")`？0G 用 CometBFT，理论上是即时终局，需要确认。
-4. 主网实际出现过哪些事件签名：V1 和 V2 的分界块，有没有 V1 的非 indexed 变体（exex 假定 V1 的 delegator 总是 indexed，Xangle 两种都处理），旧版初始化交易里是否带 `Delegate`。还要找到第一个 `ValidatorCreated` 的块号，作为回灌起点。
-5. 4 个创世 validator 在第 1 块时 operator `getDelegation` 的份额（用 archive 节点按块号查），确认是否就是 500e18。
-6. 找一个真实发生罚没的块，确认 `eth_getBlockByNumber` 返回里 `slashed` 字段的名字和结构（按说和 `withdrawals` 的元素相同），以及没有罚没时是省略还是空数组。2026-11-04 抽样的 40 个块都没有这个字段。
+| # | 问题 | 结论 | 对实现的影响 |
+|---|---|---|---|
+| 1 | 系统调用的日志能否用 `eth_getLogs` 取到 | **取不到**（`DistributeRewards`、`PopWithdrawEntry` 等） | 奖励、罚没改从区块数据和 view 调用获取 |
+| 2 | `eth_getLogs` 的限制 | 块范围上限 **100,000**（超出返回 `query exceeds max block range 100000`）；`address` 数组传 1,000 个也正常；单次返回 13,115 条没有触发条数上限 | `logRange` 默认值已从 2000 改为 100,000，`ADDRESS_CHUNK` 从 50 改为 500。全历史 493 个窗口、6 路并发扫完约 47 秒 |
+| 3 | 是否需要 `finalized` | **不需要**（人工确认）：CometBFT 出一块即终局。RPC 支持 `finalized` 标签，但比 `latest` 落后约 10 块 | 直接用 `latest`，`confirmations` 默认为 0（已实现，同步不再查 `finalized`） |
+| 4 | 事件签名、分界块、回灌起点 | 见下文"事件历史" | 回灌必须**从块 1 开始**，不能从第一个 `ValidatorCreated` 开始；旧版初始化的去重规则是必需的，而且是对的 |
+| 5 | 创世 operator 的份额是否为 500e18 | **是**（人工确认） | `GENESIS_VALIDATORS` 里写死的 500 0G 正确 |
+| 6 | `slashed` 字段的格式 | 与 `withdrawals` 元素相同（人工确认，0g-geth 的 `SlashedValidatorEntry` 复用 `engineprimitives.Withdrawal`）：`Index` = 证据高度（CometBFT 违规高度 / slashingInfo slot），`Validator` = 被罚 validator 的共识层编号，`Address` = 该 validator 的执行层提现地址，`Amount` = 罚金（gwei） | `Address` 就是 validator 合约地址：beacon 上 67 个 validator 的提现凭证都是 `0x01` + 一个已知的 validator 合约地址，与合约 `_selfDelegate` 的写法一致。**罚没直接按 `address` 归属**，不需要 beacon 的 `index → pubkey` 映射 |
+
+**事件历史**（主网全量扫描，截至块 49,270,785，共 10,311 条）：
+
+| 事件 | 条数 | 区块范围 | 发出方 |
+|---|---|---|---|
+| `ValidatorCreated` | 76 | 1,064,767 – 48,609,538 | Staking |
+| `ValidatorInitialized` | 74 | 1,064,767 – 41,956,200 | Staking（有 2 个 validator 只创建、未初始化） |
+| `ValidatorExited` | 20 | 12,034,802 – 48,556,929 | Staking |
+| `Delegate` V1（`topics` 长度 2，delegator indexed） | 1,570 | **117,516** – 10,080,413 | 39 个 validator |
+| `Undelegate` V1（同上） | 131 | 118,003 – 10,104,717 | 16 个 validator |
+| `Delegate` V2 | 6,505 | 10,110,247 – 49,269,741 | 63 个 validator |
+| `Undelegate` V2 | 1,935 | 10,156,816 – 49,085,661 | 57 个 validator |
+
+- **V1 → V2 的分界**：最后一条 V1 在块 10,104,717，第一条 V2 在块 10,110,247。
+- **V1 没有非 indexed 变体**：主网上 V1 全部是 delegator indexed（`topics` 长度 2）。解码器里非 indexed 的分支保留，不会被走到。
+- **回灌起点**：第一条 `Delegate`（块 117,516）早于第一个 `ValidatorCreated`（块 1,064,767），这些委托都发给了创世 validator。所以回灌必须从块 1 开始，现在的默认 `startBlock = 1` 是对的。
+- **旧版初始化**：74 笔初始化交易中，块 9,960,343 及以前的 35 笔，在 `ValidatorInitialized` 之前都有一条同一 validator 发出的 V1 `Delegate`，委托人就是 operator，金额等于初始自质押，35 笔全部吻合。块 10,237,103 及以后的 39 笔没有 Delegate。按"同一交易里已有该 operator 的 Delegate 就不重复记"去重是必需的；如果不去重，这 35 个 validator 的初始份额都会算两遍。
+- **validator 总数**：80 个（76 个创建 + 4 个创世），其中 20 个已退出。
+- **没有冒充事件**：主网上没有非 validator 合约发出同名的 Delegate / Undelegate。按 validator 地址集合过滤仍然保留，作为防御。
 
 ## 数据模型（MySQL，新增 3 张表 + KV 游标）
 
@@ -115,11 +136,11 @@
 骨架照抄 `eip7702.ts`：`setTimeout` 循环 + `safeAddErrorLog`，写库用 `bulkCreate(ignoreDuplicates)`，放在事务里。RPC 用 `initEthSdk(ConfigInstance.ether?.url)`。
 
 **每轮处理一个窗口 `[from, to]`**
-- `to = min(safeHead, from + range - 1)`。`safeHead` 取 `finalized`，不支持的话取 `latest - confirmations`。
+- `to = min(safeHead, from + range - 1)`。`safeHead` = `latest - confirmations`，`confirmations` 默认 0：CometBFT 出一块即终局（第 0 步第 3 项）。
 1. `getLogs({address: STAKING, topics: [[ValidatorCreated, ValidatorInitialized, ValidatorExited]]})`：新 validator 写进 `staking_validator`，同时加入内存里的地址集合。`ValidatorCreated` 只用来发现地址，不对外展示；创建高度以 `ValidatorInitialized` 为准。
    - 必须先做这一步：validator 创建后同一块里就可能收到委托，先有地址才收得到。`ValidatorInitialized` 在这里就给 operator 记初始份额。
 2. `getLogs({address: [所有 validator], topics: [[Delegate V1/V2, Undelegate V1/V2, OwnershipTransferred, CommissionRateChanged, WithdrawalFeeInGweiChanged, WithdrawCommission, WithdrawTipFee]]})`。
-   - 地址超过 RPC 上限就分组查。
+   - 地址按 500 个一组分批查（`ADDRESS_CHUNK`）。
 3. 在同一个事务里：
    - 写 `staking_event`，已存在的忽略；
    - 按事件把 shares 增量更新到 `staking_delegation`：ValidatorInitialized 给 operator 加 amount，Delegate 加，Undelegate 减（罚没没有事件，由 refresher 校正）；
@@ -127,7 +148,7 @@
    - 增量**只对新插入的事件**生效：先插事件，拿到实际插入的行，再只对这些行做增量。这样同一窗口重跑是幂等的。
 
 **其他处理**
-- 回灌：从第一个 `ValidatorCreated` 的块开始跑，逻辑同上。主网 Xangle 的 seed 只有约 9k 条 delegate_trx，量很小。
+- 回灌：从块 1 开始跑（第一条 Delegate 在块 117,516，早于第一个 `ValidatorCreated`，见第 0 步），逻辑同上。主网 Xangle 的 seed 只有约 9k 条 delegate_trx，量很小。
 - getLogs 出错时减半窗口重试，参考 `LogFetcher` 的做法。窗口大小从配置读。
 - 回滚：如果有终局就不处理 reorg。如果只能靠确认数，就在每个窗口末尾记下 blockHash，下一轮先比对，不一致就删掉 `≥ from` 的事件，按事件反向扣回 shares，再回退游标。第 0 步确认终局之后再定做不做。
 - 失败的交易：Xangle 会把失败的 delegate / undelegate 交易也记下来，出现在交易列表里。我们库里已经有全量交易（`full_tx` 带 status），**一期不单独存**。接口需要时，用"to ∈ validator 集合 + selector ∈ {`0x5c19a95c`, `0x4d99dd16`} + status = 失败"从现有交易表查。见待决问题 3。
@@ -156,8 +177,8 @@
 staking?: {
   contract?: string,          // 默认 0xea22…61B9
   startBlock?: number,
-  confirmations?: number,     // 无 finalized 时使用
-  logRange?: number,
+  confirmations?: number,     // 默认 0
+  logRange?: number,          // 默认 100,000，即 RPC 的块范围上限
   refreshIntervalMs?: number,
   enabled?: boolean,          // 默认 false
 }
@@ -325,7 +346,7 @@ group by validator;
 | **委托人奖励** `delegatorReward` | `reward − communityTax − commission` | 计入池子，按 shares 分给所有委托人（含 owner） |
 | restaking 奖励 | `withdrawals[1].amount` | 地址不固定，多数块为 0；采集保存，本期不出接口 |
 | **基金会奖励** `foundationReward` | `withdrawals[2].amount` | 固定为 `0x711b…2522`（EOA） |
-| **罚没** `slashedAmount` | `slashed[i].amount` | 按 `validatorIndex` 映射到被罚的 validator |
+| **罚没** `slashedAmount` | `slashed[i].amount` | 按 `slashed[i].address` 归属：它就是被罚 validator 的合约地址（第 0 步第 6 项） |
 
 `reward` 到社区税、佣金、委托人奖励的拆分就是合约 `_distributeRewards(amount)` 的逻辑（`ValidatorContract.sol:655-679`）：先扣税，再算佣金，剩下的进 `rewards`。
 
@@ -368,7 +389,7 @@ group by validator;
 
 - 新的循环 `StakingBlockSync`，游标存在 KV 里（`STAKING_BLOCK_REWARD_BLOCK`），从 withdrawal 激活块 **10,877,918** 开始。
 - **游标不能超过 `StakingSync` 的事件游标**：佣金要用到 `CommissionRateChanged`、owner 的委托事件和 `OwnershipTransferred`，这些事件必须先落库。
-- 每次用 JSON-RPC batch 请求 100 个块（`eth_getBlockByNumber(n, false)`），只取 `withdrawals` 和 `slashed`，一批写一个事务。上限只到 `finalized` / `latest - confirmations`。
+- 每次用 JSON-RPC batch 请求 100 个块（`eth_getBlockByNumber(n, false)`），只取 `withdrawals` 和 `slashed`，一批写一个事务。上限到 `latest - confirmations`。
 - 回灌量：截至 2026-11-04 约 3,840 万块（10,877,918 → 49,258,809）。按每秒 10 个 batch（1,000 块/秒）估算约 11 小时，实际速度取决于 RPC 限流。逐日对账回灌约 380 天 × 100 个 validator × 每天 2 次 `eth_call`，量很小。
 - 解析规则（不符合就告警，不猜位置）：
   - 前三条必须都带哨兵 `validatorIndex`；
@@ -391,7 +412,7 @@ group by validator;
 
 委托人奖励不存，查询时用 `reward − communityTax − commission` 算出。
 
-**`staking_block_slash`**，罚没原样保存：`blockNumber`、`createdAt`、`position`、`slashIndex`、`validatorIndex`、`address`、`amount`（wei）、`validator`（按 pubkey 映射到的 validator 合约地址，映射不上为空，refresher 之后补）。唯一键 `(blockNumber, position)`。
+**`staking_block_slash`**，罚没原样保存：`blockNumber`、`createdAt`、`position`、`slashIndex`、`validatorIndex`、`address`、`amount`（wei）、`validator`（= `address`，即被罚 validator 的合约地址；`slashIndex` 存证据高度，`validatorIndex` 存共识层编号）。唯一键 `(blockNumber, position)`。
 
 **`staking_reward_daily`**，按 (UTC 日, validator) 汇总，和逐块数据在同一个事务里累加：`day`、`validator`、`blockCount`、`reward`、`communityTax`、`commission`、`restakingReward`、`foundationReward`、`slashCount`、`slashedAmount`。唯一键 `(day, validator)`，一年约 4 万行。社区税和基金会奖励都按出块 validator 记，全网合计 = 所有行之和。
 
@@ -407,7 +428,7 @@ group by validator;
 
 - **每轮**：累计 `reward + restakingReward + foundationReward` 必须等于 CL `total_withdrawals` 在游标块的 `rewards`。CL 返回的是 gwei，比较前要换算。
 - **每日**：佣金按上面的公式对账；同时检查 `communityTaxRate` 有没有变。
-- **新鲜度**：游标落后 `finalized` 超过阈值（比如 10 分钟的块数）就告警。
+- **新鲜度**：游标落后 `latest` 超过阈值（比如 10 分钟的块数）就告警。
 
 ### 接口
 
@@ -472,7 +493,7 @@ group by validator;
 | `stat/model/Staking.ts` | 四张新表：`staking_block_reward`（分区）、`staking_block_slash`、`staking_reward_daily`、`staking_rate_timeline` |
 | `stat/service/staking/StakingBlockSync.ts`（新） | 逐块 batch 采集；按时间线计算社区税和佣金；写逐块表和日汇总；推进游标（不超过事件游标）；与 CL `rewards` 对账 |
 | `stat/service/staking/StakingRateTimeline.ts`（新） | 维护费率和达标时间线：事件驱动更新 + 历史状态读取 + 二分定位；逐日佣金对账 |
-| `StakingRefresher.ts` | 每轮从 beacon 接口拉 `index → pubkey` 映射，补 `staking_block_slash.validator` 和对应的日汇总 |
+| `StakingRefresher.ts` | 无需改动：罚没按 `address` 直接归属，不再需要 beacon 的 `index → pubkey` 映射 |
 | `StakingMain.ts` | `startStaking()` 一起启动；命令行增加 `blocks`（回灌）、`check-rewards <block>`（单块对账）、`check-commission <validator> <day>`（单日佣金对账） |
 | `StakingQuery.ts` / `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | 3 个统计接口、2 个明细接口，以及 `/validator`、`/validators` 的新字段 |
 | `StatConfig.staking` | `blockBatchSize`（默认 100）、`blockConcurrency`、`rewardStartBlock`（默认 10,877,918）、`foundationAddress`（默认 `0x711b…2522`）、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（缺省复用 `validatorRpc`） |
@@ -494,7 +515,7 @@ group by validator;
 
 | 阶段 | 内容 | 估时 |
 |---|---|---|
-| 0 | 上链验证（上文第 0 步） | 0.5d |
+| 0 | 上链验证（上文第 0 步） | ✅ 已完成 |
 | 1 | 模型、配置、StakingSync（发现 validator、写事件、维护 shares）、回灌、创世导入 | 2d |
 | 2 | Refresher（view 调用、beacon 状态、对账） | 1d |
 | 3 | StakingQuery 和 8 个接口、swagger | 2d |
@@ -567,7 +588,7 @@ const id = ethers.utils.id;
 - 在线路径（`process_logs`）只接受 Staking 合约或已知 validator 发出的日志，跟本计划一致。
 - 除了委托事件，还收 `WithdrawCommission` / `WithdrawTipFee`，单独汇总到 `validator_operator`，不算进解押。本计划补收 `WithdrawTipFee`。
 - backfill 的做法：按 topic0 过滤、默认每次 2000 块、指数退避重试（500ms 起、最多 5 次）、每个窗口一个事务、窗口末尾更新游标。可以作为 `getLogs` 窗口的初始默认值。
-- 它的注释提到 0G 靠 CometBFT 快速终局，所以只处理 committed chain、不处理 revert。这跟第 0 步第 3 点的判断方向一致，但仍需验证 RPC 的 `finalized` 标签。
+- 它的注释提到 0G 靠 CometBFT 快速终局，所以只处理 committed chain、不处理 revert。这跟第 0 步第 3 项的结论一致。
 
 **不照搬的**
 - backfill 路径**不校验发出地址**，只按 topic 过滤，跟在线路径不一致。
@@ -615,5 +636,4 @@ staking: {enabled: true, genesis: 'mainnet'},   // 测试网用 genesis: 'none'
 **未验证**（需要 MySQL 和能访问 0G RPC 的环境）
 - 同步、refresher 和查询的 SQL 都没在真实 MySQL 上跑过。
 - 主网回灌，以及 `diff` 跟 Xangle 数据的比对。
-- 第 0 步的第 2 到 6 点：getLogs 上限、`finalized` 标签、V1/V2 分界、创世份额、`slashed` 字段。
-- 2026-11-04 发现 `https://evmrpc.0g.ai` 在这台开发机上能连（`evmrpc-mainnet.0g.ai` 仍连不上），第 0 步的大部分验证可以直接在本地做。
+- （第 0 步已于 2026-11-04 全部完成，见该节。）

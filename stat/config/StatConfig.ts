@@ -32,8 +32,8 @@ export interface StakingOption {
      */
     genesis?: string,
     startBlock?: number, // first block to scan, default 1
-    confirmations?: number, // only used when the RPC has no `finalized` tag, default 3
-    logRange?: number, // blocks per eth_getLogs window, default 2000
+    confirmations?: number, // blocks kept back from latest, default 0 (CometBFT finalizes each block)
+    logRange?: number, // blocks per eth_getLogs window, default 100,000 (the 0G RPC's cap)
     refreshIntervalMs?: number, // default 60s
 }
 export interface ConsortiumBridgeOption {
