@@ -4,6 +4,7 @@ import {ConfigInstance} from "../../config/StatConfig";
 import {StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
+import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
 import {getStakingCursor, stakingOption, withStakingLock} from "./StakingSync";
 
@@ -90,11 +91,13 @@ async function refreshContractState(latest: number) {
 }
 
 /**
- * Beacon status from `validatorRpc` (a /eth/v1/beacon/states/head/validators
- * URL, as ZGSupply uses). Failure here must not affect the contract refresh.
+ * Beacon status from the validators endpoint. `validatorRpc` holds the
+ * consensus layer's total_withdrawals URL; `validatorRpcUrl()` derives
+ * .../states/head/validators from it, and is empty when it cannot.
+ * Failure here must not affect the contract refresh.
  */
 async function refreshBeaconStatus() {
-    const url = ConfigInstance.validatorRpc;
+    const url = validatorRpcUrl();
     if (!url) {
         return;
     }
