@@ -1009,7 +1009,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "Sum of Delegate amounts into a validator over [start, end). Only Delegate events count: undelegations and slashing are not subtracted, and the initial self-stake is not included. With `interval`, also returns per-bucket sums (UTC)."
+      description: "Delegate and Undelegate amounts into a validator over [start, end), reported separately as `delegated` / `undelegated` with their counts, and `net` = delegated - undelegated. Slashing is not included, nor is the initial self-stake at initialization. With `interval`, also returns per-bucket figures (UTC)."
       parameters:
         - $ref: '#/components/parameters/stakingAddressParam'
         - name: start
@@ -1063,7 +1063,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "Sum of a delegator's Delegate amounts across all validators, with a per-validator breakdown. Only Delegate events count; undelegations are not subtracted. Attributed to the delegator, not the payer. Without start/end, covers all history."
+      description: "A delegator's Delegate and Undelegate amounts across all validators, reported separately as `delegated` / `undelegated` with their counts and `net` = delegated - undelegated, plus a per-validator breakdown ordered by volume. Attributed to the delegator, not the payer. Without start/end, covers all history."
       parameters:
         - $ref: '#/components/parameters/stakingAddressParam'
         - name: start
@@ -1089,7 +1089,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "Staking events, newest first. `slash_detected` rows are synthetic: slashing happens in a system call whose logs are not retrievable, so it is recorded when the operator's shares are seen to drop."
+      description: "Staking events, newest first. The validator contracts' Exited is no longer collected (use validator_exited); `exited` only returns rows indexed before that change."
       parameters:
         - name: validator
           in: query
@@ -1104,7 +1104,7 @@ paths:
             type: string
         - name: type
           in: query
-          description: "Comma separated: delegate, undelegate, validator_created, validator_initialized, validator_exited, ownership_transferred, commission_rate_changed, withdrawal_fee_changed, withdraw_commission, withdraw_tip_fee, exited, slash_detected."
+          description: "Comma separated: delegate, undelegate, validator_created, validator_initialized, validator_exited, ownership_transferred, commission_rate_changed, withdrawal_fee_changed, withdraw_commission, withdraw_tip_fee, exited (historical rows only)."
           required: false
           schema:
             type: string
@@ -1143,7 +1143,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "Delegate amounts per UTC day for the last `days` days (today included, latest first), top 10 validators per day plus `others`."
+      description: "Delegate and Undelegate amounts per UTC day for the last `days` days (today included, latest first), reported separately with `net` = delegated - undelegated. Owners' own delegations are included. Per day the top 10 validators by volume (delegated + undelegated) are listed plus `others`; `percent` is the share of the day's volume."
       parameters:
         - name: days
           in: query

@@ -21,12 +21,14 @@ export enum StakingEventType {
     WithdrawalFeeInGweiChanged = 22,
     WithdrawCommission = 23,
     WithdrawTipFee = 24,
+    /** no longer collected (ValidatorExited stands for exits); rows from before stay */
     Exited = 25,
     /**
      * Synthetic, written by the refresher: the operator's on-chain shares
      * dropped without an event we can see. Slashing is a system call whose logs
      * `eth_getLogs` does not return, so this is the only trace it leaves.
      * `blockNumber` is the block the discrepancy was observed at, `logIndex` -1.
+     * Internal: it keeps shares right and is never served by the API.
      */
     SlashDetected = 90,
 }

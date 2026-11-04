@@ -17,9 +17,10 @@ import {
  *     the same formula as `getDelegatedTokens` on chain, from the validator row
  *     the refresher keeps current
  *   - self-delegation is the owner's delegation
- *   - "delegated amount" sums only Delegate events: undelegations and slashing
- *     are not subtracted, and the initial self-stake at initialization (and at
- *     genesis) is not a Delegate event
+ *   - delegation flows report `delegated` (sum of Delegate amounts) and
+ *     `undelegated` (sum of Undelegate amounts) apart, with `net` as their
+ *     difference; slashing is not included, and the initial self-stake at
+ *     initialization (and at genesis) is neither event
  */
 
 const ZERO = BigInt(0);
@@ -38,8 +39,8 @@ export const EVENT_TYPE_NAMES: {[name: string]: StakingEventType} = {
     withdrawal_fee_changed: StakingEventType.WithdrawalFeeInGweiChanged,
     withdraw_commission: StakingEventType.WithdrawCommission,
     withdraw_tip_fee: StakingEventType.WithdrawTipFee,
+    // no longer collected; kept so rows indexed before the change stay queryable
     exited: StakingEventType.Exited,
-    slash_detected: StakingEventType.SlashDetected,
 };
 const EVENT_NAME_OF: {[t: number]: string} = Object.fromEntries(
     Object.entries(EVENT_TYPE_NAMES).map(([k, v]) => [v, k]));
@@ -246,7 +247,10 @@ export async function listStakingEvents(opt: {
     const where: WhereOptions = {};
     if (opt.validator) where['validator'] = opt.validator;
     if (opt.delegator) where['account'] = opt.delegator;
-    if (opt.types?.length) where['eventType'] = {[Op.in]: opt.types};
+    // SlashDetected rows are the refresher's bookkeeping, not chain events: never served
+    where['eventType'] = opt.types?.length
+        ? {[Op.in]: opt.types.filter(t => t !== StakingEventType.SlashDetected)}
+        : {[Op.ne]: StakingEventType.SlashDetected};
     if (opt.start || opt.end) {
         where['createdAt'] = {...(opt.start ? {[Op.gte]: opt.start} : {}), ...(opt.end ? {[Op.lt]: opt.end} : {})};
     }
@@ -335,74 +339,134 @@ function bucketExpr(interval: 'day' | 'hour') {
 }
 
 /**
- * Delegate amounts per validator per UTC day for the last `days` days
- * (today included), top `top` validators per day plus an "others" entry.
+ * Delegate and Undelegate amounts per validator per UTC day for the last
+ * `days` days (today included, latest first). The two are reported apart,
+ * with `net` = delegated - undelegated, never added together. Owners' own
+ * delegations count like anyone else's.
+ *
+ * Validators are ranked within a day by volume (delegated + undelegated); the
+ * top `top` are listed and the rest folded into one "others" entry, and
+ * `percent` is the share of the day's volume.
  */
 export async function getDelegationActivity(days: number, top: number) {
     const start = new Date();
     start.setUTCHours(0, 0, 0, 0);
     start.setUTCDate(start.getUTCDate() - (days - 1));
     const t = StakingEvent.getTableName();
+    const D = StakingEventType.Delegate, U = StakingEventType.Undelegate;
     const rows: any[] = await StakingEvent.sequelize.query(
-        `select ${bucketExpr('day')} as bucket, validator, sum(amount) as amount, count(*) as cnt
-         from ${t} where eventType = ? and createdAt >= ? group by bucket, validator`,
-        {type: QueryTypes.SELECT, replacements: [StakingEventType.Delegate, start]});
+        `select ${bucketExpr('day')} as bucket, validator,
+                sum(case when eventType = ${D} then amount else 0 end) as delegated,
+                sum(case when eventType = ${D} then 1 else 0 end) as delegateCount,
+                sum(case when eventType = ${U} then amount else 0 end) as undelegated,
+                sum(case when eventType = ${U} then 1 else 0 end) as undelegateCount
+         from ${t} where eventType in (${D}, ${U}) and createdAt >= ? group by bucket, validator`,
+        {type: QueryTypes.SELECT, replacements: [start]});
     const monikers = new Map((await StakingValidator.findAll({attributes: ['address', 'moniker'], raw: true}))
         .map(v => [v.address, v.moniker]));
+
+    type Flow = {delegated: bigint, undelegated: bigint, delegateCount: number, undelegateCount: number};
+    const empty = (): Flow => ({delegated: ZERO, undelegated: ZERO, delegateCount: 0, undelegateCount: 0});
+    const add = (a: Flow, b: Flow): Flow => ({
+        delegated: a.delegated + b.delegated, undelegated: a.undelegated + b.undelegated,
+        delegateCount: a.delegateCount + b.delegateCount, undelegateCount: a.undelegateCount + b.undelegateCount,
+    });
+    const volume = (f: Flow) => f.delegated + f.undelegated;
+    const format = (f: Flow, dayVolume: bigint) => ({
+        delegated: f.delegated.toString(), delegateCount: f.delegateCount,
+        undelegated: f.undelegated.toString(), undelegateCount: f.undelegateCount,
+        net: (f.delegated - f.undelegated).toString(),
+        percent: percent(volume(f), dayVolume),
+    });
+
     const result = [];
     for (let i = days - 1; i >= 0; i--) {
         const d = new Date(start.getTime() + i * 86400_000);
         const bucket = d.toISOString().slice(0, 10);
         const dayRows = rows.filter(r => r.bucket === bucket)
-            .map(r => ({validator: r.validator, amount: big(r.amount), count: Number(r.cnt)}))
-            .sort((a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0));
-        const dayTotal = dayRows.reduce((s, r) => s + r.amount, ZERO);
-        const shown = dayRows.slice(0, top).map(r => ({
+            .map(r => ({
+                validator: r.validator as string,
+                flow: {
+                    delegated: big(r.delegated), undelegated: big(r.undelegated),
+                    delegateCount: Number(r.delegateCount), undelegateCount: Number(r.undelegateCount),
+                } as Flow,
+            }))
+            .sort((a, b) => {
+                const x = volume(b.flow) - volume(a.flow);
+                return x > ZERO ? 1 : x < ZERO ? -1 : 0;
+            });
+        const day = dayRows.reduce((s, r) => add(s, r.flow), empty());
+        const dayVolume = volume(day);
+        const shown: any[] = dayRows.slice(0, top).map(r => ({
             validator: checksum(r.validator), moniker: monikers.get(r.validator) ?? '',
-            amount: r.amount.toString(), count: r.count, percent: percent(r.amount, dayTotal),
+            ...format(r.flow, dayVolume),
         }));
         const rest = dayRows.slice(top);
         if (rest.length) {
-            const restAmount = rest.reduce((s, r) => s + r.amount, ZERO);
             shown.push({
-                validator: null, moniker: 'others', amount: restAmount.toString(),
-                count: rest.reduce((s, r) => s + r.count, 0), percent: percent(restAmount, dayTotal),
+                validator: null, moniker: 'others',
+                ...format(rest.reduce((s, r) => add(s, r.flow), empty()), dayVolume),
             });
         }
-        result.push({date: bucket, timestamp: d.getTime() / 1000, totalAmount: dayTotal.toString(), validators: shown});
+        const {percent: _, ...dayTotals} = format(day, dayVolume);
+        result.push({date: bucket, timestamp: d.getTime() / 1000, ...dayTotals, validators: shown});
     }
     return {list: result};
 }
 
-/** Delegate amount into one validator over [start, end), optionally bucketed. */
+const FLOW_TYPES = `${StakingEventType.Delegate}, ${StakingEventType.Undelegate}`;
+/** select list summing Delegate and Undelegate apart, for `formatFlow` */
+const FLOW_COLS = `sum(case when eventType = ${StakingEventType.Delegate} then amount else 0 end) as delegated,
+    sum(case when eventType = ${StakingEventType.Delegate} then 1 else 0 end) as delegateCount,
+    sum(case when eventType = ${StakingEventType.Undelegate} then amount else 0 end) as undelegated,
+    sum(case when eventType = ${StakingEventType.Undelegate} then 1 else 0 end) as undelegateCount`;
+
+function formatFlow(r: any) {
+    const delegated = big(r?.delegated), undelegated = big(r?.undelegated);
+    return {
+        delegated: delegated.toString(), delegateCount: Number(r?.delegateCount ?? 0),
+        undelegated: undelegated.toString(), undelegateCount: Number(r?.undelegateCount ?? 0),
+        net: (delegated - undelegated).toString(),
+    };
+}
+
+/**
+ * Delegate and Undelegate amounts into one validator over [start, end),
+ * optionally bucketed. Reported apart with `net` = delegated - undelegated;
+ * the initial self-stake at initialization is neither, so it is not included.
+ */
 export async function sumValidatorDelegations(validator: string, start: Date, end: Date, interval?: 'day' | 'hour') {
     const t = StakingEvent.getTableName();
-    const replacements = [validator, StakingEventType.Delegate, start, end];
-    const cond = `validator = ? and eventType = ? and createdAt >= ? and createdAt < ?`;
+    const cols = FLOW_COLS;
+    const cond = `validator = ? and eventType in (${FLOW_TYPES}) and createdAt >= ? and createdAt < ?`;
+    const replacements = [validator, start, end];
+    const flow = formatFlow;
     const [sum]: any[] = await StakingEvent.sequelize.query(
-        `select sum(amount) as amount, count(*) as cnt from ${t} where ${cond}`,
-        {type: QueryTypes.SELECT, replacements});
+        `select ${cols} from ${t} where ${cond}`, {type: QueryTypes.SELECT, replacements});
     const ret: any = {
         validator: checksum(validator),
         start: start.getTime() / 1000, end: end.getTime() / 1000,
-        amount: big(sum?.amount).toString(), count: Number(sum?.cnt ?? 0),
+        ...flow(sum),
     };
     if (interval) {
         const rows: any[] = await StakingEvent.sequelize.query(
-            `select ${bucketExpr(interval)} as bucket, sum(amount) as amount, count(*) as cnt
-             from ${t} where ${cond} group by bucket order by bucket`,
+            `select ${bucketExpr(interval)} as bucket, ${cols} from ${t} where ${cond} group by bucket order by bucket`,
             {type: QueryTypes.SELECT, replacements});
         ret.interval = interval;
-        ret.list = rows.map(r => ({bucket: r.bucket, amount: big(r.amount).toString(), count: Number(r.cnt)}));
+        ret.list = rows.map(r => ({bucket: r.bucket, ...flow(r)}));
     }
     return ret;
 }
 
-/** Delegate amount by one delegator across all validators, optionally within [start, end). */
+/**
+ * Delegate and Undelegate amounts by one delegator across all validators,
+ * optionally within [start, end), with a per-validator breakdown ordered by
+ * volume (delegated + undelegated). Attributed to the delegator, not the payer.
+ */
 export async function sumDelegatorDelegations(delegator: string, start?: Date, end?: Date) {
     const t = StakingEvent.getTableName();
-    const replacements: any[] = [delegator, StakingEventType.Delegate];
-    let cond = `account = ? and eventType = ?`;
+    const replacements: any[] = [delegator];
+    let cond = `account = ? and eventType in (${FLOW_TYPES})`;
     if (start) {
         cond += ` and createdAt >= ?`;
         replacements.push(start);
@@ -412,16 +476,22 @@ export async function sumDelegatorDelegations(delegator: string, start?: Date, e
         replacements.push(end);
     }
     const rows: any[] = await StakingEvent.sequelize.query(
-        `select validator, sum(amount) as amount, count(*) as cnt from ${t} where ${cond} group by validator`,
+        `select validator, ${FLOW_COLS} from ${t} where ${cond} group by validator`,
         {type: QueryTypes.SELECT, replacements});
-    const list = rows.map(r => ({validator: checksum(r.validator), amount: big(r.amount), count: Number(r.cnt)}))
-        .sort((a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0));
+    const volume = (r: any) => big(r.delegated) + big(r.undelegated);
+    rows.sort((a, b) => {
+        const d = volume(b) - volume(a);
+        return d > ZERO ? 1 : d < ZERO ? -1 : 0;
+    });
+    const total = rows.reduce((s, r) => ({
+        delegated: s.delegated + big(r.delegated), delegateCount: s.delegateCount + Number(r.delegateCount),
+        undelegated: s.undelegated + big(r.undelegated), undelegateCount: s.undelegateCount + Number(r.undelegateCount),
+    }), {delegated: ZERO, delegateCount: 0, undelegated: ZERO, undelegateCount: 0});
     return {
         delegator: checksum(delegator),
         start: start ? start.getTime() / 1000 : null,
         end: end ? end.getTime() / 1000 : null,
-        amount: list.reduce((s, r) => s + r.amount, ZERO).toString(),
-        count: list.reduce((s, r) => s + r.count, 0),
-        list: list.map(r => ({...r, amount: r.amount.toString()})),
+        ...formatFlow(total),
+        list: rows.map(r => ({validator: checksum(r.validator), ...formatFlow(r)})),
     };
 }

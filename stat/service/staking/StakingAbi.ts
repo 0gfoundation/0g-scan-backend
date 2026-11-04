@@ -31,7 +31,6 @@ export const TOPIC = {
     WithdrawalFeeInGweiChanged: id('WithdrawalFeeInGweiChanged(uint96,uint96)'),
     WithdrawCommission: id('WithdrawCommission(address,address,uint256)'),
     WithdrawTipFee: id('WithdrawTipFee(address,address,uint256)'),
-    Exited: id('Exited(address)'),
 };
 
 export const STAKING_TOPICS = [TOPIC.ValidatorCreated, TOPIC.ValidatorInitialized, TOPIC.ValidatorExited];
@@ -39,13 +38,16 @@ export const STAKING_TOPICS = [TOPIC.ValidatorCreated, TOPIC.ValidatorInitialize
 export const VALIDATOR_TOPICS = [
     TOPIC.DelegateV1, TOPIC.UndelegateV1, TOPIC.DelegateV2, TOPIC.UndelegateV2,
     TOPIC.OwnershipTransferred, TOPIC.CommissionRateChanged, TOPIC.WithdrawalFeeInGweiChanged,
-    TOPIC.WithdrawCommission, TOPIC.WithdrawTipFee, TOPIC.Exited,
+    TOPIC.WithdrawCommission, TOPIC.WithdrawTipFee,
 ];
 
 /**
  * Not listened to, because system calls emit them and `eth_getLogs` does not
  * return system-call logs: DistributeRewards, Slashed, PopWithdrawEntry, and
  * the failed-requeue PushWithdrawEntry. See PLAN.md "事件清单".
+ *
+ * Also not listened to: the validator contracts' Exited. A validator's exit is
+ * taken from the Staking contract's ValidatorExited instead.
  */
 
 export const VALIDATOR_ABI = [
@@ -225,11 +227,6 @@ export function decodeStakingLog(log: RawLog): DecodedStakingEvent | null {
             const eventType = t[0] === TOPIC.WithdrawCommission
                 ? StakingEventType.WithdrawCommission : StakingEventType.WithdrawTipFee;
             return {eventType, validator: emitter, account: owner, counterparty: withdrawal, amount: wordUint(w[0])};
-        }
-        case TOPIC.Exited: {
-            const owner = topicAddr(t[1]);
-            if (t.length !== 2 || !owner) bad(log, 'Exited');
-            return {eventType: StakingEventType.Exited, validator: emitter, account: owner};
         }
     }
     return null;
