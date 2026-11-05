@@ -56,6 +56,8 @@ export interface IStakingValidator {
     rewards?: string
     delegatorShares?: string
     commission?: string
+    /** tipFee(): what withdrawTipFee would pay out now */
+    tipFee?: string
     stakes?: string
     /** raw `annualPercentageYield()`, 10_000 = 100% */
     apy?: string
@@ -93,6 +95,7 @@ export class StakingValidator extends Model<IStakingValidator> implements IStaki
     rewards?: string;
     delegatorShares?: string;
     commission?: string;
+    tipFee?: string;
     stakes?: string;
     apy?: string;
     bondStatus?: number;
@@ -132,6 +135,7 @@ export class StakingValidator extends Model<IStakingValidator> implements IStaki
             rewards: amount(),
             delegatorShares: amount(),
             commission: amount(),
+            tipFee: amount(),
             stakes: amount(),
             apy: amount(),
             bondStatus: {type: DataTypes.TINYINT, allowNull: false, defaultValue: 0},

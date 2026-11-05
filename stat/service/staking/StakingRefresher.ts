@@ -29,9 +29,9 @@ const FULL_RECONCILE_INTERVAL = 3600 * SECOND;
  * The batch provider sends every call issued in the same tick as one JSON-RPC
  * batch, and the 0G RPCs reject the part of a batch beyond 50 calls with
  * -32005 "request rate exceeded" (ethers then reports a bare CALL_EXCEPTION).
- * Chunk sizes keep each batch under that: about 15 calls per validator when
- * refreshing state, 2 per validator per step in the share check, 1 per
- * delegation when reconciling.
+ * Chunk sizes keep each batch under that: up to 16 calls per validator when
+ * refreshing state (3 x 16 = 48), 2 per validator per step in the share check,
+ * 1 per delegation when reconciling.
  */
 const CHUNK_STATE = 3;
 const CHUNK_SHARE_CHECK = 10;
@@ -92,9 +92,9 @@ async function refreshContractState(latest: number) {
         const o = {blockTag: latest};
         try {
             const [owner, operator, desc, commissionRate, withdrawalFeeInGwei, tokens, rewards,
-                delegatorShares, commission, stakes, apy, bondStatus, minSelf, pubkey] = await rpc(() => Promise.all([
+                delegatorShares, commission, tipFee, stakes, apy, bondStatus, minSelf, pubkey] = await rpc(() => Promise.all([
                 c.owner(o), c.operatorAddress(o), c.description(o), c.commissionRate(o), c.withdrawalFeeInGwei(o),
-                c.tokens(o), c.rewards(o), c.delegatorShares(o), c.commission(o), c.stakes(o),
+                c.tokens(o), c.rewards(o), c.delegatorShares(o), c.commission(o), c.tipFee(o), c.stakes(o),
                 c.annualPercentageYield(o), c.bondStatus(o), c.minSelfDelegationInGwei(o),
                 row.pubkey ? Promise.resolve(null) : c.consensusPubkey(o),
             ]));
@@ -103,7 +103,7 @@ async function refreshContractState(latest: number) {
                 moniker: desc[0], identity: desc[1], website: desc[2], securityContact: desc[3], details: desc[4],
                 commissionRate: Number(commissionRate), withdrawalFeeInGwei: str(withdrawalFeeInGwei),
                 tokens: str(tokens), rewards: str(rewards), delegatorShares: str(delegatorShares),
-                commission: str(commission), stakes: str(stakes), apy: str(apy), bondStatus: Number(bondStatus),
+                commission: str(commission), tipFee: str(tipFee), stakes: str(stakes), apy: str(apy), bondStatus: Number(bondStatus),
                 minSelfDelegationInGwei: str(minSelf), refreshedBlock: latest, refreshedAt: new Date(),
             };
             if (pubkey && pubkey !== '0x') {

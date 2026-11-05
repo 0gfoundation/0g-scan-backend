@@ -364,6 +364,11 @@ async function migDB(seq: Sequelize) {
         type: DataTypes.STRING(255), allowNull: false, defaultValue: '',
     });
 
+    // added after staking_validator was first released
+    await addColumnIfNotExistsV2(qi, StakingValidator.getTableName().toString(), 'tipFee', {
+        type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0,
+    });
+
     const kv = KV.getTableName().toString();
     await changeColumnIfNecessary(qi, kv, 'value', {
         type: DataTypes.STRING(8192)

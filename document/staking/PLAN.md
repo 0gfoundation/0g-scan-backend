@@ -1,6 +1,6 @@
 # 把 Validator / Delegation 索引并进 0g-scan-backend：计划
 
-状态：一期代码已实现，尚未在真实库和链上跑过（2026-09-29），见文末"一期实现说明"。validator 事件接口（参数变更、手续费、创建与退出）的设计见"validator 事件接口"一节，逐块的奖励、佣金、社区税、基金会奖励与罚没见"区块奖励、佣金、社区税、基金会奖励与罚没"一节（2026-11-04），均未实现。
+状态：一期已实现，并在测试网上端到端跑通（2026-11-05，见文末"一期实现说明"）。二期 A（validator 事件接口）已实现并在测试网验证（2026-11-05）。二期 B（逐块的奖励、佣金、社区税、基金会奖励与罚没）只有设计，未实现。
 
 ## 背景
 
@@ -228,15 +228,15 @@ validator 合约的 `Exited`、`Slashed` 不记录：退出改由 Staking 合约
 | 事件 | 落库 | 对外 | 缺口 |
 |---|---|---|---|
 | `Delegate` / `Undelegate` | ✅ | `/events`、委托人列表、两个 sum 接口、活跃度图表 | 无（sum 和图表已同时统计 Undelegate） |
-| `CommissionRateChanged` / `WithdrawalFeeInGweiChanged` | ✅ | 只能走 `/events`，新旧值在 `extra` 里 | 没有按 validator 查的参数历史，没有格式化 |
-| `WithdrawCommission` / `WithdrawTipFee` | ✅ | 只能走 `/events` | 没有"手续费"汇总；`tipFee()` 当前值没读 |
-| `ValidatorInitialized` / `ValidatorExited` | ✅ 事件表；validator 行只有块号 | detail 里有 `initializedBlock` / `exitedBlock` | 没有交易哈希和时间；validator 列表不带 |
+| `CommissionRateChanged` / `WithdrawalFeeInGweiChanged` | ✅ | `/validator/param-changes` | 无（已实现） |
+| `WithdrawCommission` / `WithdrawTipFee` | ✅ | `/fees`、`/validator/fee-withdrawals` | 无（已实现，refresher 读 `tipFee()`） |
+| `ValidatorInitialized` / `ValidatorExited` | ✅ | `/validators`、`/validator` 的 `created` / `exited` | 无（已实现） |
 | `Exited`（validator 合约） | 已停止收集（2026-11-04） | `/events?type=exited` 只返回停收前的历史行 | 已完成：从 topic 过滤和解码里删除，已落库的行保留不动 |
 
 ### 设计原则
 - **通用流水保留，业务接口另开**：`/staking/events` 继续作为全部事件的原始流水（排查用）；每类事件再给一个字段明确、不带 `extra` 的业务接口，前端只用业务接口。
 - **一张事件表**：不为每类事件建表，现有索引 `(validator, eventType, createdAt)` 足够支撑下面所有按 validator 的查询。
-- **创建 / 退出冗余到 validator 行**：validator 列表要逐行显示创建和退出信息，把块号、交易哈希、时间直接存在 `staking_validator` 上，列表查询不用关联事件表。
+- **创建 / 退出直接查事件表**：每个 validator 最多一条 `ValidatorInitialized`、一条 `ValidatorExited`，列表查询时一条 SQL 按 eventType 取出全部，不在 `staking_validator` 上冗余存储，也就不用回填。原计划是冗余存 4 列，实现时改成了这样。
 - 沿用现有约定：金额是 wei 整数字符串，比例同时给原始值和百分比字符串，时间是 unix 秒，分页 `skip` / `limit`，外层 `{status, message, result}`。
 
 ### 接口
@@ -318,19 +318,24 @@ group by validator;
 
 **5. 通用流水** —— `GET /events`：不再返回合成的 `slash_detected` 记录，`type` 也不再接受它；`exited` 保留为可选类型，只能查到停收前的历史行（2026-11-04 已实现）。
 
-### 改动清单
+### 实现与验证（2026-11-05）
 
 | 位置 | 改动 |
 |---|---|
-| `stat/model/Staking.ts` | `staking_validator` 加 `tipFee`、`initializedTxHash`、`initializedAt`、`exitedTxHash`、`exitedAt`（表已存在时 `sync()` 不会加列，要在 `migDB` 里 `addColumnIfNotExistsV2`） |
-| `StakingAbi.ts` | ~~`VALIDATOR_TOPICS` 去掉 `Exited`~~（已完成）；`VALIDATOR_ABI` 加 `tipFee()` |
-| `StakingSync.ts` | 处理 `ValidatorInitialized` / `ValidatorExited` 时，把交易哈希和区块时间一起写进 validator 行 |
-| 回填 | 已落库的 validator 从 `staking_event`（eventType 2 / 3）一次性回填交易哈希和时间，可做成 `StakingMain.js backfill-lifecycle` 命令 |
-| `StakingRefresher.ts` | 读 `tipFee()` |
-| `StakingQuery.ts` / `OpenStakingService.ts` / `ESpaceApiRouter` | 新增 `/validator/param-changes`、`/fees`、`/validator/fee-withdrawals`；`/validators` 和 `/validator` 增加 `created`、`exited`；sum 接口加 `type` |
-| `document/evm-open-api.yaml` | 补上述接口 |
+| `stat/model/Staking.ts` | `staking_validator` 加 `tipFee` 列；已存在的表由 `DBProvider.migDB()` 用 `addColumnIfNotExistsV2` 补列 |
+| `StakingAbi.ts` | `VALIDATOR_ABI` 加 `tipFee()`；`Exited` 已不再收集 |
+| `StakingRefresher.ts` | 每轮读 `tipFee()`（每个 validator 最多 16 个调用，3 个一批，仍低于单批 50 的限流线） |
+| `StakingQuery.ts` | `listParamChanges`、`getFees`、`listFeeWithdrawals`；`lifecycles()` 从事件表取 `created` / `exited`，用于 `/validators` 和 `/validator` |
+| `OpenStakingService.ts` / `ESpaceApiRouter` | `GET /validator/param-changes`、`GET /fees`、`GET /validator/fee-withdrawals` |
+| `document/evm-open-api.yaml` | 3 个新接口，以及 `created` / `exited` 字段说明 |
 
-估时约 1.5 天。
+在测试网（本地 MySQL 容器）上验证：
+- `migDB` 给已存在的 `staking_validator` 补上了 `tipFee` 列；
+- 14 个 validator 的 `commission` / `tipFee` 当前值，与链上在 `refreshedBlock` 读到的值全部一致；
+- `/fees` 里的 `withdrawn` / `withdrawCount`，与翻页取完 `/validator/fee-withdrawals` 后的金额之和、条数完全一致（某 validator：佣金 143 条、tip fee 39 条）；
+- `/validator/param-changes` 正确返回某 validator 佣金率 10% → 9% → 10% 的两次变更；
+- `created` / `exited`：创世 validator 的 `created` 为 null，有 `ValidatorExited` 的显示退出块和交易；罚没退出的 `0x4b99…` 的 `exited` 为 null、`bondStatus` 为 1，符合设计里说明的缺口；
+- 参数错误按预期拒绝。
 
 ## 区块奖励、佣金、社区税、基金会奖励与罚没（逐块采集，二期 B）
 
@@ -520,7 +525,7 @@ group by validator;
 | 2 | Refresher（view 调用、beacon 状态、对账） | 1d |
 | 3 | StakingQuery 和 8 个接口、swagger | 2d |
 | 4 | 跟 Xangle 数据对比，测试网验证，上线（`staking.enabled = true`） | 1d |
-| 二期 A | validator 事件接口：参数变更历史、手续费、创建与退出（见上文） | 1.5d |
+| 二期 A | validator 事件接口：参数变更历史、手续费、创建与退出（见上文） | ✅ 已完成（2026-11-05） |
 | 二期 B | 区块奖励、佣金、社区税、基金会奖励与罚没：逐块采集、费率与达标时间线、日汇总、对账、3 个统计接口和 2 个明细接口（见上文） | 3.5d + 回灌约 11h |
 | 二期 | 每日快照与奖励估算、待解押队列（view 调用）、失败交易展示 | 待定 |
 

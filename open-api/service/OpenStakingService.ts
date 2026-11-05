@@ -4,6 +4,11 @@ import {Errors} from "../../stat/service/common/LogicError";
 import {
     DelegatorValidatorSort,
     EVENT_TYPE_NAMES,
+    FeeWithdrawalType,
+    getFees,
+    listFeeWithdrawals,
+    listParamChanges,
+    ParamChangeType,
     getDelegationActivity,
     getStakeBreakdown,
     getStakingSummary,
@@ -163,4 +168,44 @@ export async function getDelegatorDelegationSum(ctx) {
         paramError(`<start> must be before <end>`);
     }
     setBody(ctx, await sumDelegatorDelegations(address(q, 'address'), start, end));
+}
+
+/** comma separated values of `key`, each one of `allowed`; empty when absent */
+function listOf<T extends string>(query, key: string, allowed: readonly T[]): T[] {
+    const values = (query[key] || '').toString().split(',').map(v => v.trim()).filter(Boolean);
+    for (const v of values) {
+        if (!allowed.includes(v as T)) {
+            paramError(`parameter <${key}> must be a comma separated list of ${allowed.join(', ')}`);
+        }
+    }
+    return values as T[];
+}
+
+export async function getValidatorParamChanges(ctx) {
+    const q = ctx.query;
+    const {skip, limit} = paginateCore(q);
+    setBody(ctx, await listParamChanges(
+        address(q, 'address'),
+        listOf<ParamChangeType>(q, 'type', ['commission_rate', 'withdrawal_fee']),
+        skip, limit,
+    ));
+}
+
+export async function getValidatorFees(ctx) {
+    setBody(ctx, await getFees(address(ctx.query, 'address', false)));
+}
+
+export async function getValidatorFeeWithdrawals(ctx) {
+    const q = ctx.query;
+    const {skip, limit} = paginateCore(q);
+    const start = unixTime(q, 'start');
+    const end = unixTime(q, 'end');
+    if (start && end && start.getTime() >= end.getTime()) {
+        paramError(`<start> must be before <end>`);
+    }
+    setBody(ctx, await listFeeWithdrawals({
+        validator: address(q, 'address'),
+        types: listOf<FeeWithdrawalType>(q, 'type', ['commission', 'tip_fee']),
+        start, end, skip, limit,
+    }));
 }

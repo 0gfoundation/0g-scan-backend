@@ -944,7 +944,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "All validators, not paged. `stakedAmount` is tokens + pending rewards, which is what the delegators' shares are worth. `stakedPercent` is the share of the total staked on all validators, `cumulativePercent` the running total in the returned order."
+      description: "All validators, not paged. `stakedAmount` is tokens + pending rewards, which is what the delegators' shares are worth. `stakedPercent` is the share of the total staked on all validators, `cumulativePercent` the running total in the returned order. Each validator carries `created` (block, tx hash, time, operator and initial stake of ValidatorInitialized; null for genesis validators and ones never initialized) and `exited` (block, tx hash, time of ValidatorExited; null otherwise, including slash-induced exits, which emit no event)."
       parameters:
         - name: status
           in: query
@@ -978,7 +978,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "One validator, including its self-stake (the owner's delegation)."
+      description: "One validator, including its self-stake (the owner's delegation). Each validator carries `created` (block, tx hash, time, operator and initial stake of ValidatorInitialized; null for genesis validators and ones never initialized) and `exited` (block, tx hash, time of ValidatorExited; null otherwise, including slash-induced exits, which emit no event)."
       parameters:
         - $ref: '#/components/parameters/stakingAddressParam'
       responses:
@@ -1030,6 +1030,79 @@ paths:
           schema:
             type: string
             enum: [day, hour]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/param-changes:
+    get:
+      tags:
+        - 'Staking'
+      description: "History of a validator's commission rate and withdrawal fee, newest first. For `commission_rate`, `oldValue` / `newValue` are raw (1,000,000 = 100%) with `oldPercent` / `newPercent` alongside; for `withdrawal_fee` they are gwei and the percent fields are null."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: type
+          in: query
+          description: "Comma separated: commission_rate, withdrawal_fee. Default both."
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/fees:
+    get:
+      tags:
+        - 'Staking'
+      description: "Commission and tip fee per validator, ordered by their sum. For each: `current` is what is still in the contract (commission() / tipFee() at `refreshedBlock`), `withdrawn` the sum of WithdrawCommission / WithdrawTipFee, `total` the two added. A commission withdrawal only moves it into the withdrawal queue, so withdrawn does not mean paid out yet."
+      parameters:
+        - name: address
+          in: query
+          description: "Validator address. Omit for all validators."
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/fee-withdrawals:
+    get:
+      tags:
+        - 'Staking'
+      description: "A validator's commission and tip fee withdrawals, newest first: owner, withdrawal address, amount, block, tx hash, time."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: type
+          in: query
+          description: "Comma separated: commission, tip_fee. Default both."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
       responses:
         200:
           description: ''

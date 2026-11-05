@@ -61,6 +61,7 @@ export const VALIDATOR_ABI = [
     'function rewards() view returns (uint256)',
     'function delegatorShares() view returns (uint256)',
     'function commission() view returns (uint256)',
+    'function tipFee() view returns (uint256)',
     'function stakes() view returns (uint256)',
     'function annualPercentageYield() view returns (uint64)',
     'function bondStatus() view returns (uint8)',

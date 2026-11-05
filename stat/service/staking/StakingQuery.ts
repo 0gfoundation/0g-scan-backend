@@ -146,6 +146,38 @@ export async function getStakingSummary() {
     };
 }
 
+const toUnix = (d: any) => Math.floor(new Date(d).getTime() / 1000);
+
+/**
+ * Creation and exit of each validator, from the Staking contract's
+ * ValidatorInitialized and ValidatorExited (at most one of each per validator,
+ * so this is one small query rather than columns to keep in sync).
+ * `created` is null for genesis validators and for ones created but never
+ * initialized; `exited` is null unless ValidatorExited was emitted, which a
+ * slash-induced exit does not do.
+ */
+async function lifecycles(validators?: string[]): Promise<Map<string, {created: any, exited: any}>> {
+    const where: WhereOptions = {
+        eventType: {[Op.in]: [StakingEventType.ValidatorInitialized, StakingEventType.ValidatorExited]},
+    };
+    if (validators) {
+        where['validator'] = {[Op.in]: validators};
+    }
+    const rows = await StakingEvent.findAll({where, raw: true, order: [['blockNumber', 'asc'], ['logIndex', 'asc']]});
+    const ret = new Map<string, {created: any, exited: any}>();
+    for (const r of rows) {
+        const entry = ret.get(r.validator) || {created: null, exited: null};
+        const common = {blockNumber: Number(r.blockNumber), txHash: r.txHash, timestamp: toUnix(r.createdAt)};
+        if (r.eventType === StakingEventType.ValidatorInitialized) {
+            entry.created = entry.created || {...common, operator: checksum(r.account), initialStake: String(r.amount)};
+        } else {
+            entry.exited = {...common};
+        }
+        ret.set(r.validator, entry);
+    }
+    return ret;
+}
+
 export type ValidatorSort = 'staked' | 'commission' | 'delegators' | 'apy';
 
 export async function listValidators(opt: {status?: 'active' | 'inactive', term?: string, sort?: ValidatorSort, asc?: boolean}) {
@@ -153,6 +185,7 @@ export async function listValidators(opt: {status?: 'active' | 'inactive', term?
     const grandTotal = all.reduce((s, v) => s + poolTokens(v), ZERO);
     const counts = await delegatorCounts();
     const self = await selfShares(all);
+    const life = await lifecycles();
     const term = (opt.term || '').toLowerCase();
     let list = all.filter(v => {
         if (opt.status === 'active' && !isActive(v)) return false;
@@ -178,6 +211,8 @@ export async function listValidators(opt: {status?: 'active' | 'inactive', term?
             const selfTokens = sharesToTokens(self.get(v.address) ?? ZERO, v);
             return {
                 ...formatValidator(v),
+                created: life.get(v.address)?.created ?? null,
+                exited: life.get(v.address)?.exited ?? null,
                 delegatorCount: counts.get(v.address) ?? 0,
                 selfStakedAmount: selfTokens.toString(),
                 /** share of the total staked on all validators */
@@ -195,8 +230,11 @@ export async function getValidator(address: string) {
     }
     const counts = await delegatorCounts([address]);
     const self = sharesToTokens((await selfShares([v])).get(address) ?? ZERO, v);
+    const life = (await lifecycles([address])).get(address);
     return {
         ...formatValidator(v),
+        created: life?.created ?? null,
+        exited: life?.exited ?? null,
         delegatorCount: counts.get(address) ?? 0,
         selfStakedAmount: self.toString(),
         selfStakedPercent: percent(self, poolTokens(v)),
@@ -493,5 +531,120 @@ export async function sumDelegatorDelegations(delegator: string, start?: Date, e
         end: end ? end.getTime() / 1000 : null,
         ...formatFlow(total),
         list: rows.map(r => ({validator: checksum(r.validator), ...formatFlow(r)})),
+    };
+}
+
+export type ParamChangeType = 'commission_rate' | 'withdrawal_fee';
+const PARAM_CHANGE_TYPE: {[k in ParamChangeType]: StakingEventType} = {
+    commission_rate: StakingEventType.CommissionRateChanged,
+    withdrawal_fee: StakingEventType.WithdrawalFeeInGweiChanged,
+};
+
+/**
+ * CommissionRateChanged / WithdrawalFeeInGweiChanged of one validator, newest
+ * first. Commission rates are raw (1e6 = 100%) with a percentage alongside;
+ * withdrawal fees are gwei.
+ */
+export async function listParamChanges(validator: string, types: ParamChangeType[], skip: number, limit: number) {
+    const where = {
+        validator,
+        eventType: {[Op.in]: (types.length ? types : Object.keys(PARAM_CHANGE_TYPE) as ParamChangeType[]).map(t => PARAM_CHANGE_TYPE[t])},
+    };
+    const [total, rows] = await Promise.all([
+        StakingEvent.count({where}),
+        StakingEvent.findAll({where, raw: true, offset: skip, limit, order: [['blockNumber', 'desc'], ['logIndex', 'desc']]}),
+    ]);
+    const RATE_BASE = BigInt(1_000_000);
+    return {
+        total,
+        list: rows.map(r => {
+            const isRate = r.eventType === StakingEventType.CommissionRateChanged;
+            const {old: oldValue, new: newValue} = (typeof r.extra === 'string' ? JSON.parse(r.extra) : r.extra) as any;
+            return {
+                type: isRate ? 'commission_rate' : 'withdrawal_fee',
+                oldValue, newValue,
+                oldPercent: isRate ? percent(BigInt(oldValue), RATE_BASE) : null,
+                newPercent: isRate ? percent(BigInt(newValue), RATE_BASE) : null,
+                blockNumber: Number(r.blockNumber), txHash: r.txHash, timestamp: toUnix(r.createdAt),
+            };
+        }),
+    };
+}
+
+/**
+ * Commission and tip fee per validator: what is still in the contract
+ * (`commission()` / `tipFee()` as of the last refresh) plus what has been
+ * withdrawn (WithdrawCommission / WithdrawTipFee). A commission withdrawal
+ * only moves it into the withdrawal queue, so "withdrawn" means taken out of
+ * the balance, not necessarily paid out yet.
+ */
+export async function getFees(validator?: string) {
+    const t = StakingEvent.getTableName();
+    const C = StakingEventType.WithdrawCommission, P = StakingEventType.WithdrawTipFee;
+    const withdrawn: any[] = await StakingEvent.sequelize.query(
+        `select validator,
+                sum(case when eventType = ${C} then amount else 0 end) as commissionWithdrawn,
+                sum(case when eventType = ${C} then 1 else 0 end) as commissionCount,
+                sum(case when eventType = ${P} then amount else 0 end) as tipFeeWithdrawn,
+                sum(case when eventType = ${P} then 1 else 0 end) as tipFeeCount
+         from ${t} where eventType in (${C}, ${P})${validator ? ' and validator = ?' : ''} group by validator`,
+        {type: QueryTypes.SELECT, replacements: validator ? [validator] : []});
+    const byValidator = new Map(withdrawn.map(r => [r.validator, r]));
+    const validators = await StakingValidator.findAll({
+        raw: true, where: validator ? {address: validator} : {},
+        attributes: ['address', 'moniker', 'commission', 'tipFee', 'refreshedBlock'],
+    });
+    const part = (current: any, done: any, count: any) => {
+        const c = big(current), w = big(done);
+        return {current: c.toString(), withdrawn: w.toString(), total: (c + w).toString(), withdrawCount: Number(count ?? 0)};
+    };
+    const list = validators.map(v => {
+        const w = byValidator.get(v.address);
+        const commission = part(v.commission, w?.commissionWithdrawn, w?.commissionCount);
+        const tipFee = part(v.tipFee, w?.tipFeeWithdrawn, w?.tipFeeCount);
+        return {
+            validator: checksum(v.address), moniker: v.moniker,
+            commission, tipFee,
+            total: (BigInt(commission.total) + BigInt(tipFee.total)).toString(),
+            refreshedBlock: v.refreshedBlock == null ? null : Number(v.refreshedBlock),
+        };
+    });
+    list.sort((a, b) => {
+        const d = BigInt(b.total) - BigInt(a.total);
+        return d > ZERO ? 1 : d < ZERO ? -1 : 0;
+    });
+    return {list};
+}
+
+export type FeeWithdrawalType = 'commission' | 'tip_fee';
+const FEE_WITHDRAWAL_TYPE: {[k in FeeWithdrawalType]: StakingEventType} = {
+    commission: StakingEventType.WithdrawCommission,
+    tip_fee: StakingEventType.WithdrawTipFee,
+};
+
+/** WithdrawCommission / WithdrawTipFee of one validator, newest first. */
+export async function listFeeWithdrawals(opt: {
+    validator: string, types: FeeWithdrawalType[], start?: Date, end?: Date, skip: number, limit: number,
+}) {
+    const where: WhereOptions = {
+        validator: opt.validator,
+        eventType: {[Op.in]: (opt.types.length ? opt.types : Object.keys(FEE_WITHDRAWAL_TYPE) as FeeWithdrawalType[]).map(t => FEE_WITHDRAWAL_TYPE[t])},
+    };
+    if (opt.start || opt.end) {
+        where['createdAt'] = {...(opt.start ? {[Op.gte]: opt.start} : {}), ...(opt.end ? {[Op.lt]: opt.end} : {})};
+    }
+    const [total, rows] = await Promise.all([
+        StakingEvent.count({where}),
+        StakingEvent.findAll({where, raw: true, offset: opt.skip, limit: opt.limit, order: [['blockNumber', 'desc'], ['logIndex', 'desc']]}),
+    ]);
+    return {
+        total,
+        list: rows.map(r => ({
+            type: r.eventType === StakingEventType.WithdrawCommission ? 'commission' : 'tip_fee',
+            owner: checksum(r.account),
+            withdrawalAddress: checksum(r.counterparty),
+            amount: String(r.amount),
+            blockNumber: Number(r.blockNumber), txHash: r.txHash, timestamp: toUnix(r.createdAt),
+        })),
     };
 }
