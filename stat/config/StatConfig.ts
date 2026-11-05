@@ -25,7 +25,7 @@ export interface StakingOption {
     enabled?: boolean, // default false
     contract?: string, // default: STAKING_CONTRACT_ADDRESS from ValidatorContract.sol
     /**
-     * Which built-in genesis validator list to seed: 'mainnet' | 'none'
+     * Which built-in genesis validator list to seed: 'mainnet' | 'testnet' | 'none'
      * (GENESIS_VALIDATORS in StakingAbi.ts). Required when enabled: validators
      * registered via genesis deposits emit no event, so the sync refuses to
      * start without an explicit choice.

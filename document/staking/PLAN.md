@@ -630,6 +630,18 @@ staking: {enabled: true, genesis: 'mainnet'},   // 测试网用 genesis: 'none'
 - 解码器：用 ethers `Interface.encodeEventLog` 生成 V2 事件，加上手工构造的 V1 两种变体和畸形日志跑了一遍，全部符合预期。
 - swagger YAML 能被 `yamljs` 解析。
 
+**测试网端到端测试（2026-11-05，本地 MySQL 8.0 容器 + `https://evmrpc-testnet.0g.ai`）**
+
+- `sync`：从块 1 追到 63,947,045，639 个窗口用时 22 分 40 秒（每窗约 2 秒，串行 RPC）。入库 569 条 Staking / Delegate / Undelegate 事件，与第 0 步的独立扫描逐条数量一致；validator 共 14 个，与 Xangle 测试网 seed 一致。
+- `refresh`：14 个 validator 全部刷新成功；对账修正了 2 条负份额（测试网状态早于事件历史，见 `GENESIS_VALIDATORS.testnet`）。检测到 1 次罚没：validator `0x4b99…` 已是 Unbonded，却没有 `ValidatorExited`，owner 从未解押但份额从 500 变成 0，只能是 `slash(exited=true)`。测试网 RPC 不保留那段历史状态，没法二分到具体块。
+- 10 个接口逐个调用：数值与链上直接读取一致（如 Xangle 那个 validator 的 staked 544.85、APY 178.31%），各视角互相对得上，参数错误都按预期返回。接口用 scratchpad 里的最小 Koa 服务测试，因为完整的 open-api 需要 `node-cint64` 原生模块，本机没编译。
+
+测试中发现并修复的问题：
+1. **ethers v5 的 `provider.getLogs()` 不接受 address 数组**（报 "invalid address or ENS name"）。改为直接发 `eth_getLogs`。第 0 步用的是裸 JSON-RPC，所以没发现。
+2. **`staking_validator` 少了 7 列**：模型里 8 个金额字段共用了同一个属性定义对象，Sequelize 把它们都映射到了 `withdrawalFeeInGwei` 一列。`tokens`、`apy` 等读出来都是提现手续费，写入则悄悄丢失。改为每个字段各自生成定义。**已建过表的环境要手工补列**；生产环境还没建过这张表，不受影响。
+3. **refresher 被 RPC 限流**：0G 的 RPC 单批超过 50 个调用就返回 `-32005 request rate exceeded`，ethers 把它报成 `CALL_EXCEPTION`。改为分块控制每批调用数（状态刷新 3 个 validator 一批，份额校验 10 个，对账 40 个），限流时指数退避重试。
+4. **游标落后时 refresher 悄悄跳过对账**：现在会打日志；命令行的 `refresh` 先把同步追到链头再刷新。
+
 **已知问题（2026-11-04 发现）**
 - `1504491` 之后，`validatorRpc` 配置的是 CL 的 `.../blocks/head/total_withdrawals`，不再是 validators 接口。一期 refresher 的 `refreshBeaconStatus()` 仍然直接拿 `validatorRpc` 当 `/states/head/validators` 用，结果会是"empty beacon response"告警，`beaconStatus` 全部为空，`active` 全部为 false。已修复：改用 `ZGSupply.validatorRpcUrl()`，从 `validatorRpc` 推导出 validators 接口；用主网 beacon 验证过推导地址可用（67 个 validator，pubkey 格式与库里一致）。
 

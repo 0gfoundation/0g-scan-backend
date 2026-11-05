@@ -48,6 +48,10 @@ async function main() {
         }
         console.log(`caught up at ${await getStakingCursor()}`);
     } else if (cmd === 'refresh') {
+        // the share checks read state at the cursor block, so it must be near the head
+        while (!(await stakingSyncOnce())) {
+            // loop until caught up
+        }
         await stakingRefreshOnce({fullReconcile: true});
     } else if (cmd === 'reconcile') {
         await reconcileAllShares(await getStakingCursor());

@@ -103,7 +103,10 @@ export class StakingValidator extends Model<IStakingValidator> implements IStaki
     refreshedAt?: Date;
 
     static register(seq: Sequelize) {
-        const amount = {type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0};
+        // a fresh object per attribute: Sequelize writes the column name into the
+        // definition it is given, so one shared object maps every attribute onto
+        // the same column
+        const amount = () => ({type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0});
         StakingValidator.init({
             address: {type: DataTypes.STRING(42), allowNull: false, primaryKey: true},
             // raw 48-byte BLS key; genesis validators get it from the refresher
@@ -124,15 +127,15 @@ export class StakingValidator extends Model<IStakingValidator> implements IStaki
             securityContact: {type: DataTypes.STRING(140), allowNull: false, defaultValue: ''},
             details: {type: DataTypes.STRING(280), allowNull: false, defaultValue: ''},
             commissionRate: {type: DataTypes.INTEGER({unsigned: true}), allowNull: false, defaultValue: 0},
-            withdrawalFeeInGwei: amount,
-            tokens: amount,
-            rewards: amount,
-            delegatorShares: amount,
-            commission: amount,
-            stakes: amount,
-            apy: amount,
+            withdrawalFeeInGwei: amount(),
+            tokens: amount(),
+            rewards: amount(),
+            delegatorShares: amount(),
+            commission: amount(),
+            stakes: amount(),
+            apy: amount(),
             bondStatus: {type: DataTypes.TINYINT, allowNull: false, defaultValue: 0},
-            minSelfDelegationInGwei: amount,
+            minSelfDelegationInGwei: amount(),
 
             beaconStatus: {type: DataTypes.STRING(32), allowNull: true},
             beaconEffectiveBalance: {type: DataTypes.DECIMAL(65, 0), allowNull: true},

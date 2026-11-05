@@ -235,15 +235,26 @@ export function decodeStakingLog(log: RawLog): DecodedStakingEvent | null {
 /**
  * Validators registered through genesis deposits rather than
  * `createValidator`, so no ValidatorCreated/ValidatorInitialized exists for
- * them. Values from `0g-reth-exex-template` src/exex.rs (mainnet); the initial
- * operator shares are unverified there and are checked by the refresher's
- * reconciliation.
+ * them. Addresses match the deposits in each network's genesis.json (address =
+ * last 20 bytes of the 0x01 credentials, 500 0G each).
+ *
+ * mainnet: operator and shares checked at block 1 -- the owner 0x711b...2522
+ * holds all 500e18 shares of each.
+ *
+ * testnet: each pool also holds 500e18 shares at block 1, but not in the
+ * owner's name, and later events show other addresses undelegating far more
+ * than they ever delegated: testnet state predates its event history. So only
+ * the addresses are seeded, which keeps their events from being filtered out;
+ * shares are left to the refresher's reconciliation.
  */
 export interface GenesisValidator {
     address: string
     operator: string
-    /** operator's initial shares, wei; the pool starts empty so shares == amount */
-    amount: string
+    /**
+     * operator's initial shares, wei (the pool starts empty, so shares == amount);
+     * null when unknown, and then no shares are seeded
+     */
+    amount: string | null
 }
 
 export const GENESIS_VALIDATORS: {[network: string]: GenesisValidator[]} = {
@@ -256,6 +267,16 @@ export const GENESIS_VALIDATORS: {[network: string]: GenesisValidator[]} = {
         address,
         operator: '0x711b0ecb072c27de0e50c9944d7195a51b202522',
         amount: '500000000000000000000',
+    })),
+    testnet: [
+        '0x08fc637a7802c1210cc071c2dc65bcad26badbdf',
+        '0xcc6e4f0a7fc8754c247a4cc7c189d94e3c844213',
+        '0xa96d3f1228115a3945045d5aa18c5b7a9f4d943e',
+        '0x8936421339b144259187e7ecbe185771bfc1bbd4',
+    ].map(address => ({
+        address,
+        operator: '0x565e66aa2bcb27116937983f2f208efabf620ab2',
+        amount: null,
     })),
     none: [],
 };

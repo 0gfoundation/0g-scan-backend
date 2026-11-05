@@ -25,7 +25,18 @@ import {getStakingCursor, stakingOption, withStakingLock} from "./StakingSync";
 /** how far behind latest the cursor may be for state reads at the cursor block */
 const MAX_STATE_LAG = 64;
 const FULL_RECONCILE_INTERVAL = 3600 * SECOND;
-const CONCURRENCY = 20;
+/**
+ * The batch provider sends every call issued in the same tick as one JSON-RPC
+ * batch, and the 0G RPCs reject the part of a batch beyond 50 calls with
+ * -32005 "request rate exceeded" (ethers then reports a bare CALL_EXCEPTION).
+ * Chunk sizes keep each batch under that: about 15 calls per validator when
+ * refreshing state, 2 per validator per step in the share check, 1 per
+ * delegation when reconciling.
+ */
+const CHUNK_STATE = 3;
+const CHUNK_SHARE_CHECK = 10;
+const CHUNK_RECONCILE = 40;
+const RATE_LIMIT_RETRIES = 5;
 
 const ctx = {
     provider: null as ethers.providers.JsonRpcBatchProvider,
@@ -44,9 +55,28 @@ function validatorContract(address: string) {
     return new ethers.Contract(address, VALIDATOR_ABI, provider());
 }
 
-async function inChunks<T>(list: T[], fn: (t: T) => Promise<any>) {
-    for (let i = 0; i < list.length; i += CONCURRENCY) {
-        await Promise.all(list.slice(i, i + CONCURRENCY).map(fn));
+async function inChunks<T>(list: T[], size: number, fn: (t: T) => Promise<any>) {
+    for (let i = 0; i < list.length; i += size) {
+        await Promise.all(list.slice(i, i + size).map(fn));
+    }
+}
+
+function isRateLimited(e: any): boolean {
+    const text = `${e?.message || ''} ${JSON.stringify(e?.error || '')}`;
+    return /-32005|rate exceeded|too many requests/i.test(text);
+}
+
+/** Retries RPC calls rejected by the rate limit, backing off 200ms, 400ms, ... */
+async function rpc<T>(fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await fn();
+        } catch (e) {
+            if (attempt >= RATE_LIMIT_RETRIES || !isRateLimited(e)) {
+                throw e;
+            }
+            await new Promise(r => setTimeout(r, 200 * 2 ** attempt));
+        }
     }
 }
 
@@ -57,17 +87,17 @@ const str = (v: any) => v.toString();
 async function refreshContractState(latest: number) {
     const rows = await StakingValidator.findAll({attributes: ['address', 'pubkey'], raw: true});
     let failed = 0;
-    await inChunks(rows, async row => {
+    await inChunks(rows, CHUNK_STATE, async row => {
         const c = validatorContract(row.address);
         const o = {blockTag: latest};
         try {
             const [owner, operator, desc, commissionRate, withdrawalFeeInGwei, tokens, rewards,
-                delegatorShares, commission, stakes, apy, bondStatus, minSelf, pubkey] = await Promise.all([
+                delegatorShares, commission, stakes, apy, bondStatus, minSelf, pubkey] = await rpc(() => Promise.all([
                 c.owner(o), c.operatorAddress(o), c.description(o), c.commissionRate(o), c.withdrawalFeeInGwei(o),
                 c.tokens(o), c.rewards(o), c.delegatorShares(o), c.commission(o), c.stakes(o),
                 c.annualPercentageYield(o), c.bondStatus(o), c.minSelfDelegationInGwei(o),
                 row.pubkey ? Promise.resolve(null) : c.consensusPubkey(o),
-            ]);
+            ]));
             const fields: any = {
                 owner: lower(owner), operator: lower(operator),
                 moniker: desc[0], identity: desc[1], website: desc[2], securityContact: desc[3], details: desc[4],
@@ -138,15 +168,15 @@ async function refreshBeaconStatus() {
 async function checkOperatorShares(block: number) {
     const rows = await StakingValidator.findAll({attributes: ['address'], raw: true});
     const blockTime = new Date((await provider().getBlock(block)).timestamp * 1000);
-    await inChunks(rows, async row => {
+    await inChunks(rows, CHUNK_SHARE_CHECK, async row => {
         const c = validatorContract(row.address);
         const o = {blockTag: block};
         try {
-            const operator = lower(await c.operatorAddress(o));
+            const operator = lower(await rpc(() => c.operatorAddress(o)));
             if (!operator || operator === ethers.constants.AddressZero) {
                 return;
             }
-            const [[, chainShares], chainTotal] = await Promise.all([c.getDelegation(operator, o), c.delegatorShares(o)]);
+            const [[, chainShares], chainTotal] = await rpc(() => Promise.all([c.getDelegation(operator, o), c.delegatorShares(o)]));
             const opRow = await StakingDelegation.findOne({where: {validator: row.address, delegator: operator}, raw: true});
             const dbShares = BigInt(opRow?.shares ?? 0);
             const onChain = BigInt(str(chainShares));
@@ -199,8 +229,8 @@ export async function reconcileAllShares(block: number) {
         attributes: ['id', 'validator', 'delegator', 'shares'], raw: true, where: {shares: {[Op.ne]: 0}},
     });
     let mismatched = 0;
-    await inChunks(rows, async row => {
-        const [, chainShares] = await validatorContract(row.validator).getDelegation(row.delegator, {blockTag: block});
+    await inChunks(rows, CHUNK_RECONCILE, async row => {
+        const [, chainShares] = await rpc(() => validatorContract(row.validator).getDelegation(row.delegator, {blockTag: block}));
         const onChain = BigInt(str(chainShares));
         if (onChain !== BigInt(row.shares)) {
             mismatched++;
@@ -223,7 +253,8 @@ export async function stakingRefreshOnce({fullReconcile = false} = {}) {
     await withStakingLock(async () => {
         const cursor = await getStakingCursor();
         if (latest - cursor > MAX_STATE_LAG) {
-            return; // still catching up
+            console.log(`staking refresh: share checks skipped, cursor ${cursor} is ${latest - cursor} blocks behind ${latest}`);
+            return;
         }
         await checkOperatorShares(cursor);
         if (fullReconcile || Date.now() - ctx.lastFullReconcile > FULL_RECONCILE_INTERVAL) {

@@ -110,7 +110,7 @@ async function seedGenesis(network: string) {
                 transaction: dbTx,
             });
         }
-        await applyShareDeltas(new Map(list.map(g => [pairKey(g.address, g.operator), {
+        await applyShareDeltas(new Map(list.filter(g => g.amount != null).map(g => [pairKey(g.address, g.operator), {
             delta: BigInt(g.amount), firstBlock: 0, lastBlock: 0, firstAt: null, lastAt: null,
         }])), dbTx);
         await KV.upsert({key: KEY_STAKING_GENESIS, value: network}, {transaction: dbTx});
@@ -122,9 +122,24 @@ async function safeHead(): Promise<number> {
     return (await ctx.provider.getBlockNumber()) - stakingOption().confirmations;
 }
 
+/**
+ * Raw eth_getLogs: ethers v5's provider.getLogs() rejects an address array
+ * ("invalid address or ENS name"), and the validator query needs one.
+ */
 async function getLogs(address: string | string[], topics: string[], from: number, to: number): Promise<RawLog[]> {
-    const logs = await ctx.provider.getLogs({address: address as any, topics: [topics], fromBlock: from, toBlock: to});
-    return logs as any as RawLog[];
+    const logs: any[] = await ctx.provider.send('eth_getLogs', [{
+        address, topics: [topics], fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16),
+    }]);
+    return logs.map(l => ({
+        address: l.address,
+        topics: l.topics,
+        data: l.data,
+        blockNumber: parseInt(l.blockNumber, 16),
+        blockHash: l.blockHash,
+        transactionHash: l.transactionHash,
+        transactionIndex: parseInt(l.transactionIndex, 16),
+        logIndex: parseInt(l.logIndex, 16),
+    }));
 }
 
 function pairKey(validator: string, delegator: string) {
