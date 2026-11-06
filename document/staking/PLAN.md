@@ -124,7 +124,7 @@
 | 事件 | 原因 | 替代办法 |
 |---|---|---|
 | `DistributeRewards` | 系统调用触发，日志取不到 | 每块奖励改从区块的 `withdrawals` 前三条采集（见"区块奖励、佣金、社区税、基金会奖励与罚没"），第 0 条就是分给出块 validator 的奖励，社区税和佣金按合约规则从它算出 |
-| `Exited` / `Slashed`（validator 合约） | 按需求不记录。退出改用 Staking 合约的 `ValidatorExited`；`Exited` 仍会拉取，只用来区分退出走的是哪个实现版本（见"二期 B 实现与验证"第 3 点），不入库。`Slashed` 在测试网上其实能查到（块 38,873,058），但罚没以区块的 `slashed` 数组为准 | 罚没对份额的影响仍由 refresher 校正（`SlashDetected`，见 Refresher），只用于保证份额正确，不对外提供罚没接口 |
+| `Exited` / `Slashed`（validator 合约） | 按需求不记录。退出改用 Staking 合约的 `ValidatorExited`；`Exited` 仍会拉取，只用来区分退出走的是哪个实现版本（见"二期 B 实现与验证"第 3 点），不入库。共识层罚没由 geth 以系统调用执行 `slashValidator`，`Slashed` 日志取不到，罚没以区块的 `slashed` 数组为准（测试网块 38,873,058 那条 `Slashed` 是管理员的普通交易，见"二期 B 实现与验证"第 3 点） | 罚没对份额的影响仍由 refresher 校正（`SlashDetected`，见 Refresher），只用于保证份额正确，不对外提供罚没接口 |
 | `PopWithdrawEntry` | 主要在系统调用里出队，日志不完整 | 待解押队列一律用 `withdrawCount()` / `getWithdraw(i)` 读当前状态（二期） |
 | `PushWithdrawEntry` | 正常入队（`isFailed=false`）能取到，但失败重入队（`isFailed=true`）发生在系统调用里；只收一半反而误导 | 同上。解押记录本身已有 `Undelegate` 事件，完成高度 = 解押块号 + `minWithdrawabilityDelay()` |
 | `DepositEvent` / `OperatorChangeQueued` / `OperatorChangeCancelled` / `OperatorUpdated`（Deposit 合约） | 共识层 deposit 与 operator 变更，跟委托统计无关 | `operatorAddress()` 由 refresher 读 |
@@ -515,7 +515,7 @@ group by validator;
 - **CL 对账精确通过**：块 49,236,778–49,338,495 采集的 `reward + restaking + foundation` 合计 246,318,157,986,926 gwei，与 CL 累计 `rewards` 在同一段的增量完全相等。
 - **佣金逐 wei 一致**：最近 60 块里出块的 13 个 validator，逐块算出的佣金与链上 `commission(末) − commission(初) + 期间 WithdrawCommission` 全部相等。其中 3 个 owner 自质押不达标的创世 validator，佣金为 0。
 - **社区税逐 wei 一致**：同样 60 块里，社区池 `0x51e0…04c7` 的余额增量等于采集到的社区税合计。
-- 5 个接口：金额关系（奖励 = 社区税 + 佣金 + 委托人奖励）、全网与各 validator 之和、按天分组、截断到采集游标、参数校验都正确。期间没有罚没，`slashed` 的解析只靠代码逻辑，还没碰到真实数据。
+- 5 个接口：金额关系（奖励 = 社区税 + 佣金 + 委托人奖励）、全网与各 validator 之和、按天分组、截断到采集游标、参数校验都正确。期间没有罚没；`slashed` 的验证见下面第 7 点。
 
 **主网测试中的发现**
 1. **`eth_getLogs` 的 address 数组最多 32 个**（见第 0 步第 2 项），`ADDRESS_CHUNK` 已改为 32。
@@ -533,10 +533,19 @@ group by validator;
    - refresher 不再把"已退出、owner 链上份额为 0"记为罚没。`/fees` 的 commission `total` 扣除 `exitSettlement`，`exitSettlement` 单独返回；读不到时为 null，`total` 仍包含它。
    - 已知限制：佣金的"是否达标"按新公式 `getDelegatedTokens` 判断。在 `bb794bcc7` 之前的实现下（不含 rewards，且要求份额 > 0），owner 正好处在门槛附近时可能判断不一致。升级的具体块不知道，只能确定在块 37,392,579 之前。
    - 验证（新建一个空库，用新代码从块 1 重新同步主网）：16 个旧版退出（块 12,034,802–35,681,625）全部标为 `stake-to-commission`，4 个新版退出（块 37,392,579–48,556,929）全部标为 `emits-exited`。全量份额对账 2,197 条，0 条修正，refresher 没有再报罚没；`Exited` 没有入库。16 个旧版退出中 15 个的 `exitSettlement` 因为读不到历史状态，记为 null。
-   - 测试网上有 1 条 `Slashed` 事件（块 38,873,058），`eth_getLogs` 能查到，推翻了"`Slashed` 走系统调用、日志取不到"的推断。按之前的决定仍不记录 `Slashed`，罚没以区块的 `slashed` 数组为准。
+   - 测试网上有 1 条 `Slashed` 事件（块 38,873,058，validator `0x4b99…`），`eth_getLogs` 能查到。它来自管理员地址 `0x565e…` 直接调用 `slashValidator(address,uint256)` 的普通交易，当时的合约还允许这样调用；现在的合约要求只能由系统地址调用。所以它**没有**推翻"系统调用的日志取不到"：共识层罚没由 geth 的 `ProcessStakingSlashings` 以系统调用执行，`Slashed` 日志仍然取不到。罚没以区块的 `slashed` 数组为准。
 4. **公共 RPC 读不到可靠的历史状态**：`evmrpc.0g.ai` 背后的节点只有部分保留历史状态，而且时有时无。开始测试时还能读块 1,100 万和 2,363 万，后来除了最近约一百个块全部报 `missing trie node`。依赖历史状态的有三项："是否达标"判断、`check-commission`、退出本金的读取。**生产环境需要专用的归档节点**；否则"是否达标"全部退回估算（`approx`），对自质押在门槛附近的 validator 可能算错，`exitSettlement` 也会一直是 null。
 5. 命令行的 `sync` / `refresh` / `blocks` 原来遇到一次 RPC 临时错误就退出，现在会带退避地重试，连续失败 10 次才放弃。常驻服务里的循环本来就会重试。
 6. **主网份额对账**：2,197 条普通委托记录全部和链上一致，0 条修正。一期的份额增量算法，包括创世份额导入和旧版初始化去重，在主网上得到了验证。
+7. **`slashed` 数组**（2026-11-06）：
+   - 链上没有真实样本可用。主网共识层 67 个 validator 都没有 `slashed=true`，从未发生过共识层罚没；测试网的共识层接口未知，唯一一条 `Slashed` 也不是共识层罚没（见第 3 点）。
+   - 0g-geth 源码（`aristotle-v1.0.6` / `galileo-v3.0.7-rc1` 起）：
+     - `slashed` 不参与块哈希，但随块体在 p2p 里同步（`eth/protocols/eth` 的 body 带可选字段），所以同步来的节点也能返回它；
+     - RPC 只在非空时输出 `slashed`，元素是 `types.Withdrawal` 的 JSON（`index`、`validatorIndex`、`address`、`amount` 都是十六进制，`amount` 单位 gwei）；
+     - 每条执行 `StakingContract.slashValidator(address, amount × 1e9)`，所以 `address` 就是 validator 合约地址。`amount` 为 0 的条目直接跳过；地址不是已注册 validator 时合约什么都不做。
+   - 验证方法：本地 RPC 代理把请求转发给主网，同时往块 49,339,900 和 49,340,500 注入上面格式的 `slashed`，覆盖单条、同块多条、大写地址、amount 为 0、非 validator 地址这几种情况。在复制出来的库里跑逐块采集，再查 `/slashes`、`/validator/rewards`（累计、跨整日和部分日的时间段、单个 validator）和 `/validator` 的 `rewards`。
+   - 结果：地址统一成小写；gwei 正确换算成 wei；同块多条按数组下标记 `position`；日汇总的 `slashCount` / `slashedAmount` 和各接口的累计、时间段数字都正确；CL 奖励对账不受影响。
+   - 据此修改了两处：amount 为 0 的条目跟链上一样跳过，不再记成一次罚没；地址不是已知 validator 时记录警告（仍入库，因为数组里确实有这条）。
 
 ## 验证（仓库没有测试套件）
 

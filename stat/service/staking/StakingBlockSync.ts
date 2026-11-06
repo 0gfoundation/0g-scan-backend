@@ -7,6 +7,7 @@ import {
     StakingBlockReward,
     StakingBlockSlash,
     StakingRewardDaily,
+    StakingValidator,
 } from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
@@ -138,13 +139,22 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
             };
         }
     }
+    // position is the index in the block's array, kept even when an entry is
+    // skipped so a row can be traced back to the RPC response
     const slashes = (b.slashed || []).map((s: any, position: number) => ({
         blockNumber: number, createdAt, position,
         slashIndex: BigInt(s.index).toString(),
         validatorIndex: BigInt(s.validatorIndex).toString(),
         validator: s.address.toLowerCase(),
         amount: (BigInt(s.amount) * GWEI).toString(),
-    }));
+    })).filter((s: IStakingBlockSlash) => {
+        // 0g-geth's ProcessStakingSlashings skips zero amounts without calling slashValidator
+        if (s.amount === '0') {
+            warn(`block ${number}: slashed[${s.position}] has amount 0, skipped as the chain does`);
+            return false;
+        }
+        return true;
+    });
     return {reward, slashes};
 }
 
@@ -200,6 +210,14 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
 
     const warnings: string[] = [];
     const parsed = blocks.map(b => parseBlock(b, m => warnings.push(m)));
+    const slashed = [...new Set(parsed.flatMap(p => p.slashes.map(s => s.validator)))];
+    if (slashed.length) {
+        // slashValidator is a no-op for an address that is not a registered validator
+        const known = new Set((await StakingValidator.findAll({
+            raw: true, attributes: ['address'], where: {address: {[Op.in]: slashed}},
+        })).map(v => v.address));
+        slashed.filter(v => !known.has(v)).forEach(v => warnings.push(`slashed address ${v} is not a known validator`));
+    }
     warnings.slice(0, 5).forEach(m => console.log(`staking blocks: ${m}`));
     if (warnings.length) {
         safeAddErrorLog('staking', 'block-parse', new Error(`${warnings.length} warnings in ${from}-${to}, first: ${warnings[0]}`));
