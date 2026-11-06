@@ -533,7 +533,7 @@ group by validator;
    - refresher 不再把"已退出、owner 链上份额为 0"记为罚没。`/fees` 的 commission `total` 扣除 `exitSettlement`，`exitSettlement` 单独返回；读不到时为 null，`total` 仍包含它。
    - 已知限制：佣金的"是否达标"按新公式 `getDelegatedTokens` 判断。在 `bb794bcc7` 之前的实现下（不含 rewards，且要求份额 > 0），owner 正好处在门槛附近时可能判断不一致。升级的具体块不知道，只能确定在块 37,392,579 之前。
    - 验证（新建一个空库，用新代码从块 1 重新同步主网）：16 个旧版退出（块 12,034,802–35,681,625）全部标为 `stake-to-commission`，4 个新版退出（块 37,392,579–48,556,929）全部标为 `emits-exited`。全量份额对账 2,197 条，0 条修正，refresher 没有再报罚没；`Exited` 没有入库。16 个旧版退出中 15 个的 `exitSettlement` 因为读不到历史状态，记为 null。
-   - 测试网上有 1 条 `Slashed` 事件（块 38,873,058，validator `0x4b99…`），`eth_getLogs` 能查到。它来自管理员地址 `0x565e…` 直接调用 `slashValidator(address,uint256)` 的普通交易，当时的合约还允许这样调用；现在的合约要求只能由系统地址调用。所以它**没有**推翻"系统调用的日志取不到"：共识层罚没由 geth 的 `ProcessStakingSlashings` 以系统调用执行，`Slashed` 日志仍然取不到。罚没以区块的 `slashed` 数组为准。
+   - 系统调用产生的日志用 `eth_getLogs` 取不到（第 0 步第 1 项），共识层罚没是 geth 的 `ProcessStakingSlashings` 以系统调用执行的 `slashValidator`，所以罚没只能从区块的 `slashed` 数组采集。测试网块 38,873,058 有 1 条能查到的 `Slashed`（validator `0x4b99…`），它不是系统调用：是管理员地址 `0x565e…` 发的普通交易，直接调用了 `slashValidator(address,uint256)`，当时的合约还允许这样调用，现在的合约只允许系统地址调用。
 4. **公共 RPC 读不到可靠的历史状态**：`evmrpc.0g.ai` 背后的节点只有部分保留历史状态，而且时有时无。开始测试时还能读块 1,100 万和 2,363 万，后来除了最近约一百个块全部报 `missing trie node`。依赖历史状态的有三项："是否达标"判断、`check-commission`、退出本金的读取。**生产环境需要专用的归档节点**；否则"是否达标"全部退回估算（`approx`），对自质押在门槛附近的 validator 可能算错，`exitSettlement` 也会一直是 null。
 5. 命令行的 `sync` / `refresh` / `blocks` 原来遇到一次 RPC 临时错误就退出，现在会带退避地重试，连续失败 10 次才放弃。常驻服务里的循环本来就会重试。
 6. **主网份额对账**：2,197 条普通委托记录全部和链上一致，0 条修正。一期的份额增量算法，包括创世份额导入和旧版初始化去重，在主网上得到了验证。
