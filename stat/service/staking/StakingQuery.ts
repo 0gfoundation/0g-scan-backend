@@ -7,6 +7,8 @@ import {
     StakingEventType,
     StakingValidator,
 } from "../../model/Staking";
+import {cumulativeByValidator, formatValidatorTotals} from "./StakingRewardQuery";
+import {blockRewardOption} from "./StakingSync";
 
 /**
  * Read side of the 0G validator/delegation index, for open-api.
@@ -24,6 +26,10 @@ import {
  */
 
 const ZERO = BigInt(0);
+const ZERO_TOTALS = {
+    blockCount: 0, reward: ZERO, communityTax: ZERO, commission: ZERO,
+    restakingReward: ZERO, foundationReward: ZERO, slashCount: 0, slashedAmount: ZERO,
+};
 const HUNDRED = BigInt(100);
 
 export const ACTIVE_BEACON_STATUS = ['active_ongoing', 'active_exiting', 'active_slashed'];
@@ -186,6 +192,8 @@ export async function listValidators(opt: {status?: 'active' | 'inactive', term?
     const counts = await delegatorCounts();
     const self = await selfShares(all);
     const life = await lifecycles();
+    // cumulative block rewards, only when they are being collected (all zero otherwise)
+    const rewards = blockRewardOption().enabled ? await cumulativeByValidator() : null;
     const term = (opt.term || '').toLowerCase();
     let list = all.filter(v => {
         if (opt.status === 'active' && !isActive(v)) return false;
@@ -213,6 +221,7 @@ export async function listValidators(opt: {status?: 'active' | 'inactive', term?
                 ...formatValidator(v),
                 created: life.get(v.address)?.created ?? null,
                 exited: life.get(v.address)?.exited ?? null,
+                rewards: rewards ? formatValidatorTotals(rewards.get(v.address) || ZERO_TOTALS) : null,
                 delegatorCount: counts.get(v.address) ?? 0,
                 selfStakedAmount: selfTokens.toString(),
                 /** share of the total staked on all validators */
@@ -231,10 +240,12 @@ export async function getValidator(address: string) {
     const counts = await delegatorCounts([address]);
     const self = sharesToTokens((await selfShares([v])).get(address) ?? ZERO, v);
     const life = (await lifecycles([address])).get(address);
+    const rewards = blockRewardOption().enabled ? (await cumulativeByValidator(address)).get(address) : null;
     return {
         ...formatValidator(v),
         created: life?.created ?? null,
         exited: life?.exited ?? null,
+        rewards: blockRewardOption().enabled ? formatValidatorTotals(rewards || ZERO_TOTALS) : null,
         delegatorCount: counts.get(address) ?? 0,
         selfStakedAmount: self.toString(),
         selfStakedPercent: percent(self, poolTokens(v)),
@@ -577,6 +588,11 @@ export async function listParamChanges(validator: string, types: ParamChangeType
  * withdrawn (WithdrawCommission / WithdrawTipFee). A commission withdrawal
  * only moves it into the withdrawal queue, so "withdrawn" means taken out of
  * the balance, not necessarily paid out yet.
+ *
+ * An exit moves the owner's stake into commission() too (deployed contract
+ * behaviour, not in the source we have), so for exited validators
+ * current/withdrawn include it; commission.total leaves it out and
+ * commission.exitSettlement reports it.
  */
 export async function getFees(validator?: string) {
     const t = StakingEvent.getTableName();
@@ -594,13 +610,33 @@ export async function getFees(validator?: string) {
         raw: true, where: validator ? {address: validator} : {},
         attributes: ['address', 'moniker', 'commission', 'tipFee', 'refreshedBlock'],
     });
-    const part = (current: any, done: any, count: any) => {
+    // what each exit moved into commission() (recorded by the sync on ValidatorExited)
+    const exits = await StakingEvent.findAll({
+        raw: true, attributes: ['validator', 'extra'],
+        where: {eventType: StakingEventType.ValidatorExited, ...(validator ? {validator} : {})},
+    });
+    const settlement = new Map<string, bigint | null>();
+    for (const e of exits) {
+        const x: any = typeof e.extra === 'string' ? JSON.parse(e.extra) : (e.extra || {});
+        const prev = settlement.has(e.validator) ? settlement.get(e.validator) : ZERO;
+        settlement.set(e.validator, prev == null || x.exitSettlement == null ? null : prev + BigInt(x.exitSettlement));
+    }
+    const part = (current: any, done: any, count: any, exitSettlement: bigint | null = ZERO) => {
         const c = big(current), w = big(done);
-        return {current: c.toString(), withdrawn: w.toString(), total: (c + w).toString(), withdrawCount: Number(count ?? 0)};
+        return {
+            current: c.toString(), withdrawn: w.toString(),
+            total: (c + w - (exitSettlement ?? ZERO)).toString(), withdrawCount: Number(count ?? 0),
+        };
     };
     const list = validators.map(v => {
         const w = byValidator.get(v.address);
-        const commission = part(v.commission, w?.commissionWithdrawn, w?.commissionCount);
+        const exitSettlement = settlement.has(v.address) ? settlement.get(v.address) : ZERO;
+        const commission = {
+            ...part(v.commission, w?.commissionWithdrawn, w?.commissionCount, exitSettlement),
+            // the owner's stake an exit moved into commission(): part of current/withdrawn, not of total;
+            // null when it could not be read, and then total still includes it
+            exitSettlement: exitSettlement == null ? null : exitSettlement.toString(),
+        };
         const tipFee = part(v.tipFee, w?.tipFeeWithdrawn, w?.tipFeeCount);
         return {
             validator: checksum(v.address), moniker: v.moniker,

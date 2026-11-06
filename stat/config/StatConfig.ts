@@ -35,6 +35,19 @@ export interface StakingOption {
     confirmations?: number, // blocks kept back from latest, default 0 (CometBFT finalizes each block)
     logRange?: number, // blocks per eth_getLogs window, default 100,000 (the 0G RPC's cap)
     refreshIntervalMs?: number, // default 60s
+    /** per-block rewards, commission, community tax, foundation rewards and slashes */
+    blockRewards?: {
+        enabled?: boolean, // default false
+        // first block to collect; mainnet withdrawals start at 10,877,918. A later
+        // start only covers part of the history: cumulative figures then count from it.
+        startBlock?: number,
+        batchSize?: number, // blocks per JSON-RPC batch, default 50 (the 0G RPCs reject more)
+        concurrency?: number, // batches in flight, default 2
+        foundationAddress?: string, // expected withdrawals[2].address, default 0x711b...2522
+        communityTaxRate?: number, // raw, 1e6 = 100%; default 100000 (10%)
+        // consensus layer .../blocks/{id}/total_withdrawals; default: validatorRpc
+        clTotalWithdrawalsUrl?: string,
+    },
 }
 export interface ConsortiumBridgeOption {
     port: number,

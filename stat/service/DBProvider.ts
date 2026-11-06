@@ -91,7 +91,15 @@ import {
     PartnerAudit,
     PartnerContract,
 } from "../model/PartnerChain";
-import {StakingDelegation, StakingEvent, StakingValidator} from "../model/Staking";
+import {
+    StakingBlockReward,
+    StakingBlockSlash,
+    StakingDelegation,
+    StakingEvent,
+    StakingRewardDaily,
+    StakingSelfDelegation,
+    StakingValidator,
+} from "../model/Staking";
 
 let conf
 export function createDB(config) {
@@ -237,6 +245,10 @@ export async function initPartialModel(sequelize) {
     StakingValidator.register(sequelize)
     StakingDelegation.register(sequelize)
     StakingEvent.register(sequelize)
+    StakingBlockReward.register(sequelize)
+    StakingBlockSlash.register(sequelize)
+    StakingRewardDaily.register(sequelize)
+    StakingSelfDelegation.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)

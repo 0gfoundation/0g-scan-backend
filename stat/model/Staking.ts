@@ -21,7 +21,7 @@ export enum StakingEventType {
     WithdrawalFeeInGweiChanged = 22,
     WithdrawCommission = 23,
     WithdrawTipFee = 24,
-    /** no longer collected (ValidatorExited stands for exits); rows from before stay */
+    /** not stored any more: fetched only to tell exit implementations apart; rows from before stay */
     Exited = 25,
     /**
      * Synthetic, written by the refresher: the operator's on-chain shares
@@ -274,6 +274,217 @@ export class StakingEvent extends Model<IStakingEvent> implements IStakingEvent 
                 {name: 'idx_type_time', fields: ['eventType', 'createdAt']},
                 {name: 'idx_tx', fields: ['txHash']},
             ]
+        })
+    }
+}
+
+/*
+ * Per-block rewards and slashes, from each block's withdrawals[0..2] and its
+ * slashed array (see PLAN.md "区块奖励、佣金、社区税、基金会奖励与罚没"). Fed by
+ * StakingBlockSync. Amounts are wei (the block carries gwei).
+ */
+
+export interface IStakingBlockReward {
+    blockNumber: number
+    createdAt: Date
+    /** withdrawals[0].address: the proposing validator's contract */
+    validator: string
+    /** withdrawals[0].amount */
+    reward: string
+    /** reward * communityTaxRate / 1e6, sent to the Staking contract's communityPoolAddress */
+    communityTax: string
+    /** reward * commissionRate / 1e6 while the owner meets minSelfDelegation, else 0 */
+    commission: string
+    restakingAddress: string
+    restakingReward: string
+    foundationAddress: string
+    foundationReward: string
+}
+
+export class StakingBlockReward extends Model<IStakingBlockReward> implements IStakingBlockReward {
+    blockNumber: number;
+    createdAt: Date;
+    validator: string;
+    reward: string;
+    communityTax: string;
+    commission: string;
+    restakingAddress: string;
+    restakingReward: string;
+    foundationAddress: string;
+    foundationReward: string;
+
+    static register(seq: Sequelize) {
+        const amount = () => ({type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0});
+        StakingBlockReward.init({
+            blockNumber: {type: DataTypes.BIGINT, allowNull: false, primaryKey: true},
+            createdAt: {type: DataTypes.DATE, allowNull: false},
+            validator: {type: DataTypes.STRING(42), allowNull: false},
+            reward: amount(),
+            communityTax: amount(),
+            commission: amount(),
+            restakingAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
+            restakingReward: amount(),
+            foundationAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
+            foundationReward: amount(),
+        }, {
+            sequelize: seq,
+            tableName: 'staking_block_reward',
+            timestamps: false,
+            indexes: [
+                {name: 'idx_time', fields: ['createdAt']},
+                {name: 'idx_validator_time', fields: ['validator', 'createdAt']},
+            ],
+        })
+    }
+}
+
+export interface IStakingBlockSlash {
+    id?: number
+    blockNumber: number
+    createdAt: Date
+    /** position in the block's slashed array */
+    position: number
+    /** slashed[i].index: evidence height (CometBFT misbehavior height / slashingInfo slot) */
+    slashIndex: string
+    /** slashed[i].validatorIndex: consensus-layer validator index */
+    validatorIndex: string
+    /** slashed[i].address: execution withdrawal address, i.e. the validator contract */
+    validator: string
+    amount: string
+}
+
+export class StakingBlockSlash extends Model<IStakingBlockSlash> implements IStakingBlockSlash {
+    id?: number;
+    blockNumber: number;
+    createdAt: Date;
+    position: number;
+    slashIndex: string;
+    validatorIndex: string;
+    validator: string;
+    amount: string;
+
+    static register(seq: Sequelize) {
+        StakingBlockSlash.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            blockNumber: {type: DataTypes.BIGINT, allowNull: false},
+            createdAt: {type: DataTypes.DATE, allowNull: false},
+            position: {type: DataTypes.INTEGER, allowNull: false},
+            slashIndex: {type: DataTypes.STRING(20), allowNull: false},
+            validatorIndex: {type: DataTypes.STRING(20), allowNull: false},
+            validator: {type: DataTypes.STRING(42), allowNull: false},
+            amount: {type: DataTypes.DECIMAL(65, 0), allowNull: false},
+        }, {
+            sequelize: seq,
+            tableName: 'staking_block_slash',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_block_position', fields: ['blockNumber', 'position'], unique: true},
+                {name: 'idx_validator_time', fields: ['validator', 'createdAt']},
+                {name: 'idx_time', fields: ['createdAt']},
+            ],
+        })
+    }
+}
+
+export interface IStakingRewardDaily {
+    id?: number
+    /** UTC day, YYYY-MM-DD */
+    day: string
+    validator: string
+    blockCount: number
+    reward: string
+    communityTax: string
+    commission: string
+    restakingReward: string
+    foundationReward: string
+    slashCount: number
+    slashedAmount: string
+}
+
+/**
+ * Per (UTC day, validator) totals, added to in the same transaction as the
+ * per-block rows. Rewards, tax, commission and foundation rewards belong to
+ * the block's proposer; slashes to the slashed validator.
+ */
+export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IStakingRewardDaily {
+    id?: number;
+    day: string;
+    validator: string;
+    blockCount: number;
+    reward: string;
+    communityTax: string;
+    commission: string;
+    restakingReward: string;
+    foundationReward: string;
+    slashCount: number;
+    slashedAmount: string;
+
+    static register(seq: Sequelize) {
+        const amount = () => ({type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0});
+        StakingRewardDaily.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            day: {type: DataTypes.DATEONLY, allowNull: false},
+            validator: {type: DataTypes.STRING(42), allowNull: false},
+            blockCount: {type: DataTypes.INTEGER({unsigned: true}), allowNull: false, defaultValue: 0},
+            reward: amount(),
+            communityTax: amount(),
+            commission: amount(),
+            restakingReward: amount(),
+            foundationReward: amount(),
+            slashCount: {type: DataTypes.INTEGER({unsigned: true}), allowNull: false, defaultValue: 0},
+            slashedAmount: amount(),
+        }, {
+            sequelize: seq,
+            tableName: 'staking_reward_daily',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_day_validator', fields: ['day', 'validator'], unique: true},
+                {name: 'idx_validator_day', fields: ['validator', 'day']},
+            ],
+        })
+    }
+}
+
+export interface IStakingSelfDelegation {
+    id?: number
+    validator: string
+    /** state after this block, i.e. it applies to rewards from fromBlock + 1 on */
+    fromBlock: number
+    owner: string
+    ok: boolean
+    /** `state_read`: getDelegatedTokens(owner) vs minSelfDelegation at fromBlock; `approx`: from indexed shares at the current share price, when the RPC has no state for that block */
+    source: string
+}
+
+/**
+ * Whether a validator's owner met minSelfDelegation, the condition under
+ * which _distributeRewards accrues commission. Evaluated at the blocks where
+ * it can flip (collection start, owner Delegate/Undelegate,
+ * OwnershipTransferred, SlashDetected) and cached here.
+ */
+export class StakingSelfDelegation extends Model<IStakingSelfDelegation> implements IStakingSelfDelegation {
+    id?: number;
+    validator: string;
+    fromBlock: number;
+    owner: string;
+    ok: boolean;
+    source: string;
+
+    static register(seq: Sequelize) {
+        StakingSelfDelegation.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            validator: {type: DataTypes.STRING(42), allowNull: false},
+            fromBlock: {type: DataTypes.BIGINT, allowNull: false},
+            owner: {type: DataTypes.STRING(42), allowNull: false},
+            ok: {type: DataTypes.BOOLEAN, allowNull: false},
+            source: {type: DataTypes.STRING(16), allowNull: false},
+        }, {
+            sequelize: seq,
+            tableName: 'staking_self_delegation',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_validator_block', fields: ['validator', 'fromBlock'], unique: true},
+            ],
         })
     }
 }

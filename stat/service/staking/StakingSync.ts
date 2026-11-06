@@ -4,6 +4,7 @@ import {ConfigInstance, StakingOption} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {IStakingEvent, StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
+import {ethers} from "ethers";
 import {initEthSdk, SECOND} from "../common/utils";
 import {
     decodeStakingLog,
@@ -34,10 +35,13 @@ import {
 export const KEY_STAKING_CURSOR = 'STAKING_SYNC_BLOCK';
 const KEY_STAKING_GENESIS = 'STAKING_GENESIS_SEEDED';
 /**
- * eth_getLogs address-array size. evmrpc.0g.ai took 1,000 without complaint
- * (2026-11-04); other RPCs cap it differently, so stay well below that.
+ * eth_getLogs address-array size. evmrpc.0g.ai rejects more than 32
+ * ("filter.address can contain up to 32 addresses"), which mainnet's validator
+ * count passed around block 46.4M. An earlier probe with 1,000 (72 distinct,
+ * repeated) went through, so the cap may count distinct addresses or differ
+ * between the nodes behind it; 32 is what holds.
  */
-const ADDRESS_CHUNK = 500;
+const ADDRESS_CHUNK = 32;
 
 export function stakingOption(): Required<StakingOption> {
     const o = ConfigInstance.staking || {};
@@ -50,6 +54,24 @@ export function stakingOption(): Required<StakingOption> {
         // the 0G RPC's eth_getLogs limit (`query exceeds max block range 100000`)
         logRange: o.logRange ?? 100_000,
         refreshIntervalMs: o.refreshIntervalMs ?? 60 * SECOND,
+        blockRewards: o.blockRewards || {},
+    };
+}
+
+/** mainnet's first block with withdrawals; the consensus layer 404s before it */
+export const WITHDRAWAL_ACTIVATION_BLOCK = 10_877_918;
+const FOUNDATION_ADDRESS = '0x711b0ecb072c27de0e50c9944d7195a51b202522';
+
+export function blockRewardOption() {
+    const o = ConfigInstance.staking?.blockRewards || {};
+    return {
+        enabled: !!o.enabled,
+        startBlock: o.startBlock ?? WITHDRAWAL_ACTIVATION_BLOCK,
+        batchSize: o.batchSize ?? 50,
+        concurrency: o.concurrency ?? 2,
+        foundationAddress: (o.foundationAddress || FOUNDATION_ADDRESS).toLowerCase(),
+        communityTaxRate: BigInt(o.communityTaxRate ?? 100_000),
+        clTotalWithdrawalsUrl: o.clTotalWithdrawalsUrl || ConfigInstance.validatorRpc || '',
     };
 }
 
@@ -189,6 +211,81 @@ async function applyShareDeltas(map: Map<string, ShareDelta>, dbTx: Transaction)
     await StakingDelegation.sequelize.query(sql, {type: QueryTypes.INSERT, replacements, transaction: dbTx});
 }
 
+/** the 0G RPCs reject the part of a JSON-RPC batch beyond 50 calls */
+const BLOCK_BATCH = 50;
+
+/**
+ * Block timestamps, fetched in JSON-RPC batches: one request per block made a
+ * mainnet backfill (10k event blocks) take hours.
+ */
+async function blockTimes(numbers: number[]): Promise<Map<number, Date>> {
+    const out = new Map<number, Date>();
+    for (let i = 0; i < numbers.length; i += BLOCK_BATCH) {
+        const chunk = numbers.slice(i, i + BLOCK_BATCH);
+        const body = chunk.map((n, id) => ({jsonrpc: '2.0', id, method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const resp: any[] = await (await fetch(ConfigInstance.ether.url, {
+                    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
+                })).json();
+                const byId = new Map(resp.map(r => [r.id, r]));
+                chunk.forEach((n, id) => {
+                    const r = byId.get(id);
+                    if (!r?.result) {
+                        throw new Error(`block ${n}: ${JSON.stringify(r?.error || 'missing')}`);
+                    }
+                    out.set(n, new Date(parseInt(r.result.timestamp, 16) * 1000));
+                });
+                break;
+            } catch (e) {
+                if (attempt >= 5) {
+                    throw e;
+                }
+                await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
+            }
+        }
+    }
+    return out;
+}
+
+/** the validator's owner after `block`: the last OwnershipTransferred up to it, else the genesis operator */
+async function ownerAt(validator: string, block: number, windowEvents: {log: RawLog, ev: DecodedStakingEvent}[]): Promise<string | null> {
+    const inWindow = windowEvents.filter(d => d.ev.validator === validator
+        && d.ev.eventType === StakingEventType.OwnershipTransferred && d.log.blockNumber <= block);
+    if (inWindow.length) {
+        return inWindow[inWindow.length - 1].ev.counterparty;
+    }
+    const last = await StakingEvent.findOne({
+        raw: true, attributes: ['counterparty'], order: [['blockNumber', 'desc'], ['logIndex', 'desc']],
+        where: {validator, eventType: StakingEventType.OwnershipTransferred, blockNumber: {[Op.lte]: block}},
+    });
+    if (last?.counterparty) {
+        return last.counterparty;
+    }
+    return GENESIS_VALIDATORS[stakingOption().genesis]?.find(g => g.address === validator)?.operator ?? null;
+}
+
+/**
+ * commission() after `block` minus before it, i.e. what the exit moved into
+ * commission. Null when no node serves that state (only some behind
+ * evmrpc.0g.ai keep history, hence the retries).
+ */
+async function commissionJump(validator: string, block: number): Promise<string | null> {
+    const c = new ethers.Contract(validator, ['function commission() view returns (uint256)'], ctx.provider);
+    for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+            const [before, after] = await Promise.all([c.commission({blockTag: block - 1}), c.commission({blockTag: block})]);
+            return (BigInt(after.toString()) - BigInt(before.toString())).toString();
+        } catch (e) {
+            if (!/missing trie node|is not available|header not found/i.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
+                throw e;
+            }
+        }
+    }
+    console.log(`staking sync: no state for the exit of ${validator} at ${block}, exitSettlement left unknown`);
+    return null;
+}
+
 interface WindowResult {
     events: number
     newValidators: number
@@ -201,7 +298,7 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
 
     // decode first: validators created in this window must be in the address
     // set before their own logs are requested
-    const decoded: {log: RawLog, ev: DecodedStakingEvent}[] = [];
+    let decoded: {log: RawLog, ev: DecodedStakingEvent}[] = [];
     const newValidators = new Set<string>();
     const decode = (log: RawLog) => {
         try {
@@ -233,10 +330,29 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
     }
     decoded.sort((a, b) => a.log.blockNumber - b.log.blockNumber || a.log.logIndex - b.log.logIndex);
 
-    const blockTime = new Map<number, Date>();
-    for (const n of new Set(decoded.map(d => d.log.blockNumber))) {
-        const block = await ctx.provider.getBlock(n);
-        blockTime.set(n, new Date(block.timestamp * 1000));
+    const blockTime = await blockTimes([...new Set(decoded.map(d => d.log.blockNumber))]);
+
+    // Exits. The validator implementation changed how it exits
+    // (0g-chain-ng contracts/src/staking, f61aef593): before, exit()
+    // undelegated all of the owner's shares into commission() and emitted no
+    // Exited; since, it leaves shares alone and emits Exited. Mainnet ran the
+    // old one until shortly before block 37,392,579 (its first Exited), e.g.
+    // 0x0712...f7dd at 23,630,587: commission 0 -> 565.12, owner's shares
+    // 500 -> 0. So an exit without the validator's Exited in the same tx zeroes
+    // the owner's shares; the amount moved, read from state when a node still
+    // has it, goes into the ValidatorExited row's extra. Exited itself is not
+    // stored.
+    const newStyleExit = new Set(decoded.filter(d => d.ev.eventType === StakingEventType.Exited)
+        .map(d => `${d.log.transactionHash}|${d.ev.validator}`));
+    decoded = decoded.filter(d => d.ev.eventType !== StakingEventType.Exited);
+    const exits = new Map<string, {owner: string, exitSettlement: string | null, implementation: string}>();
+    for (const {log, ev} of decoded) {
+        if (ev.eventType === StakingEventType.ValidatorExited) {
+            const owner = await ownerAt(ev.validator, log.blockNumber, decoded);
+            exits.set(`${log.blockNumber}|${log.logIndex}`, newStyleExit.has(`${log.transactionHash}|${ev.validator}`)
+                ? {owner, exitSettlement: '0', implementation: 'emits-exited'}
+                : {owner, exitSettlement: await commissionJump(ev.validator, log.blockNumber), implementation: 'stake-to-commission'});
+        }
     }
 
     let inserted = 0;
@@ -255,6 +371,7 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             .map(d => `${d.log.transactionHash}|${d.ev.validator}|${d.ev.account}`));
 
         const rows: IStakingEvent[] = [];
+        const zeroed: {validator: string, owner: string}[] = [];
         const deltas = new Map<string, ShareDelta>();
         for (const {log, ev} of decoded) {
             if (existing.has(`${log.blockNumber}|${log.logIndex}|${ev.validator}`)) {
@@ -278,9 +395,15 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
                         addDelta(deltas, ev.validator, ev.account, BigInt(ev.amount), log.blockNumber, at);
                     }
                     break;
-                case StakingEventType.ValidatorExited:
+                case StakingEventType.ValidatorExited: {
                     await upsertValidator(ev.validator, {exitedBlock: log.blockNumber}, dbTx);
+                    const exit = exits.get(`${log.blockNumber}|${log.logIndex}`);
+                    rows[rows.length - 1].extra = {...(ev.extra || {}), ...exit};
+                    if (exit.owner && exit.implementation === 'stake-to-commission') {
+                        zeroed.push({validator: ev.validator, owner: exit.owner});
+                    }
                     break;
+                }
                 case StakingEventType.Delegate:
                     addDelta(deltas, ev.validator, ev.account, BigInt(ev.shares), log.blockNumber, at);
                     break;
@@ -293,6 +416,9 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             await StakingEvent.bulkCreate(rows, {transaction: dbTx, ignoreDuplicates: true});
         }
         await applyShareDeltas(deltas, dbTx);
+        for (const z of zeroed) {
+            await StakingDelegation.update({shares: '0'}, {where: {validator: z.validator, delegator: z.owner}, transaction: dbTx});
+        }
         await KV.saveNumber(KEY_STAKING_CURSOR, to, dbTx);
         inserted = rows.length;
     }));

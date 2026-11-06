@@ -1,11 +1,11 @@
 # 把 Validator / Delegation 索引并进 0g-scan-backend：计划
 
-状态：一期已实现，并在测试网上端到端跑通（2026-11-05，见文末"一期实现说明"）。二期 A（validator 事件接口）已实现并在测试网验证（2026-11-05）。二期 B（逐块的奖励、佣金、社区税、基金会奖励与罚没）只有设计，未实现。
+状态：一期、二期 A、二期 B 均已实现（2026-11-05）。一期和二期 A 在测试网上端到端验证；二期 B 在主网最近约 10 万块上验证（CL 对账、佣金、社区税逐 wei 一致），见"二期 B 实现与验证"。生产部署需要归档节点，见同一节。
 
 ## 背景
 
 - Xangle 交接的 `x-back-0g-indexer`（Java + Mongo）负责索引 0G 的 validator 和 delegation 数据，服务交接的 `0g-explorer` 前端。我们不打算再维护一套 Java/Mongo 栈，改为在 scan-backend 里实现同样的能力。
-- 合约源码在 `common/contracts/gravity/`。
+- 合约源码在 `common/contracts/gravity/`，等于 `0g-chain-ng` 仓库 `contracts/src/staking` 的最新版本 `35a01dce7`。主网实际跑过更早的实现，退出逻辑和达标判断都不同，见"二期 B 实现与验证"第 3 点。
 - 另一个参考实现：`0glabs/0g-reth-exex-template`（Rust reth ExEx + SQLite），其事件解码、创世 validator 数据、backfill 工具可对照，结论见附录 D。
 - 参考实现的细节整理自 Xangle 交接包，下文称"Xangle"。
   - 注意：交接源码里**没有应用** `0g_self_delegation_fix(26.07.13).patch`。
@@ -46,7 +46,7 @@
 | # | 问题 | 结论 | 对实现的影响 |
 |---|---|---|---|
 | 1 | 系统调用的日志能否用 `eth_getLogs` 取到 | **取不到**（`DistributeRewards`、`PopWithdrawEntry` 等） | 奖励、罚没改从区块数据和 view 调用获取 |
-| 2 | `eth_getLogs` 的限制 | 块范围上限 **100,000**（超出返回 `query exceeds max block range 100000`）；`address` 数组传 1,000 个也正常；单次返回 13,115 条没有触发条数上限 | `logRange` 默认值已从 2000 改为 100,000，`ADDRESS_CHUNK` 从 50 改为 500。全历史 493 个窗口、6 路并发扫完约 47 秒 |
+| 2 | `eth_getLogs` 的限制 | 块范围上限 **100,000**（超出返回 `query exceeds max block range 100000`）；`address` 数组**最多 32 个地址**（超过返回 `filter.address can contain up to 32 addresses`，2026-11-05 主网同步到块 46.4M、validator 增至 79 个时撞上；之前用 72 个不重复地址循环填成 1,000 个的探测通过了，可能按去重后计数或各节点配置不同）；单次返回 13,115 条没有触发条数上限 | `logRange` 默认值已从 2000 改为 100,000，`ADDRESS_CHUNK` 从 50 改为 32。全历史 493 个窗口、6 路并发扫完约 47 秒 |
 | 3 | 是否需要 `finalized` | **不需要**（人工确认）：CometBFT 出一块即终局。RPC 支持 `finalized` 标签，但比 `latest` 落后约 10 块 | 直接用 `latest`，`confirmations` 默认为 0（已实现，同步不再查 `finalized`） |
 | 4 | 事件签名、分界块、回灌起点 | 见下文"事件历史" | 回灌必须**从块 1 开始**，不能从第一个 `ValidatorCreated` 开始；旧版初始化的去重规则是必需的，而且是对的 |
 | 5 | 创世 operator 的份额是否为 500e18 | **是**（人工确认） | `GENESIS_VALIDATORS` 里写死的 500 0G 正确 |
@@ -124,7 +124,7 @@
 | 事件 | 原因 | 替代办法 |
 |---|---|---|
 | `DistributeRewards` | 系统调用触发，日志取不到 | 每块奖励改从区块的 `withdrawals` 前三条采集（见"区块奖励、佣金、社区税、基金会奖励与罚没"），第 0 条就是分给出块 validator 的奖励，社区税和佣金按合约规则从它算出 |
-| `Exited` / `Slashed`（validator 合约） | 按需求不记录。退出改用 Staking 合约的 `ValidatorExited`；`Slashed` 走系统调用，本来也取不到 | 罚没对份额的影响仍由 refresher 校正（`SlashDetected`，见 Refresher），只用于保证份额正确，不对外提供罚没接口 |
+| `Exited` / `Slashed`（validator 合约） | 按需求不记录。退出改用 Staking 合约的 `ValidatorExited`；`Exited` 仍会拉取，只用来区分退出走的是哪个实现版本（见"二期 B 实现与验证"第 3 点），不入库。`Slashed` 在测试网上其实能查到（块 38,873,058），但罚没以区块的 `slashed` 数组为准 | 罚没对份额的影响仍由 refresher 校正（`SlashDetected`，见 Refresher），只用于保证份额正确，不对外提供罚没接口 |
 | `PopWithdrawEntry` | 主要在系统调用里出队，日志不完整 | 待解押队列一律用 `withdrawCount()` / `getWithdraw(i)` 读当前状态（二期） |
 | `PushWithdrawEntry` | 正常入队（`isFailed=false`）能取到，但失败重入队（`isFailed=true`）发生在系统调用里；只收一半反而误导 | 同上。解押记录本身已有 `Undelegate` 事件，完成高度 = 解押块号 + `minWithdrawabilityDelay()` |
 | `DepositEvent` / `OperatorChangeQueued` / `OperatorChangeCancelled` / `OperatorUpdated`（Deposit 合约） | 共识层 deposit 与 operator 变更，跟委托统计无关 | `operatorAddress()` 由 refresher 读 |
@@ -140,7 +140,7 @@
 1. `getLogs({address: STAKING, topics: [[ValidatorCreated, ValidatorInitialized, ValidatorExited]]})`：新 validator 写进 `staking_validator`，同时加入内存里的地址集合。`ValidatorCreated` 只用来发现地址，不对外展示；创建高度以 `ValidatorInitialized` 为准。
    - 必须先做这一步：validator 创建后同一块里就可能收到委托，先有地址才收得到。`ValidatorInitialized` 在这里就给 operator 记初始份额。
 2. `getLogs({address: [所有 validator], topics: [[Delegate V1/V2, Undelegate V1/V2, OwnershipTransferred, CommissionRateChanged, WithdrawalFeeInGweiChanged, WithdrawCommission, WithdrawTipFee]]})`。
-   - 地址按 500 个一组分批查（`ADDRESS_CHUNK`）。
+   - 地址按 32 个一组分批查（`ADDRESS_CHUNK`，即 RPC 的上限）。
 3. 在同一个事务里：
    - 写 `staking_event`，已存在的忽略；
    - 按事件把 shares 增量更新到 `staking_delegation`：ValidatorInitialized 给 operator 加 amount，Delegate 加，Undelegate 减（罚没没有事件，由 refresher 校正）；
@@ -491,19 +491,52 @@ group by validator;
 - `GET /slashes?validator=&start=&end=&skip=&limit=`：罚没明细；
 - `GET /validator/blocks?address=&start=&end=&skip=&limit=`：某 validator 出的块，以及每块的 `reward` / `communityTax` / `commission`。
 
-### 改动清单
+### 二期 B 实现与验证（2026-11-05）
 
-| 位置 | 改动 |
+**实现**
+
+| 位置 | 内容 |
 |---|---|
-| `stat/model/Staking.ts` | 四张新表：`staking_block_reward`（分区）、`staking_block_slash`、`staking_reward_daily`、`staking_rate_timeline` |
-| `stat/service/staking/StakingBlockSync.ts`（新） | 逐块 batch 采集；按时间线计算社区税和佣金；写逐块表和日汇总；推进游标（不超过事件游标）；与 CL `rewards` 对账 |
-| `stat/service/staking/StakingRateTimeline.ts`（新） | 维护费率和达标时间线：事件驱动更新 + 历史状态读取 + 二分定位；逐日佣金对账 |
-| `StakingRefresher.ts` | 无需改动：罚没按 `address` 直接归属，不再需要 beacon 的 `index → pubkey` 映射 |
-| `StakingMain.ts` | `startStaking()` 一起启动；命令行增加 `blocks`（回灌）、`check-rewards <block>`（单块对账）、`check-commission <validator> <day>`（单日佣金对账） |
-| `StakingQuery.ts` / `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | 3 个统计接口、2 个明细接口，以及 `/validator`、`/validators` 的新字段 |
-| `StatConfig.staking` | `blockBatchSize`（默认 100）、`blockConcurrency`、`rewardStartBlock`（默认 10,877,918）、`foundationAddress`（默认 `0x711b…2522`）、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（缺省复用 `validatorRpc`） |
+| `stat/model/Staking.ts` | `staking_block_reward`、`staking_block_slash`、`staking_reward_daily`、`staking_self_delegation` 四张表 |
+| `StakingBlockSync.ts` | 逐块采集：JSON-RPC 批量取块（每批 50）、解析 `withdrawals[0..2]` 和 `slashed`、算社区税和佣金、写逐块表和日汇总、推进游标（不超过事件游标）；每轮与 CL 累计 `rewards` 对账 |
+| `StakingCommission.ts` | 佣金：费率由 `CommissionRateChanged` 推出；是否达标在可能跳变的块上读历史状态判断，结果缓存在 `staking_self_delegation`，读不到时退回估算（`source = approx`） |
+| `StakingRewardQuery.ts` | 5 个接口的查询：时间段的完整天查日汇总表，两端零头查逐块表 |
+| `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/slashes`、`/validator/blocks`；`/validators` 和 `/validator` 带累计 `rewards` |
+| `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check-commission <validator> <from> <to>` |
+| `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`） |
 
-估时约 3.5 天，其中佣金的时间线和对账约 1 天；另加回灌约 11 小时。
+与设计的差别：
+- 只把"是否达标"存成时间线表（`staking_self_delegation`）。佣金费率每次从事件推出，社区税率用配置值，所以没有通用的 `staking_rate_timeline`。
+- 逐日自动对账（读历史 `commission()` 并二分定位）没做，改为 `check-commission` 命令手工核对任意区间。原因见下面的归档节点问题。
+- 逐块表没有分区。生产回灌前要按块号补分区 DDL。
+- 每批 50 个块（RPC 上限），全量回灌约 77 万次请求；实测稳定速度约每分钟 8,000 块，主网全量（约 3,840 万块）约 80 小时，需要更快的节点或提高并发。
+
+**在主网上的验证**（本地 MySQL，主网事件全量同步 + 最近 101,718 块的区块奖励）
+- **CL 对账精确通过**：块 49,236,778–49,338,495 采集的 `reward + restaking + foundation` 合计 246,318,157,986,926 gwei，与 CL 累计 `rewards` 在同一段的增量完全相等。
+- **佣金逐 wei 一致**：最近 60 块里出块的 13 个 validator，逐块算出的佣金与链上 `commission(末) − commission(初) + 期间 WithdrawCommission` 全部相等。其中 3 个 owner 自质押不达标的创世 validator，佣金为 0。
+- **社区税逐 wei 一致**：同样 60 块里，社区池 `0x51e0…04c7` 的余额增量等于采集到的社区税合计。
+- 5 个接口：金额关系（奖励 = 社区税 + 佣金 + 委托人奖励）、全网与各 validator 之和、按天分组、截断到采集游标、参数校验都正确。期间没有罚没，`slashed` 的解析只靠代码逻辑，还没碰到真实数据。
+
+**主网测试中的发现**
+1. **`eth_getLogs` 的 address 数组最多 32 个**（见第 0 步第 2 项），`ADDRESS_CHUNK` 已改为 32。
+2. **事件同步取区块时间戳原来是逐块串行请求**，主网约 1 万个有事件的块要跑几小时。改成 JSON-RPC 批量后，从每分钟约 10 万块提到约 180 万块。
+3. **主网的 validator 实现中途升级过，退出逻辑前后不同**。合约历史在 `0g-chain-ng` 仓库的 `contracts/src/staking`（`common/contracts/gravity` 等于其中最新的 `35a01dce7`）。和索引相关的变化：
+
+   | 版本 | `exit()` | `_checkSelfDelegation()` | `Exited` / `Slashed` 事件 |
+   |---|---|---|---|
+   | `9da3eb492`、`f74e3c56b` | 把 owner 全部份额赎回、加进 `commission()`，不发 `Exited` | owner 份额 × `tokens` / `delegatorShares`（**不含 rewards**），要求份额 > 0 | 无 |
+   | `bb794bcc7` | 同上 | `getDelegatedTokens(owner)`（含 rewards） | 无 |
+   | `f61aef593` 起（`28d435a2c`、`35a01dce7`） | 不动份额，发 `Exited` | 同上 | 有 |
+
+   - 主网上 `Exited` 一共只出现过 4 次，最早在块 **37,392,579**，所以主网在这之前升级到了 `f61aef593` 之后的实现。之前退出的 16 个 validator 都走了旧逻辑，例如 `0x0712…f7dd` 在块 23,630,587 退出：`commission` 从 0 变成 565.12，owner 份额从 500 变成 0。refresher 在主网报出的 12 个"罚没"，全部是这批旧版退出。
+   - 处理方式：同步继续拉取 validator 的 `Exited` 日志，但**只用来判断退出走的是哪个版本，不入库**。同一交易里没有 `Exited` 的 `ValidatorExited` 按旧版处理：清零 owner 份额，读出转进佣金的金额，记到 `extra.exitSettlement`，并标 `extra.implementation = "stake-to-commission"`。有 `Exited` 的按新版处理：`exitSettlement` 记为 0，标 `"emits-exited"`。
+   - refresher 不再把"已退出、owner 链上份额为 0"记为罚没。`/fees` 的 commission `total` 扣除 `exitSettlement`，`exitSettlement` 单独返回；读不到时为 null，`total` 仍包含它。
+   - 已知限制：佣金的"是否达标"按新公式 `getDelegatedTokens` 判断。在 `bb794bcc7` 之前的实现下（不含 rewards，且要求份额 > 0），owner 正好处在门槛附近时可能判断不一致。升级的具体块不知道，只能确定在块 37,392,579 之前。
+   - 验证（新建一个空库，用新代码从块 1 重新同步主网）：16 个旧版退出（块 12,034,802–35,681,625）全部标为 `stake-to-commission`，4 个新版退出（块 37,392,579–48,556,929）全部标为 `emits-exited`。全量份额对账 2,197 条，0 条修正，refresher 没有再报罚没；`Exited` 没有入库。16 个旧版退出中 15 个的 `exitSettlement` 因为读不到历史状态，记为 null。
+   - 测试网上有 1 条 `Slashed` 事件（块 38,873,058），`eth_getLogs` 能查到，推翻了"`Slashed` 走系统调用、日志取不到"的推断。按之前的决定仍不记录 `Slashed`，罚没以区块的 `slashed` 数组为准。
+4. **公共 RPC 读不到可靠的历史状态**：`evmrpc.0g.ai` 背后的节点只有部分保留历史状态，而且时有时无。开始测试时还能读块 1,100 万和 2,363 万，后来除了最近约一百个块全部报 `missing trie node`。依赖历史状态的有三项："是否达标"判断、`check-commission`、退出本金的读取。**生产环境需要专用的归档节点**；否则"是否达标"全部退回估算（`approx`），对自质押在门槛附近的 validator 可能算错，`exitSettlement` 也会一直是 null。
+5. 命令行的 `sync` / `refresh` / `blocks` 原来遇到一次 RPC 临时错误就退出，现在会带退避地重试，连续失败 10 次才放弃。常驻服务里的循环本来就会重试。
+6. **主网份额对账**：2,197 条普通委托记录全部和链上一致，0 条修正。一期的份额增量算法，包括创世份额导入和旧版初始化去重，在主网上得到了验证。
 
 ## 验证（仓库没有测试套件）
 
@@ -526,7 +559,7 @@ group by validator;
 | 3 | StakingQuery 和 8 个接口、swagger | 2d |
 | 4 | 跟 Xangle 数据对比，测试网验证，上线（`staking.enabled = true`） | 1d |
 | 二期 A | validator 事件接口：参数变更历史、手续费、创建与退出（见上文） | ✅ 已完成（2026-11-05） |
-| 二期 B | 区块奖励、佣金、社区税、基金会奖励与罚没：逐块采集、费率与达标时间线、日汇总、对账、3 个统计接口和 2 个明细接口（见上文） | 3.5d + 回灌约 11h |
+| 二期 B | 区块奖励、佣金、社区税、基金会奖励与罚没（见上文） | ✅ 已实现并在主网最近 10 万块上验证（2026-11-05）；全量回灌和归档节点待定 |
 | 二期 | 每日快照与奖励估算、待解押队列（view 调用）、失败交易展示 | 待定 |
 
 ## 待决问题

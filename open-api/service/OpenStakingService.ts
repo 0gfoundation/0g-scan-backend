@@ -21,6 +21,14 @@ import {
     sumValidatorDelegations,
     ValidatorSort,
 } from "../../stat/service/staking/StakingQuery";
+import {
+    getCommunityTax,
+    getFoundationRewards,
+    getValidatorRewards,
+    listSlashes,
+    listValidatorBlocks,
+    RewardSort,
+} from "../../stat/service/staking/StakingRewardQuery";
 import {setBody} from "../router/middleware";
 
 /**
@@ -207,5 +215,59 @@ export async function getValidatorFeeWithdrawals(ctx) {
         validator: address(q, 'address'),
         types: listOf<FeeWithdrawalType>(q, 'type', ['commission', 'tip_fee']),
         start, end, skip, limit,
+    }));
+}
+
+/** start (optional) / end (default now) / interval for the reward statistics */
+function rewardRange(q) {
+    const start = unixTime(q, 'start');
+    const end = unixTime(q, 'end');
+    const interval = oneOf(q, 'interval', ['day'] as const);
+    if (!start && (end || interval)) {
+        paramError(`<end> and <interval> need <start>`);
+    }
+    if (start) {
+        const to = (end ?? new Date()).getTime();
+        if (start.getTime() >= to) {
+            paramError(`<start> must be before <end>`);
+        }
+        if (to - start.getTime() > MAX_SUM_RANGE_DAYS * 86400_000) {
+            paramError(`range must not exceed ${MAX_SUM_RANGE_DAYS} days`);
+        }
+    }
+    return {start, end, interval};
+}
+
+export async function getRewards(ctx) {
+    const q = ctx.query;
+    setBody(ctx, await getValidatorRewards({
+        validator: address(q, 'address', false),
+        sort: oneOf<RewardSort>(q, 'sort', ['reward', 'commission', 'blockCount', 'slashedAmount'], 'reward'),
+        ...rewardRange(q),
+    }));
+}
+
+export async function getTax(ctx) {
+    const q = ctx.query;
+    setBody(ctx, await getCommunityTax({validator: address(q, 'validator', false), ...rewardRange(q)}));
+}
+
+export async function getFoundation(ctx) {
+    setBody(ctx, await getFoundationRewards(rewardRange(ctx.query)));
+}
+
+export async function getSlashes(ctx) {
+    const q = ctx.query;
+    const {skip, limit} = paginateCore(q);
+    setBody(ctx, await listSlashes({
+        validator: address(q, 'validator', false), start: unixTime(q, 'start'), end: unixTime(q, 'end'), skip, limit,
+    }));
+}
+
+export async function getValidatorBlocks(ctx) {
+    const q = ctx.query;
+    const {skip, limit} = paginateCore(q);
+    setBody(ctx, await listValidatorBlocks({
+        validator: address(q, 'address'), start: unixTime(q, 'start'), end: unixTime(q, 'end'), skip, limit,
     }));
 }

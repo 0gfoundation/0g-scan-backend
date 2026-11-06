@@ -166,7 +166,7 @@ async function refreshBeaconStatus() {
  * still corrected to chain state, but it is reported as an error.
  */
 async function checkOperatorShares(block: number) {
-    const rows = await StakingValidator.findAll({attributes: ['address'], raw: true});
+    const rows = await StakingValidator.findAll({attributes: ['address', 'exitedBlock'], raw: true});
     const blockTime = new Date((await provider().getBlock(block)).timestamp * 1000);
     await inChunks(rows, CHUNK_SHARE_CHECK, async row => {
         const c = validatorContract(row.address);
@@ -180,6 +180,10 @@ async function checkOperatorShares(block: number) {
             const opRow = await StakingDelegation.findOne({where: {validator: row.address, delegator: operator}, raw: true});
             const dbShares = BigInt(opRow?.shares ?? 0);
             const onChain = BigInt(str(chainShares));
+            // an exit zeroes the owner's shares without an event; the sync zeroes them
+            // too, so a leftover here is a correction, not a slash
+            const exitSettled = row.exitedBlock != null && onChain === BigInt(0);
+            const slash = onChain < dbShares && !exitSettled;
             if (dbShares !== onChain) {
                 await StakingDelegation.sequelize.transaction(async dbTx => {
                     if (opRow) {
@@ -190,7 +194,7 @@ async function checkOperatorShares(block: number) {
                             firstBlock: block, lastBlock: block, firstAt: blockTime, lastAt: blockTime,
                         }, {transaction: dbTx});
                     }
-                    if (onChain < dbShares) {
+                    if (slash) {
                         await StakingEvent.findOrCreate({
                             where: {blockNumber: block, logIndex: -1, validator: row.address},
                             defaults: {
@@ -203,7 +207,7 @@ async function checkOperatorShares(block: number) {
                     }
                 });
                 const msg = `operator ${operator} of ${row.address} shares db ${dbShares} chain ${onChain} at ${block}`;
-                console.log(`staking refresh: ${onChain < dbShares ? 'slash detected' : 'corrected'}, ${msg}`);
+                console.log(`staking refresh: ${slash ? 'slash detected' : exitSettled ? 'exit settled' : 'corrected'}, ${msg}`);
                 if (onChain > dbShares) {
                     safeAddErrorLog('staking', 'operator-shares', new Error(msg));
                 }

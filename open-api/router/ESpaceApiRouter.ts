@@ -87,6 +87,11 @@ import {
     getValidatorFeeWithdrawals,
     getValidatorList,
     getValidatorParamChanges,
+    getRewards,
+    getTax,
+    getFoundation,
+    getSlashes,
+    getValidatorBlocks,
 } from "../service/OpenStakingService";
 import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAuth";
 import {
@@ -1149,6 +1154,11 @@ export function registerRouter(router: Router) {
     router.get('/staking/validator/param-changes', getValidatorParamChanges);
     router.get('/staking/validator/fee-withdrawals', getValidatorFeeWithdrawals);
     router.get('/staking/fees', getValidatorFees);
+    router.get('/staking/validator/rewards', getRewards);
+    router.get('/staking/validator/blocks', getValidatorBlocks);
+    router.get('/staking/community/tax', getTax);
+    router.get('/staking/foundation/rewards', getFoundation);
+    router.get('/staking/slashes', getSlashes);
     router.get('/staking/delegator/validators', getDelegatorValidators);
     router.get('/staking/delegator/delegations/sum', getDelegatorDelegationSum);
     router.get('/staking/events', getEvents);
