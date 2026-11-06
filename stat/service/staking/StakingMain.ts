@@ -9,6 +9,7 @@ import {ConfigInstance} from "../../config/StatConfig";
 import {StakingBlockReward, StakingEvent, StakingEventType} from "../../model/Staking";
 import {getBlockRewardCursor, reconcileBlockRewards, runStakingBlockSync, stakingBlockSyncOnce} from "./StakingBlockSync";
 import {VALIDATOR_ABI} from "./StakingAbi";
+import {commissionCheckOnce} from "./StakingCheck";
 import {
     blockRewardOption,
     getStakingCursor,
@@ -49,6 +50,8 @@ export async function startStaking() {
  *   reconcile         full reconciliation at the cursor block only
  *   diff <xangleDir>  compare with the Xangle indexer's Mongo exports
  *   blocks            collect block rewards until caught up with the event sync, then reconcile
+ *   check             write a commission / tax-rate checkpoint at the block-reward cursor now
+ *                     and compare it with the previous one (needs state at the cursor block)
  *   check-commission <validator> <fromBlock> <toBlock>
  *                     compare the collected commission over [from, to] with chain state
  *                     (needs an RPC that serves state at those blocks)
@@ -80,6 +83,9 @@ async function main() {
         }, 'blocks');
         console.log(`block rewards caught up at ${await getBlockRewardCursor()}`);
         console.log(`reconciliation:`, await reconcileBlockRewards());
+    } else if (cmd === 'check') {
+        const r = await commissionCheckOnce(await getBlockRewardCursor(), true);
+        console.log(r ? JSON.stringify(r, null, 2) : 'nothing to check: no new collected blocks since the last checkpoint');
     } else if (cmd === 'check-commission') {
         await checkCommission(arg.toLowerCase(), Number(arg2), Number(arg3));
     } else {

@@ -72,6 +72,8 @@ export function blockRewardOption() {
         foundationAddress: (o.foundationAddress || FOUNDATION_ADDRESS).toLowerCase(),
         communityTaxRate: BigInt(o.communityTaxRate ?? 100_000),
         clTotalWithdrawalsUrl: o.clTotalWithdrawalsUrl || ConfigInstance.validatorRpc || '',
+        checkIntervalSec: o.checkIntervalSec ?? 3600,
+        freshnessAlertSec: o.freshnessAlertSec ?? 600,
     };
 }
 

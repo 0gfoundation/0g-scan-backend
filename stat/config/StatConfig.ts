@@ -47,6 +47,10 @@ export interface StakingOption {
         communityTaxRate?: number, // raw, 1e6 = 100%; default 100000 (10%)
         // consensus layer .../blocks/{id}/total_withdrawals; default: validatorRpc
         clTotalWithdrawalsUrl?: string,
+        // seconds of chain time between commission/tax-rate checkpoints, default 3600
+        checkIntervalSec?: number,
+        // alert when the collected head is older than this, once caught up; default 600
+        freshnessAlertSec?: number,
     },
 }
 export interface ConsortiumBridgeOption {

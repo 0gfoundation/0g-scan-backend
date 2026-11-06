@@ -373,15 +373,23 @@ group by validator;
 
    在这些块上，用历史状态读 `getDelegatedTokens(owner)` 和 `minSelfDelegationInGwei()`，得到新的达标状态。两次跳变之间，owner 的代币价值只会随奖励上涨，所以只可能从不达标变成达标；这种情况由下面的逐日对账发现，再二分定位到具体块。
 
-**逐日对账（佣金）**：每个 UTC 日结束时，用历史状态读每个 validator 的 `commission()`，计算
+**佣金对账（按检查点，已实现，`StakingCheck.ts`）**：原设计按 UTC 日对账，但每个日界都要读历史状态，没有归档节点就无法运行。实现改为按检查点：每隔 `checkIntervalSec`（默认 1 小时链上时间）在采集游标处读所有 validator 的 `commission()`，和该 validator 的上一个检查点比：
 
 ```
-当日实际计提 = commission(日末) − commission(上日末) + 当日 Σ WithdrawCommission.amount
+实际计提 = commission(本次) − commission(上次) + 区间内 Σ WithdrawCommission.amount − 区间内旧版退出转入的本金（exitSettlement）
 ```
 
-并与当日逐块计算的佣金之和比较，必须相等。不相等就告警，并在当天二分找出差异开始的块（通常是达标状态变化），修正时间线后重算当天。
+区间是 (上次, 本次]，实际计提必须等于区间内逐块计算的佣金之和。结果逐 validator 写入 `staking_commission_check`，状态分四种：
+- `baseline`：该 validator 的第一个检查点；
+- `ok`：相等；
+- `mismatch`：不相等，告警并给出用于定位的 `check-commission <validator> <from> <to>` 命令；
+- `unknown`：区间内有一次 `exitSettlement` 为 null 的退出，无法比较。
 
-**社区税率**：`setCommunityTaxRate` 不发事件。按配置的 10% 计算，逐日对账时顺带用历史状态读日末的 `communityTaxRate()`；如果变了，就二分找出变化的块，记入税率时间线并重算。
+不一致时**只告警，不自动二分修正**，用 `check-commission` 手工定位。
+
+检查点读的是游标处的状态，追上之后游标就在最新块附近，所以公共 RPC 也能读到。读不到时（没有归档节点的回灌期间）不写检查点，回灌中也不再每轮重试；下一个成功的检查点自然覆盖整个缺口。有归档节点时，回灌期间也能每小时对一次。
+
+**社区税率**：`setCommunityTaxRate` 不发事件。每个检查点在同一批调用里读 `communityTaxRate()`，和配置值不同就告警（社区税按配置值计算），最近一次读到的值记在 KV `STAKING_COMMUNITY_TAX_RATE_SEEN`。不做自动二分。
 
 ### 数据来源的保障
 
@@ -432,8 +440,8 @@ group by validator;
 ### 对账与告警
 
 - **每轮**：累计 `reward + restakingReward + foundationReward` 必须等于 CL `total_withdrawals` 在游标块的 `rewards`。CL 返回的是 gwei，比较前要换算。
-- **每日**：佣金按上面的公式对账；同时检查 `communityTaxRate` 有没有变。
-- **新鲜度**：游标落后 `latest` 超过阈值（比如 10 分钟的块数）就告警。
+- **每个检查点**（默认每小时链上时间）：佣金按上面的公式对账，同时检查 `communityTaxRate`。
+- **新鲜度**：本进程追上过最新块之后，如果游标块的时间落后当前时间超过 `freshnessAlertSec`（默认 600 秒）就告警，最多每 10 分钟一次；告警里带上事件游标，便于判断是哪一路同步卡住。首次回灌期间不告警。
 
 ### 接口
 
@@ -497,17 +505,18 @@ group by validator;
 
 | 位置 | 内容 |
 |---|---|
-| `stat/model/Staking.ts` | `staking_block_reward`、`staking_block_slash`、`staking_reward_daily`、`staking_self_delegation` 四张表 |
+| `stat/model/Staking.ts` | `staking_block_reward`、`staking_block_slash`、`staking_reward_daily`、`staking_self_delegation` 四张表，以及对账结果表 `staking_commission_check` |
 | `StakingBlockSync.ts` | 逐块采集：JSON-RPC 批量取块（每批 50）、解析 `withdrawals[0..2]` 和 `slashed`、算社区税和佣金、写逐块表和日汇总、推进游标（不超过事件游标）；每轮与 CL 累计 `rewards` 对账 |
 | `StakingCommission.ts` | 佣金：费率由 `CommissionRateChanged` 推出；是否达标在可能跳变的块上读历史状态判断，结果缓存在 `staking_self_delegation`，读不到时退回估算（`source = approx`） |
 | `StakingRewardQuery.ts` | 5 个接口的查询：时间段的完整天查日汇总表，两端零头查逐块表 |
 | `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/slashes`、`/validator/blocks`；`/validators` 和 `/validator` 带累计 `rewards` |
-| `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check-commission <validator> <from> <to>` |
-| `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`） |
+| `StakingCheck.ts` | 佣金检查点对账、社区税率检查、新鲜度告警；每轮逐块采集后调用 |
+| `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check`（立即在游标处打一个检查点）、`check-commission <validator> <from> <to>` |
+| `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`）、`checkIntervalSec`（默认 3600）、`freshnessAlertSec`（默认 600） |
 
 与设计的差别：
 - 只把"是否达标"存成时间线表（`staking_self_delegation`）。佣金费率每次从事件推出，社区税率用配置值，所以没有通用的 `staking_rate_timeline`。
-- 逐日自动对账（读历史 `commission()` 并二分定位）没做，改为 `check-commission` 命令手工核对任意区间。原因见下面的归档节点问题。
+- 佣金对账按检查点而不是按 UTC 日做，不一致时只告警、不自动二分修正，用 `check-commission` 手工定位（见"佣金对账"）。
 - 逐块表没有分区。生产回灌前要按块号补分区 DDL。
 - 每批 50 个块（RPC 上限），全量回灌约 77 万次请求；实测稳定速度约每分钟 8,000 块，主网全量（约 3,840 万块）约 80 小时，需要更快的节点或提高并发。
 
@@ -546,6 +555,14 @@ group by validator;
    - 验证方法：本地 RPC 代理把请求转发给主网，同时往块 49,339,900 和 49,340,500 注入上面格式的 `slashed`，覆盖单条、同块多条、大写地址、amount 为 0、非 validator 地址这几种情况。在复制出来的库里跑逐块采集，再查 `/slashes`、`/validator/rewards`（累计、跨整日和部分日的时间段、单个 validator）和 `/validator` 的 `rewards`。
    - 结果：地址统一成小写；gwei 正确换算成 wei；同块多条按数组下标记 `position`；日汇总的 `slashCount` / `slashedAmount` 和各接口的累计、时间段数字都正确；CL 奖励对账不受影响。
    - 据此修改了两处：amount 为 0 的条目跟链上一样跳过，不再记成一次罚没；地址不是已知 validator 时记录警告（仍入库，因为数组里确实有这条）。
+
+8. **对账与告警**（2026-11-06，`StakingCheck.ts`，在主网库的副本上测试）：
+   - 正向：在块 49,240,000、49,290,000、49,339,845 依次打检查点。第一个是 80 个 `baseline`，后两个窗口（各约 5 万块）80 个 validator 全部 `ok`。窗口里各有约 25 个 validator 有佣金计提，合计约 7,700 和 8,000 0G，期间有 3 笔 `WithdrawCommission`。社区税率读到 100000，和配置一致。
+   - 反向：把块 49,300,001 的佣金加 1 wei 后重打最后一个检查点，报出 1 个 `mismatch`（差 1 wei），其余 79 个 `ok`，提示里给出了定位命令。
+   - 社区税率：配置改成 90000 时告警。
+   - 新鲜度：游标块落后约 89,000 秒时告警。
+   - 读不到状态：让 `eth_call` 一律返回 `missing trie node` 时，检查点推迟、不写入；回灌期间之后的轮次直接跳过。
+   - 公共 RPC 读历史状态时好时坏：这次读得到 49,240,000 这样一天前的块。
 
 ## 验证（仓库没有测试套件）
 

@@ -12,6 +12,7 @@ import {
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {CommissionModel} from "./StakingCommission";
+import {runChecks} from "./StakingCheck";
 import {blockRewardOption, getStakingCursor, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
 
 /**
@@ -305,6 +306,7 @@ export async function runStakingBlockSync() {
     let delay = 0;
     try {
         const caughtUp = await stakingBlockSyncOnce();
+        await runChecks(await getBlockRewardCursor(), caughtUp);
         if (caughtUp || ++ctx.rounds % 100 === 0) {
             const r = await reconcileBlockRewards().catch(e => ({ok: false, message: e?.message || String(e)}));
             if (r && !r.ok) {

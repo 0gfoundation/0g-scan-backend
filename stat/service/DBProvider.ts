@@ -98,6 +98,7 @@ import {
     StakingEvent,
     StakingRewardDaily,
     StakingSelfDelegation,
+    StakingCommissionCheck,
     StakingValidator,
 } from "../model/Staking";
 
@@ -249,6 +250,7 @@ export async function initPartialModel(sequelize) {
     StakingBlockSlash.register(sequelize)
     StakingRewardDaily.register(sequelize)
     StakingSelfDelegation.register(sequelize)
+    StakingCommissionCheck.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)

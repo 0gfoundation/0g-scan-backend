@@ -488,3 +488,61 @@ export class StakingSelfDelegation extends Model<IStakingSelfDelegation> impleme
         })
     }
 }
+
+export interface IStakingCommissionCheck {
+    id?: number
+    /** checkpoint: the block-reward cursor when commission() was read */
+    blockNumber: number
+    createdAt: Date
+    validator: string
+    /** commission() at blockNumber */
+    commission: string
+    /** previous checkpoint for this validator; null for a baseline */
+    prevBlock: number | null
+    /** sum of the collected per-block commission over (prevBlock, blockNumber] */
+    expected: string | null
+    /** commission() delta + WithdrawCommission - exit settlement over the same blocks */
+    actual: string | null
+    /** baseline | ok | mismatch | unknown (an exit settlement in the window is unknown) */
+    status: string
+}
+
+/**
+ * Commission reconciliation checkpoints (StakingCheck): what the chain
+ * accrued against what the block sync computed, per validator and window.
+ */
+export class StakingCommissionCheck extends Model<IStakingCommissionCheck> implements IStakingCommissionCheck {
+    id?: number;
+    blockNumber: number;
+    createdAt: Date;
+    validator: string;
+    commission: string;
+    prevBlock: number | null;
+    expected: string | null;
+    actual: string | null;
+    status: string;
+
+    static register(seq: Sequelize) {
+        const amount = (allowNull: boolean) => ({type: DataTypes.DECIMAL(65, 0), allowNull});
+        StakingCommissionCheck.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            blockNumber: {type: DataTypes.BIGINT, allowNull: false},
+            createdAt: {type: DataTypes.DATE, allowNull: false},
+            validator: {type: DataTypes.STRING(42), allowNull: false},
+            commission: amount(false),
+            prevBlock: {type: DataTypes.BIGINT, allowNull: true},
+            expected: amount(true),
+            actual: amount(true),
+            status: {type: DataTypes.STRING(16), allowNull: false},
+        }, {
+            sequelize: seq,
+            tableName: 'staking_commission_check',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_block_validator', fields: ['blockNumber', 'validator'], unique: true},
+                {name: 'idx_validator_block', fields: ['validator', 'blockNumber']},
+                {name: 'idx_status', fields: ['status']},
+            ],
+        })
+    }
+}
