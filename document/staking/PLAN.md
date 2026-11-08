@@ -420,8 +420,8 @@ group by validator;
 | `validator` | `withdrawals[0].address`，出块 validator |
 | `reward` | `withdrawals[0].amount`，wei |
 | `communityTax` / `commission` | 按上面的规则在写入时算好 |
-| `restakingAddress` / `restakingReward` | `withdrawals[1]` |
-| `foundationAddress` / `foundationReward` | `withdrawals[2]` |
+| `restakingAddress` / `restakingReward` | `withdrawals[1]`。收款地址每块不同（主网最近 10.3 万块有 4 个，其中零地址 71,533 块），所以逐块保存 |
+| `foundationReward` | `withdrawals[2].amount`。收款地址始终是配置的基金会地址，不逐块保存；出现别的地址时告警，并记入 KV `STAKING_FOUNDATION_OTHER_ADDRESSES`，`/foundation/rewards` 的 `otherAddressesSeen` 从这里读 |
 
 委托人奖励不存，查询时用 `reward − communityTax − commission` 算出。
 
@@ -517,7 +517,14 @@ group by validator;
 与设计的差别：
 - 只把"是否达标"存成时间线表（`staking_self_delegation`）。佣金费率每次从事件推出，社区税率用配置值，所以没有通用的 `staking_rate_timeline`。
 - 佣金对账按检查点而不是按 UTC 日做，不一致时只告警、不自动二分修正，用 `check-commission` 手工定位（见"佣金对账"）。
-- 逐块表没有分区。生产回灌前要按块号补分区 DDL。
+- 逐块表**不分区**，原因如下：
+  - 接口对它的查询都按 `createdAt` / `validator` 过滤，没有块号条件，分区剪枝用不上。本地 EXPLAIN 显示，按块号分 5 个区后，同样的查询要访问全部 5 个分区；MySQL 没有全局索引，每个分区的 `idx_time` 都要各查一次。
+  - 规模可控：每行约 450 字节，主网全量约 4,900 万行，合计约 22 GB；B 树比现在只深 1 层。
+  - 只追加不删除，用不上 `DROP PARTITION`。
+  - 现有的 `full_block` / `full_tx` 按块高分区，并由 `autoAddPartition` 自动扩分区；那是为了它们的数据量和 prune。
+- 会随总行数变慢的查询已改掉（2026-11-08）：
+  - `/foundation/rewards` 原来每次请求都 `select distinct foundationAddress` 扫全表，改为读逐块采集记下的 KV，并去掉了 `foundationAddress` 列；
+  - `/validator/blocks` 的 `total` 原来是对这个 validator 的全部块 `count(*)`，出块最多的 validator 全量时约 680 万条。改为整天部分读日汇总表的 `blockCount`，只有零头查逐块表。在 6 种时间段（不带时间段、只有 start、只有 end、跨日期、同一天内的零头、从 0 点开始）上和直接 count 的结果一致。
 - 每批 50 个块（RPC 上限），全量回灌约 77 万次请求；实测稳定速度约每分钟 8,000 块，主网全量（约 3,840 万块）约 80 小时，需要更快的节点或提高并发。
 
 **在主网上的验证**（本地 MySQL，主网事件全量同步 + 最近 101,718 块的区块奖励）

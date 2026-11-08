@@ -295,9 +295,14 @@ export interface IStakingBlockReward {
     communityTax: string
     /** reward * commissionRate / 1e6 while the owner meets minSelfDelegation, else 0 */
     commission: string
+    /** withdrawals[1]: the recipient varies by block, so it is kept */
     restakingAddress: string
     restakingReward: string
-    foundationAddress: string
+    /**
+     * withdrawals[2].amount. Its recipient is always the configured foundation
+     * address, so it is not stored per block; any other recipient is recorded
+     * in KV STAKING_FOUNDATION_OTHER_ADDRESSES and reported.
+     */
     foundationReward: string
 }
 
@@ -310,7 +315,6 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
     commission: string;
     restakingAddress: string;
     restakingReward: string;
-    foundationAddress: string;
     foundationReward: string;
 
     static register(seq: Sequelize) {
@@ -324,7 +328,6 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
             commission: amount(),
             restakingAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
             restakingReward: amount(),
-            foundationAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
             foundationReward: amount(),
         }, {
             sequelize: seq,

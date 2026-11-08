@@ -40,6 +40,8 @@ const KEY_CURSOR = 'STAKING_BLOCK_REWARD_BLOCK';
 /** the consensus layer's cumulative `rewards` (gwei) at the block before the collection start */
 const KEY_CL_BASE = 'STAKING_BLOCK_REWARD_CL_BASE';
 const SENTINEL = '0xffffffffffffffff';
+/** JSON array of withdrawals[2] recipients other than the configured foundation address */
+const KEY_OTHER_FOUNDATION = 'STAKING_FOUNDATION_OTHER_ADDRESSES';
 const GWEI = BigInt(1e9);
 const RATE_BASE = BigInt(1_000_000);
 const BLOCKS_PER_ROUND = 1000;
@@ -49,6 +51,12 @@ const ctx = {
     commission: null as CommissionModel,
     rounds: 0,
 };
+
+/** withdrawals[2] recipients seen other than the configured foundation address; normally empty */
+export async function otherFoundationAddresses(transaction?: Transaction): Promise<string[]> {
+    const row = await KV.findByPk(KEY_OTHER_FOUNDATION, {raw: true, transaction});
+    return row?.value ? JSON.parse(row.value) : [];
+}
 
 export async function getBlockRewardCursor(): Promise<number> {
     return (await KV.getNumber(KEY_CURSOR)) ?? blockRewardOption().startBlock - 1;
@@ -113,6 +121,8 @@ async function clRewards(block: number): Promise<bigint | null> {
 interface Parsed {
     reward: IStakingBlockReward | null
     slashes: IStakingBlockSlash[]
+    /** withdrawals[2].address when it is not the configured foundation address */
+    otherFoundation?: string
 }
 
 function parseBlock(b: any, warn: (msg: string) => void): Parsed {
@@ -120,6 +130,7 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
     const createdAt = new Date(parseInt(b.timestamp, 16) * 1000);
     const w: any[] = b.withdrawals || [];
     let reward: IStakingBlockReward = null;
+    let otherFoundation: string;
     if (w.length) {
         if (w.length < 3 || !w.slice(0, 3).every(x => x.validatorIndex === SENTINEL)) {
             warn(`block ${number}: first three withdrawals are not all rewards, not parsed`);
@@ -127,6 +138,7 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
             const foundationAddress = w[2].address.toLowerCase();
             if (foundationAddress !== blockRewardOption().foundationAddress) {
                 warn(`block ${number}: withdrawals[2] goes to ${foundationAddress}, not the configured foundation address`);
+                otherFoundation = foundationAddress;
             }
             reward = {
                 blockNumber: number, createdAt,
@@ -135,7 +147,6 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
                 communityTax: '0', commission: '0',
                 restakingAddress: w[1].address.toLowerCase(),
                 restakingReward: (BigInt(w[1].amount) * GWEI).toString(),
-                foundationAddress,
                 foundationReward: (BigInt(w[2].amount) * GWEI).toString(),
             };
         }
@@ -156,7 +167,7 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
         }
         return true;
     });
-    return {reward, slashes};
+    return {reward, slashes, otherFoundation};
 }
 
 type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint,
@@ -267,6 +278,14 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
         if (rewards.length) await StakingBlockReward.bulkCreate(rewards, {transaction: dbTx});
         if (slashes.length) await StakingBlockSlash.bulkCreate(slashes, {transaction: dbTx});
         await addDaily(daily, dbTx);
+        const others = parsed.map(p => p.otherFoundation).filter(Boolean);
+        if (others.length) {
+            const seen = await otherFoundationAddresses(dbTx);
+            const merged = [...new Set([...seen, ...others])];
+            if (merged.length > seen.length) {
+                await KV.upsert({key: KEY_OTHER_FOUNDATION, value: JSON.stringify(merged)}, {transaction: dbTx});
+            }
+        }
         await KV.saveNumber(KEY_CURSOR, to, dbTx);
     });
     if (slashes.length) {

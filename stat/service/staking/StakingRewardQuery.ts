@@ -3,6 +3,7 @@ import {Op, QueryTypes} from "sequelize";
 import {ConfigInstance} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {StakingBlockReward, StakingBlockSlash, StakingRewardDaily, StakingValidator} from "../../model/Staking";
+import {otherFoundationAddresses} from "./StakingBlockSync";
 import {blockRewardOption, stakingOption} from "./StakingSync";
 
 /**
@@ -270,11 +271,11 @@ export async function getFoundationRewards(opt: RangeOpt) {
     const cumulative = total(await fromDaily('validator', undefined));
     const inRange = range ? total(await rangeGrouped('validator', undefined, range.from, range.to)) : null;
     const list = range && opt.interval === 'day' ? await rangeGrouped('day', undefined, range.from, range.to) : null;
-    const addresses: any[] = await StakingBlockReward.sequelize.query(
-        `select distinct foundationAddress as a from ${StakingBlockReward.getTableName()}`, {type: QueryTypes.SELECT});
+    // recorded by the block sync, so this costs no scan of the per-block table
+    const others = await otherFoundationAddresses();
     return {
         foundationAddress: blockRewardOption().foundationAddress,
-        ...(addresses.length > 1 ? {otherAddressesSeen: addresses.map(r => r.a).filter(a => a !== blockRewardOption().foundationAddress)} : {}),
+        ...(others.length ? {otherAddressesSeen: others} : {}),
         ...head,
         cumulative: fmt(cumulative),
         ...(range ? {range: {
@@ -305,6 +306,18 @@ export async function listSlashes(opt: {validator?: string, start?: Date, end?: 
     };
 }
 
+/**
+ * How many blocks a validator proposed in [start, end): whole days from the
+ * daily table, partial days from the per-block table. A plain count over the
+ * per-block table would read every block the validator ever proposed.
+ */
+async function proposedCount(validator: string, start?: Date, end?: Date): Promise<number> {
+    const g = start || end
+        ? await rangeGrouped('validator', validator, start ? start.getTime() : 0, end ? end.getTime() : Date.now() + DAY)
+        : await fromDaily('validator', validator);
+    return g.get(validator)?.blockCount ?? 0;
+}
+
 /** blocks proposed by one validator with their reward split, newest first */
 export async function listValidatorBlocks(opt: {validator: string, start?: Date, end?: Date, skip: number, limit: number}) {
     const where: any = {validator: opt.validator};
@@ -312,7 +325,7 @@ export async function listValidatorBlocks(opt: {validator: string, start?: Date,
         where.createdAt = {...(opt.start ? {[Op.gte]: opt.start} : {}), ...(opt.end ? {[Op.lt]: opt.end} : {})};
     }
     const [count, rows] = await Promise.all([
-        StakingBlockReward.count({where}),
+        proposedCount(opt.validator, opt.start, opt.end),
         StakingBlockReward.findAll({where, raw: true, offset: opt.skip, limit: opt.limit, order: [['blockNumber', 'desc']]}),
     ]);
     return {
