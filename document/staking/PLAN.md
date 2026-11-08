@@ -411,7 +411,7 @@ group by validator;
 
 ### 数据模型
 
-**`staking_block_reward`**，每块一行，约 3,840 万行，按块号分区（参照 `full_block`）：
+**`staking_block_reward`**，每块一行，主网全量约 4,900 万行（约 22 GB），不分区（理由见"二期 B 实现与验证"）：
 
 | 列 | 说明 |
 |---|---|
