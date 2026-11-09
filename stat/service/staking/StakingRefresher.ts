@@ -6,7 +6,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
-import {getStakingCursor, stakingOption, withStakingLock} from "./StakingSync";
+import {getStakingCursor, stakingOption, trackedBeacon, withStakingLock} from "./StakingSync";
 
 /**
  * Periodic refresh of the validator rows from chain state, plus the checks
@@ -253,6 +253,7 @@ export async function stakingRefreshOnce({fullReconcile = false} = {}) {
     const latest = await provider().getBlockNumber();
     await refreshContractState(latest);
     await refreshBeaconStatus();
+    await checkValidatorBeacon();
 
     await withStakingLock(async () => {
         const cursor = await getStakingCursor();
@@ -266,6 +267,25 @@ export async function stakingRefreshOnce({fullReconcile = false} = {}) {
             ctx.lastFullReconcile = Date.now();
         }
     });
+}
+
+/**
+ * setValidatorBeacon emits nothing. A new beacon would only serve validators
+ * created after the switch, whose upgrades the sync would then miss, so a
+ * change is reported (the fix is to track both; see classifyImplementation).
+ */
+async function checkValidatorBeacon() {
+    const tracked = trackedBeacon();
+    if (!tracked || stakingOption().validatorBeacon) {
+        return;
+    }
+    const s = new ethers.Contract(stakingOption().contract, ['function validatorBeacon() view returns (address)'], provider());
+    const now = (await s.validatorBeacon()).toLowerCase();
+    if (now !== tracked) {
+        const msg = `the Staking contract's validatorBeacon() is now ${now}, but the sync tracks upgrades of ${tracked}`;
+        console.log(`staking refresh: ${msg}`);
+        safeAddErrorLog('staking', 'beacon', new Error(msg));
+    }
 }
 
 export async function runStakingRefresher() {

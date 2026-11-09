@@ -24,6 +24,14 @@ export enum StakingEventType {
     /** not stored any more: fetched only to tell exit implementations apart; rows from before stay */
     Exited = 25,
     /**
+     * The validator beacon's Upgraded(implementation): every validator proxy
+     * runs the new implementation from this block on. `validator` holds the
+     * beacon address, `account` the implementation, and `extra` what the
+     * implementation's bytecode shows: {emitsExited, selfDelegation}.
+     * Internal: it drives the commission model and is not served by /events.
+     */
+    ImplementationUpgraded = 30,
+    /**
      * Synthetic, written by the refresher: the operator's on-chain shares
      * dropped without an event we can see. Slashing is a system call whose logs
      * `eth_getLogs` does not return, so this is the only trace it leaves.
@@ -451,8 +459,15 @@ export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IS
 export interface IStakingSelfDelegation {
     id?: number
     validator: string
-    /** state after this block, i.e. it applies to rewards from fromBlock + 1 on */
+    /**
+     * first block whose reward this applies to. A block's reward is
+     * distributed after its transactions and before its slashes, so a
+     * transaction in block b (a delegation, an ownership transfer, an upgrade)
+     * applies from b, and a slash in block b from b + 1.
+     */
     fromBlock: number
+    /** the block whose post-state was read (or approximated) */
+    stateBlock?: number
     owner: string
     ok: boolean
     /** `state_read`: getDelegatedTokens(owner) vs minSelfDelegation at fromBlock; `approx`: from indexed shares at the current share price, when the RPC has no state for that block */
@@ -469,6 +484,7 @@ export class StakingSelfDelegation extends Model<IStakingSelfDelegation> impleme
     id?: number;
     validator: string;
     fromBlock: number;
+    stateBlock?: number;
     owner: string;
     ok: boolean;
     source: string;
@@ -478,6 +494,7 @@ export class StakingSelfDelegation extends Model<IStakingSelfDelegation> impleme
             id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
             validator: {type: DataTypes.STRING(42), allowNull: false},
             fromBlock: {type: DataTypes.BIGINT, allowNull: false},
+            stateBlock: {type: DataTypes.BIGINT, allowNull: true},
             owner: {type: DataTypes.STRING(42), allowNull: false},
             ok: {type: DataTypes.BOOLEAN, allowNull: false},
             source: {type: DataTypes.STRING(16), allowNull: false},

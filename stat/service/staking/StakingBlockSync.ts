@@ -239,7 +239,7 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
         ctx.commission = new CommissionModel(opt.startBlock);
     }
     const proposers = new Set(parsed.filter(p => p.reward).map(p => p.reward.validator));
-    await ctx.commission.prepare(proposers, to);
+    await ctx.commission.prepare(proposers, to, parsed.flatMap(p => p.slashes));
 
     const rewards: IStakingBlockReward[] = [];
     const slashes: IStakingBlockSlash[] = [];

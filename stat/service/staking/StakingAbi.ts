@@ -33,6 +33,8 @@ export const TOPIC = {
     WithdrawTipFee: id('WithdrawTipFee(address,address,uint256)'),
     // fetched only to tell the two exit implementations apart, never stored (see StakingSync)
     Exited: id('Exited(address)'),
+    /** OpenZeppelin UpgradeableBeacon */
+    Upgraded: id('Upgraded(address)'),
 };
 
 export const STAKING_TOPICS = [TOPIC.ValidatorCreated, TOPIC.ValidatorInitialized, TOPIC.ValidatorExited];

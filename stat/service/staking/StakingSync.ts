@@ -14,6 +14,7 @@ import {
     RawLog,
     STAKING_TOPICS,
     StakingDecodeError,
+    TOPIC,
     VALIDATOR_TOPICS,
 } from "./StakingAbi";
 
@@ -34,6 +35,8 @@ import {
 
 export const KEY_STAKING_CURSOR = 'STAKING_SYNC_BLOCK';
 const KEY_STAKING_GENESIS = 'STAKING_GENESIS_SEEDED';
+/** the beacon whose Upgraded history up to the cursor is in staking_event */
+const KEY_BEACON_BACKFILLED = 'STAKING_BEACON_UPGRADES';
 /**
  * eth_getLogs address-array size. evmrpc.0g.ai rejects more than 32
  * ("filter.address can contain up to 32 addresses"), which mainnet's validator
@@ -54,6 +57,7 @@ export function stakingOption(): Required<StakingOption> {
         // the 0G RPC's eth_getLogs limit (`query exceeds max block range 100000`)
         logRange: o.logRange ?? 100_000,
         refreshIntervalMs: o.refreshIntervalMs ?? 60 * SECOND,
+        validatorBeacon: (o.validatorBeacon || '').toLowerCase(),
         blockRewards: o.blockRewards || {},
     };
 }
@@ -81,6 +85,7 @@ const ctx = {
     provider: null as JsonRpcProvider,
     validators: new Set<string>(),
     range: 0,
+    beacon: '',
 };
 
 /**
@@ -93,6 +98,11 @@ export function withStakingLock<T>(fn: () => Promise<T>): Promise<T> {
     const run = lockTail.then(fn, fn);
     lockTail = run.catch(() => undefined);
     return run;
+}
+
+/** the beacon whose upgrades are tracked; set by initStakingSync */
+export function trackedBeacon(): string {
+    return ctx.beacon;
 }
 
 export async function getStakingCursor(): Promise<number> {
@@ -110,7 +120,10 @@ export async function initStakingSync() {
         throw new Error(`config.staking.genesis must be one of ${Object.keys(GENESIS_VALIDATORS)}, got [${opt.genesis}]`);
     }
     ctx.range = opt.logRange;
+    ctx.beacon = opt.validatorBeacon || (await new ethers.Contract(opt.contract,
+        ['function validatorBeacon() view returns (address)'], ctx.provider).validatorBeacon()).toLowerCase();
     await seedGenesis(opt.genesis);
+    await backfillUpgrades();
     const rows = await StakingValidator.findAll({attributes: ['address'], raw: true});
     rows.forEach(r => ctx.validators.add(r.address));
     console.log(`staking sync: ${ctx.validators.size} validators known, cursor ${await getStakingCursor()}`);
@@ -164,6 +177,76 @@ async function getLogs(address: string | string[], topics: string[], from: numbe
         transactionIndex: parseInt(l.transactionIndex, 16),
         logIndex: parseInt(l.logIndex, 16),
     }));
+}
+
+/**
+ * What an implementation's bytecode says about it. Read at the latest block:
+ * deployed code does not change, so no historical state is needed.
+ *
+ * - emitsExited: the Exited topic appears in the code. It came with
+ *   f61aef593 (0g-chain-ng contracts/src/staking), which also stopped exit()
+ *   from moving the owner's stake into commission.
+ * - selfDelegation: the formula _distributeRewards uses to decide whether
+ *   the owner meets minSelfDelegation. bb794bcc7 switched it from
+ *   `shares * tokens / delegatorShares` (rewards not yet folded in, shares
+ *   must be > 0) to getDelegatedTokens(owner). The function itself is older,
+ *   so its selector proves nothing; but the history is linear and bb794bcc7
+ *   precedes f61aef593, so an implementation that emits Exited has the new
+ *   formula. On mainnet both arrive with the upgrade at 37,026,750; the one
+ *   before it (32,558,027, 2026-05-07) predates bb794bcc7 (2026-05-31).
+ */
+const implementations = new Map<string, {emitsExited: boolean, selfDelegation: 'delegated-tokens' | 'shares-tokens'}>();
+async function classifyImplementation(impl: string) {
+    if (!implementations.has(impl)) {
+        const code = (await ctx.provider.getCode(impl)).toLowerCase();
+        if (code === '0x') {
+            throw new Error(`implementation ${impl} has no code`);
+        }
+        const emitsExited = code.includes(TOPIC.Exited.slice(2).toLowerCase());
+        implementations.set(impl, {emitsExited, selfDelegation: emitsExited ? 'delegated-tokens' : 'shares-tokens'});
+    }
+    return implementations.get(impl);
+}
+
+/** the beacon's Upgraded logs in [from, to], as events */
+async function upgradeEvents(from: number, to: number): Promise<{log: RawLog, ev: DecodedStakingEvent}[]> {
+    const out = [];
+    for (const log of await getLogs(ctx.beacon, [TOPIC.Upgraded], from, to)) {
+        const implementation = '0x' + log.topics[1].slice(26).toLowerCase();
+        out.push({log, ev: {
+            eventType: StakingEventType.ImplementationUpgraded, validator: ctx.beacon, account: implementation,
+            extra: {beacon: ctx.beacon, implementation, ...await classifyImplementation(implementation)},
+        }});
+    }
+    return out;
+}
+
+/**
+ * The commission model needs the implementation in force at every block it
+ * computes, including those before the event cursor's start, so the beacon's
+ * whole history up to the cursor is loaded once; syncWindow keeps it current.
+ */
+async function backfillUpgrades() {
+    if (await KV.getString(KEY_BEACON_BACKFILLED, '') === ctx.beacon) {
+        return;
+    }
+    const cursor = await getStakingCursor();
+    const found: {log: RawLog, ev: DecodedStakingEvent}[] = [];
+    for (let from = 1; from <= cursor; from += ctx.range) {
+        found.push(...await upgradeEvents(from, Math.min(cursor, from + ctx.range - 1)));
+    }
+    const times = await blockTimes([...new Set(found.map(f => f.log.blockNumber))]);
+    await StakingEvent.sequelize.transaction(async dbTx => {
+        if (found.length) {
+            await StakingEvent.bulkCreate(found.map(({log, ev}) => ({
+                blockNumber: log.blockNumber, blockHash: log.blockHash, createdAt: times.get(log.blockNumber),
+                txHash: log.transactionHash, txIndex: log.transactionIndex, logIndex: log.logIndex,
+                validator: ev.validator, eventType: ev.eventType, account: ev.account, extra: ev.extra,
+            })), {transaction: dbTx, ignoreDuplicates: true});
+        }
+        await KV.upsert({key: KEY_BEACON_BACKFILLED, value: ctx.beacon}, {transaction: dbTx});
+    });
+    console.log(`staking sync: beacon ${ctx.beacon}, ${found.length} implementation upgrades up to ${cursor}`);
 }
 
 function pairKey(validator: string, delegator: string) {
@@ -330,6 +413,7 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
         const logs = await getLogs(addresses.slice(i, i + ADDRESS_CHUNK), VALIDATOR_TOPICS, from, to);
         logs.forEach(decode);
     }
+    decoded.push(...await upgradeEvents(from, to));
     decoded.sort((a, b) => a.log.blockNumber - b.log.blockNumber || a.log.logIndex - b.log.logIndex);
 
     const blockTime = await blockTimes([...new Set(decoded.map(d => d.log.blockNumber))]);

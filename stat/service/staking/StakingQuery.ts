@@ -296,10 +296,11 @@ export async function listStakingEvents(opt: {
     const where: WhereOptions = {};
     if (opt.validator) where['validator'] = opt.validator;
     if (opt.delegator) where['account'] = opt.delegator;
-    // SlashDetected rows are the refresher's bookkeeping, not chain events: never served
+    // internal rows (the refresher's SlashDetected, the beacon's upgrades) are never served
+    const internal = [StakingEventType.SlashDetected, StakingEventType.ImplementationUpgraded];
     where['eventType'] = opt.types?.length
-        ? {[Op.in]: opt.types.filter(t => t !== StakingEventType.SlashDetected)}
-        : {[Op.ne]: StakingEventType.SlashDetected};
+        ? {[Op.in]: opt.types.filter(t => !internal.includes(t))}
+        : {[Op.notIn]: internal};
     if (opt.start || opt.end) {
         where['createdAt'] = {...(opt.start ? {[Op.gte]: opt.start} : {}), ...(opt.end ? {[Op.lt]: opt.end} : {})};
     }

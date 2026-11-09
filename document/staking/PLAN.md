@@ -363,15 +363,21 @@ group by validator;
 
 ### 佣金的计算
 
-合约里佣金有前提：`_checkSelfDelegation()`，即 `getDelegatedTokens(owner) ≥ minSelfDelegationInGwei × 1e9`（`operatorAddress()` 就是 `owner()`）。所以每块的佣金要知道两样东西：
+合约里佣金有前提：`_checkSelfDelegation()`，即 owner 的自质押不低于 `minSelfDelegationInGwei × 1e9`（`operatorAddress()` 就是 `owner()`）。判断公式随实现版本变化，见"二期 B 实现与验证"第 3 点。所以每块的佣金要知道两样东西：
 
-1. **当时的 `commissionRate`**：按 validator 维护费率时间线。初始费率用历史状态读取初始化块的 `commissionRate()`，之后按 `CommissionRateChanged` 事件逐次更新（一期已采集）。
-2. **当时是否满足门槛**：维护"达标"时间线。它只会在以下时刻跳变：
+1. **当时的 `commissionRate`**：按 validator 维护费率时间线，由 `CommissionRateChanged` 事件推出。第一次变更之前用这个事件里的旧值；从来没变过的，用当前费率。
+2. **当时是否满足门槛**：维护"达标"时间线，在可能跳变的块上读历史状态判断。可能跳变的块有：
    - owner 自己的 Delegate / Undelegate；
    - `OwnershipTransferred`（换了 owner）；
-   - 罚没（只扣 owner 的 shares）。
+   - 罚没（只扣 owner 的 shares），块号取自逐块采集的 `slashed`；
+   - 实现升级导致公式切换的那一块；
+   - 旧公式时期，这个 validator 上任何人的 Delegate、Undelegate、WithdrawCommission（会把 rewards 并入 `tokens`）。
 
-   在这些块上，用历史状态读 `getDelegatedTokens(owner)` 和 `minSelfDelegationInGwei()`，得到新的达标状态。两次跳变之间，owner 的代币价值只会随奖励上涨，所以只可能从不达标变成达标；这种情况由下面的逐日对账发现，再二分定位到具体块。
+   新公式下，两次跳变之间 owner 的代币价值只会随奖励上涨，所以只可能从不达标变成达标；这种情况由下面的佣金对账发现。
+
+**生效时间**：0g-geth 处理一个块时，先执行块内的交易，再做奖励分配，最后执行罚没。所以块 b 里由交易引起的变化（费率变更、owner 委托或解押、所有权转移、实现升级）**对块 b 自己的奖励就已生效**；块 b 里的罚没从 b+1 起生效。`staking_self_delegation` 的 `fromBlock` 是开始生效的块，`stateBlock` 是读取状态的块。
+
+最早的实现按"块 b 的变化从 b+1 起生效"处理，差了一块，2026-11-09 已修正。只有出块 validator 恰好在自己出块的那一块里改了费率或自质押时才会算错。缓存表里 `stateBlock` 为空的旧行会被忽略，按新规则重新判断。读的是块 b 执行完之后的状态，新公式下会多算块 b 自己的一份奖励，只有 owner 正好卡在门槛上时才可能有影响。
 
 **佣金对账（按检查点，已实现，`StakingCheck.ts`）**：原设计按 UTC 日对账，但每个日界都要读历史状态，没有归档节点就无法运行。实现改为按检查点：每隔 `checkIntervalSec`（默认 1 小时链上时间）在采集游标处读所有 validator 的 `commission()`，和该 validator 的上一个检查点比：
 
@@ -547,7 +553,18 @@ group by validator;
    - 主网上 `Exited` 一共只出现过 4 次，最早在块 **37,392,579**，所以主网在这之前升级到了 `f61aef593` 之后的实现。之前退出的 16 个 validator 都走了旧逻辑，例如 `0x0712…f7dd` 在块 23,630,587 退出：`commission` 从 0 变成 565.12，owner 份额从 500 变成 0。refresher 在主网报出的 12 个"罚没"，全部是这批旧版退出。
    - 处理方式：同步继续拉取 validator 的 `Exited` 日志，但**只用来判断退出走的是哪个版本，不入库**。同一交易里没有 `Exited` 的 `ValidatorExited` 按旧版处理：清零 owner 份额，读出转进佣金的金额，记到 `extra.exitSettlement`，并标 `extra.implementation = "stake-to-commission"`。有 `Exited` 的按新版处理：`exitSettlement` 记为 0，标 `"emits-exited"`。
    - refresher 不再把"已退出、owner 链上份额为 0"记为罚没。`/fees` 的 commission `total` 扣除 `exitSettlement`，`exitSettlement` 单独返回；读不到时为 null，`total` 仍包含它。
-   - 已知限制：佣金的"是否达标"按新公式 `getDelegatedTokens` 判断。在 `bb794bcc7` 之前的实现下（不含 rewards，且要求份额 > 0），owner 正好处在门槛附近时可能判断不一致。升级的具体块不知道，只能确定在块 37,392,579 之前。
+   - **实现升级从日志里探测**（2026-11-09，取代原来的"已知限制"）：
+     - 每个 validator 都是 BeaconProxy。升级实现时，beacon（主网 `0x335a…f1bf`，由 Staking 合约的 `validatorBeacon()` 读出）会发 `Upgraded(address implementation)`。这是管理员发的普通交易，`eth_getLogs` 取得到。
+     - 同步首次启动时回填 beacon 从块 1 到游标的全部升级，之后每个窗口顺带采集。每次升级存一行 `ImplementationUpgraded`（type 30，内部类型，`/events` 不返回）。
+     - 实现的版本从它的字节码判断：读最新块的代码即可，因为部署后的代码不会变，不需要归档节点。字节码里有 `Exited` 的 topic，就是 `f61aef593` 及以后的版本。历史是线性的，`bb794bcc7`（新达标公式）在 `f61aef593` 之前，所以发 `Exited` 的实现一定用新公式。`getDelegatedTokens` 的 selector 不能用来判断：这个函数在旧公式时期就已经存在。
+     - 主网结果：14 次升级，块 37,026,750（2026-06-25）之前都是旧公式，从这一块起是新公式，退出也是从这一块起改发 `Exited`。佐证：
+       - 上一次升级在块 32,558,027（2026-05-07），早于 `bb794bcc7`（2026-05-31）；
+       - 最后一个旧版退出在 35,681,625，第一个新版退出在 37,392,579，都落在切换点两侧。
+       - 主网 80 个 validator 中，76 个的 BeaconProxy 指向这个 beacon；4 个创世 validator 的 beacon 槽为空，但它们的代码里直接嵌着同一个 beacon 地址。
+     - 佣金模型（`StakingCommission.ts`）按块选择达标公式：
+       - 旧公式 `shares-tokens`：owner 份额 × `tokens` / `delegatorShares`，不含 rewards，并要求份额 > 0。rewards 只在 `_processDeposit` 里并入 `tokens`，也就是这个 validator 上任何人的 Delegate、Undelegate、WithdrawCommission 发生时，所以这些块都要重新判断一次达标；
+       - 新公式 `delegated-tokens`：`getDelegatedTokens(owner)`；
+       - 公式切换的那一块也要重新判断一次。
    - 验证（新建一个空库，用新代码从块 1 重新同步主网）：16 个旧版退出（块 12,034,802–35,681,625）全部标为 `stake-to-commission`，4 个新版退出（块 37,392,579–48,556,929）全部标为 `emits-exited`。全量份额对账 2,197 条，0 条修正，refresher 没有再报罚没；`Exited` 没有入库。16 个旧版退出中 15 个的 `exitSettlement` 因为读不到历史状态，记为 null。
    - 系统调用产生的日志用 `eth_getLogs` 取不到（第 0 步第 1 项），共识层罚没是 geth 的 `ProcessStakingSlashings` 以系统调用执行的 `slashValidator`，所以罚没只能从区块的 `slashed` 数组采集。测试网块 38,873,058 有 1 条能查到的 `Slashed`（validator `0x4b99…`），它不是系统调用：是管理员地址 `0x565e…` 发的普通交易，直接调用了 `slashValidator(address,uint256)`，当时的合约还允许这样调用，现在的合约只允许系统地址调用。
 4. **公共 RPC 读不到可靠的历史状态**：`evmrpc.0g.ai` 背后的节点只有部分保留历史状态，而且时有时无。开始测试时还能读块 1,100 万和 2,363 万，后来除了最近约一百个块全部报 `missing trie node`。依赖历史状态的有三项："是否达标"判断、`check-commission`、退出本金的读取。**生产环境需要专用的归档节点**；否则"是否达标"全部退回估算（`approx`），对自质押在门槛附近的 validator 可能算错，`exitSettlement` 也会一直是 null。
@@ -601,10 +618,21 @@ group by validator;
    - (a) 前端改成调新接口，推荐；
    - (b) 后端另加一层 Xangle 兼容格式。
    需要前端负责人拍板。
-2. **API 挂在哪**：open-api（对外公开，需要限流 key）还是 scan-api v1（浏览器前端现在用的）？如果浏览器页面直接调用，scan-api 可能更合适。
+2. **API 挂在哪**：open-api（对外公开，需要限流 key）还是 scan-api v1（浏览器前端现在用的）？如果浏览器页面直接调用，scan-api 可能更合适。→ 已定：open-api，见下面"已定事项"。
 3. **失败交易**：交易列表里要不要展示失败的 delegate / undelegate？
 4. **USD 价值**：Xangle 的 `*Value` 字段一直是 0。要不要接现有的代币价格（`TokenQuoteTrack`）？
 5. 过渡期 Xangle 的服务是否继续运行、什么时候下线。
+
+### 已定事项（2026-11-09）
+
+| 事项 | 结论 |
+|---|---|
+| 前端兼容 | 前端改成调新接口，后端不做 Xangle 兼容层 |
+| 主网区块奖励回灌 | 全部回灌，`blockRewards.startBlock` 用默认值 10,877,918 |
+| 升级 validator 实现的块号 | 不再需要合约团队提供，同步时从 beacon 的 `Upgraded` 日志探测（见"二期 B 实现与验证"第 3 点）。主网的达标公式在块 37,026,750 切换 |
+| 归档节点 | 待定 |
+| Xangle 服务下线时间 | 待定 |
+| API 挂载 | open-api（`/open/staking/*`），已确认。理由：<br>① 接口已经实现在 open-api 里（`/open/staking/*`），swagger 在 `evm-open-api.yaml`，`/open/doc` 能看到；<br>② 前端既然改调新接口，就没有沿用 scan-api v1 的理由。v1 建在 `koaflow` 上（readme 自称过度设计），再加一套就要维护两份路由和两种响应格式；<br>③ 浏览器直接调用时，不带 key 按 IP 走免费档限流，每个访问者各算各的；如果前端是服务端渲染，所有请求从同一个 IP 发出，就给前端服务配一个高档 `rate_key`；<br>④ 钱包、数据面板等第三方也能直接用公开文档。<br>前端要处理的一点：EVM 模式下的响应是 `{status, message, result}`，出错时多数也是 HTTP 200，要看 `status` 判断 |
 
 ## 附录 A：事件 topic
 

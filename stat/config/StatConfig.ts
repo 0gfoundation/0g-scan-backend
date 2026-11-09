@@ -35,6 +35,8 @@ export interface StakingOption {
     confirmations?: number, // blocks kept back from latest, default 0 (CometBFT finalizes each block)
     logRange?: number, // blocks per eth_getLogs window, default 100,000 (the 0G RPC's cap)
     refreshIntervalMs?: number, // default 60s
+    // the validators' UpgradeableBeacon; default: the Staking contract's validatorBeacon()
+    validatorBeacon?: string,
     /** per-block rewards, commission, community tax, foundation rewards and slashes */
     blockRewards?: {
         enabled?: boolean, // default false
