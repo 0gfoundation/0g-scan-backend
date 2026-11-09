@@ -928,8 +928,492 @@ paths:
             "application/json":
               schema:
                 $ref: "#/components/schemas/StringArray"
+  /staking/summary:
+    get:
+      tags:
+        - 'Staking'
+      description: "Totals over all validators. Amounts are integer strings in wei (1 0G = 1e18). `delegatorCount` counts distinct addresses with non-zero shares; `delegationCount` counts (validator, delegator) pairs."
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validators:
+    get:
+      tags:
+        - 'Staking'
+      description: "All validators, not paged. `stakedAmount` is tokens + pending rewards, which is what the delegators' shares are worth. `stakedPercent` is the share of the total staked on all validators, `cumulativePercent` the running total in the returned order. Each validator carries `created` (block, tx hash, time, operator and initial stake of ValidatorInitialized; null for genesis validators and ones never initialized) and `exited` (block, tx hash, time of ValidatorExited; null otherwise, including slash-induced exits, which emit no event)."
+      parameters:
+        - name: status
+          in: query
+          description: "`active` or `inactive`, by beacon chain status. Omit for all."
+          required: false
+          schema:
+            type: string
+            enum: [active, inactive]
+        - name: term
+          in: query
+          description: "Case-insensitive substring of the moniker or the address."
+          required: false
+          schema:
+            type: string
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [staked, commission, delegators, apy]
+            default: staked
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator:
+    get:
+      tags:
+        - 'Staking'
+      description: "One validator, including its self-stake (the owner's delegation). Each validator carries `created` (block, tx hash, time, operator and initial stake of ValidatorInitialized; null for genesis validators and ones never initialized) and `exited` (block, tx hash, time of ValidatorExited; null otherwise, including slash-induced exits, which emit no event)."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/delegators:
+    get:
+      tags:
+        - 'Staking'
+      description: "Delegators of a validator with non-zero shares, by shares. `amount` is the current token value of the shares."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/delegations/sum:
+    get:
+      tags:
+        - 'Staking'
+      description: "Delegate and Undelegate amounts into a validator over [start, end), reported separately as `delegated` / `undelegated` with their counts, and `net` = delegated - undelegated. Slashing is not included, nor is the initial self-stake at initialization. With `interval`, also returns per-bucket figures (UTC)."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive."
+          required: true
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now. The range is limited to 366 days, 31 days with `interval=hour`."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [day, hour]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/param-changes:
+    get:
+      tags:
+        - 'Staking'
+      description: "History of a validator's commission rate and withdrawal fee, newest first. For `commission_rate`, `oldValue` / `newValue` are raw (1,000,000 = 100%) with `oldPercent` / `newPercent` alongside; for `withdrawal_fee` they are gwei and the percent fields are null."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: type
+          in: query
+          description: "Comma separated: commission_rate, withdrawal_fee. Default both."
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/fees:
+    get:
+      tags:
+        - 'Staking'
+      description: "Commission and tip fee per validator, ordered by their sum. For each: `current` is what is still in the contract (commission() / tipFee() at `refreshedBlock`), `withdrawn` the sum of WithdrawCommission / WithdrawTipFee, `total` the two added. A commission withdrawal only moves it into the withdrawal queue, so withdrawn does not mean paid out yet."
+      parameters:
+        - name: address
+          in: query
+          description: "Validator address. Omit for all validators."
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/fee-withdrawals:
+    get:
+      tags:
+        - 'Staking'
+      description: "A validator's commission and tip fee withdrawals, newest first: owner, withdrawal address, amount, block, tx hash, time."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: type
+          in: query
+          description: "Comma separated: commission, tip_fee. Default both."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/rewards:
+    get:
+      tags:
+        - 'Staking'
+      description: "Blocks proposed, reward (withdrawals[0]), community tax (10% of it, to the Staking contract's communityPoolAddress), commission (reward x commissionRate while the owner meets minSelfDelegation), delegatorReward (what is left for the pool) and slashes, cumulative and over [start, end). Without `address`, network totals plus one row per validator, ordered by `sort` over the range (or cumulatively without one). Figures come from each block's withdrawals[0..2] and slashed array, collected from `startBlock` up to `asOfBlock` (both in the response); cumulative means over that span. Amounts are wei."
+      parameters:
+        - name: address
+          in: query
+          description: "Validator address. Omit for all validators."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive. Without it only cumulative figures are returned."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now; clamped to the collected data. The range is limited to 366 days."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          description: "`day` adds a per-UTC-day breakdown of the range."
+          required: false
+          schema:
+            type: string
+            enum: [day]
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [reward, commission, blockCount, slashedAmount]
+            default: reward
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/validator/blocks:
+    get:
+      tags:
+        - 'Staking'
+      description: "Blocks proposed by a validator with each block's reward, community tax, commission, delegator reward, restaking and foundation rewards, newest first."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/community/tax:
+    get:
+      tags:
+        - 'Staking'
+      description: "Community tax: 10% of each block's withdrawals[0], which the validator contract sends to the Staking contract's communityPoolAddress (`communityPool` in the response). Cumulative and over [start, end), with a per-validator breakdown over the same span. Figures come from each block's withdrawals[0..2] and slashed array, collected from `startBlock` up to `asOfBlock` (both in the response); cumulative means over that span. Amounts are wei."
+      parameters:
+        - name: validator
+          in: query
+          description: "Only the tax from blocks this validator proposed."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive. Without it only cumulative figures are returned."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now; clamped to the collected data. The range is limited to 366 days."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          description: "`day` adds a per-UTC-day breakdown of the range."
+          required: false
+          schema:
+            type: string
+            enum: [day]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/foundation/rewards:
+    get:
+      tags:
+        - 'Staking'
+      description: "Foundation rewards: each block's withdrawals[2], paid to `foundationAddress`. Cumulative and over [start, end). Figures come from each block's withdrawals[0..2] and slashed array, collected from `startBlock` up to `asOfBlock` (both in the response); cumulative means over that span. Amounts are wei."
+      parameters:
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive. Without it only cumulative figures are returned."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now; clamped to the collected data. The range is limited to 366 days."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          description: "`day` adds a per-UTC-day breakdown of the range."
+          required: false
+          schema:
+            type: string
+            enum: [day]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/slashes:
+    get:
+      tags:
+        - 'Staking'
+      description: "Slashes from the blocks' slashed arrays, newest first: validator (the slashed validator's contract), its consensus-layer index, the evidence height and the penalty in wei."
+      parameters:
+        - name: validator
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/delegator/validators:
+    get:
+      tags:
+        - 'Staking'
+      description: "Validators a delegator has non-zero shares on, with the current token value of each."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [amount, commission, apy, first]
+            default: amount
+        - $ref: '#/components/parameters/stakingOrderParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/delegator/delegations/sum:
+    get:
+      tags:
+        - 'Staking'
+      description: "A delegator's Delegate and Undelegate amounts across all validators, reported separately as `delegated` / `undelegated` with their counts and `net` = delegated - undelegated, plus a per-validator breakdown ordered by volume. Attributed to the delegator, not the payer. Without start/end, covers all history."
+      parameters:
+        - $ref: '#/components/parameters/stakingAddressParam'
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive."
+          required: false
+          schema:
+            type: integer
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/events:
+    get:
+      tags:
+        - 'Staking'
+      description: "Staking events, newest first. The validator contracts' Exited is no longer collected (use validator_exited); `exited` only returns rows indexed before that change."
+      parameters:
+        - name: validator
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: delegator
+          in: query
+          description: "The delegator for delegate/undelegate, the owner or operator for other events."
+          required: false
+          schema:
+            type: string
+        - name: type
+          in: query
+          description: "Comma separated: delegate, undelegate, validator_created, validator_initialized, validator_exited, ownership_transferred, commission_rate_changed, withdrawal_fee_changed, withdraw_commission, withdraw_tip_fee, exited (historical rows only)."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/skipParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/charts/breakdown:
+    get:
+      tags:
+        - 'Staking'
+      description: "Total staked, split into owners' self-stake and delegations by others."
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
+  /staking/charts/activity:
+    get:
+      tags:
+        - 'Staking'
+      description: "Delegate and Undelegate amounts per UTC day for the last `days` days (today included, latest first), reported separately with `net` = delegated - undelegated. Owners' own delegations are included. Per day the top 10 validators by volume (delegated + undelegated) are listed plus `others`; `percent` is the share of the day's volume."
+      parameters:
+        - name: days
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+            maximum: 30
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
 components:
   schemas:
+    StakingResult:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        result:
+          type: object
     CommonResponse:
       type: object
       properties:
@@ -2878,6 +3362,20 @@ components:
       required: true
       schema:
         type: string
+    stakingAddressParam:
+      name: address
+      in: query
+      required: true
+      schema:
+        type: string
+    stakingOrderParam:
+      name: order
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
     skipParam:
       name: skip
       in: query
