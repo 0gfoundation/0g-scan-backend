@@ -11,6 +11,7 @@ import {TokenTool} from "./service/tool/TokenTool";
 import {TokenQuoteSync} from "./service/TokenQuoteSync";
 import {repeatCheckAccount} from "./service/watcher/AccountChecker";
 import {listenPort} from "./monitor/serverApi";
+import {startStaking} from "./service/staking/StakingMain";
 
 async function main() {
     redirectLog()
@@ -24,6 +25,7 @@ async function main() {
     startContractUserAnd1155data(cfx, config, 500).then();
     startUniqueAddrStat().then()
     repeatCheckAccount(cfx).then(); // should move it to stat-task
+    startStaking().then(); // no-op unless config.staking.enabled
     // quote service
     if (config?.syncQuote?.open) {
         const tokenTool = new TokenTool(cfx);

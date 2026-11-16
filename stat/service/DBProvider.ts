@@ -91,6 +91,16 @@ import {
     PartnerAudit,
     PartnerContract,
 } from "../model/PartnerChain";
+import {
+    StakingBlockReward,
+    StakingBlockSlash,
+    StakingDelegation,
+    StakingEvent,
+    StakingRewardDaily,
+    StakingSelfDelegation,
+    StakingCommissionCheck,
+    StakingValidator,
+} from "../model/Staking";
 
 let conf
 export function createDB(config) {
@@ -232,6 +242,15 @@ export async function initPartialModel(sequelize) {
     DailyPartnerAddr.register(sequelize)
     DailyPartnerTvl.register(sequelize)
     PartnerAudit.register(sequelize)
+    // 0G validator/delegation index, written by token_x, read by open-api
+    StakingValidator.register(sequelize)
+    StakingDelegation.register(sequelize)
+    StakingEvent.register(sequelize)
+    StakingBlockReward.register(sequelize)
+    StakingBlockSlash.register(sequelize)
+    StakingRewardDaily.register(sequelize)
+    StakingSelfDelegation.register(sequelize)
+    StakingCommissionCheck.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)
@@ -357,6 +376,15 @@ async function migDB(seq: Sequelize) {
     const rateKey = RateKey.getTableName().toString();
     await addColumnIfNotExistsV2(qi, rateKey, 'scope', {
         type: DataTypes.STRING(255), allowNull: false, defaultValue: '',
+    });
+
+    // added after staking_self_delegation was first created (not yet released)
+    await addColumnIfNotExistsV2(qi, StakingSelfDelegation.getTableName().toString(), 'stateBlock', {
+        type: DataTypes.BIGINT, allowNull: true,
+    });
+    // added after staking_validator was first released
+    await addColumnIfNotExistsV2(qi, StakingValidator.getTableName().toString(), 'tipFee', {
+        type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0,
     });
 
     const kv = KV.getTableName().toString();

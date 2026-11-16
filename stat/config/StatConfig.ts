@@ -20,6 +20,41 @@ export interface ConfluxOption {
 export interface EtherOption {
     url: string,
 }
+/** 0G validator/delegation index, see document/staking/PLAN.md */
+export interface StakingOption {
+    enabled?: boolean, // default false
+    contract?: string, // default: STAKING_CONTRACT_ADDRESS from ValidatorContract.sol
+    /**
+     * Which built-in genesis validator list to seed: 'mainnet' | 'testnet' | 'none'
+     * (GENESIS_VALIDATORS in StakingAbi.ts). Required when enabled: validators
+     * registered via genesis deposits emit no event, so the sync refuses to
+     * start without an explicit choice.
+     */
+    genesis?: string,
+    startBlock?: number, // first block to scan, default 1
+    confirmations?: number, // blocks kept back from latest, default 0 (CometBFT finalizes each block)
+    logRange?: number, // blocks per eth_getLogs window, default 100,000 (the 0G RPC's cap)
+    refreshIntervalMs?: number, // default 60s
+    // the validators' UpgradeableBeacon; default: the Staking contract's validatorBeacon()
+    validatorBeacon?: string,
+    /** per-block rewards, commission, community tax, foundation rewards and slashes */
+    blockRewards?: {
+        enabled?: boolean, // default false
+        // first block to collect; mainnet withdrawals start at 10,877,918. A later
+        // start only covers part of the history: cumulative figures then count from it.
+        startBlock?: number,
+        batchSize?: number, // blocks per JSON-RPC batch, default 50 (the 0G RPCs reject more)
+        concurrency?: number, // batches in flight, default 2
+        foundationAddress?: string, // expected withdrawals[2].address, default 0x711b...2522
+        communityTaxRate?: number, // raw, 1e6 = 100%; default 100000 (10%)
+        // consensus layer .../blocks/{id}/total_withdrawals; default: validatorRpc
+        clTotalWithdrawalsUrl?: string,
+        // seconds of chain time between commission/tax-rate checkpoints, default 3600
+        checkIntervalSec?: number,
+        // alert when the collected head is older than this, once caught up; default 600
+        freshnessAlertSec?: number,
+    },
+}
 export interface ConsortiumBridgeOption {
     port: number,
     retry: number,
@@ -104,6 +139,7 @@ export interface StatConfig{
     // Named for the validators endpoint it used to point at, which fed a staked figure
     // nothing publishes any more.
     validatorRpc?: string,
+    staking?: StakingOption,
 
     syncIPFSGateway: boolean,
     syncIPFSGatewayDelay: number,
