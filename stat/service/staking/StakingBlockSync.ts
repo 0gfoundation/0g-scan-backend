@@ -1,5 +1,4 @@
 import {Op, QueryTypes, Transaction} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {
     IStakingBlockReward,
@@ -13,7 +12,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {CommissionModel} from "./StakingCommission";
 import {runChecks} from "./StakingCheck";
-import {blockRewardOption, getStakingCursor, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
+import {blockRewardOption, getStakingCursor, stakingRpcUrl, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
 
 /**
  * Per-block collection of rewards and slashes (PLAN.md "区块奖励、佣金、社区税、
@@ -66,7 +65,7 @@ async function rpcBatch(calls: {method: string, params: any[]}[]): Promise<any[]
     const body = calls.map((c, id) => ({jsonrpc: '2.0', id, ...c}));
     for (let attempt = 0; ; attempt++) {
         try {
-            const resp = await fetch(ConfigInstance.ether.url, {
+            const resp = await fetch(stakingRpcUrl(), {
                 method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
             });
             const json: any[] = await resp.json();

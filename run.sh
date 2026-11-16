@@ -111,6 +111,19 @@ OPEN_PORT=9527
 # Needed by every host that runs stat_task or the api, not just one of them.
 # Without it /supply reports genesis only, and the issuance monitor alerts hourly.
 #_VALIDATOR_RPC="http://127.0.0.1:3500/eth/v1/beacon/blocks/head/total_withdrawals"
+# Ethereum JSON-RPC (eth_*), written as config.ether.url. _RPC above may be a
+# cfx bridge; the staking index and EIP-7702 lookups need the eth endpoint itself.
+#_ETH_RPC="https://evmrpc.0g.ai"
+# Staking index (validators, delegations, events), run inside token_x. See document/staking/PLAN.md.
+#_STAKING_ENABLED=true
+# which built-in genesis validator list to seed: mainnet | testnet | none
+#_STAKING_GENESIS=mainnet
+# per-block rewards, commission, community tax, foundation rewards and slashes
+#_STAKING_BLOCK_REWARDS=true
+# first block to collect; empty = from the first block with withdrawals (mainnet 10,877,918)
+#_STAKING_BLOCK_REWARDS_START=
+# withdrawals[2] recipient; empty = mainnet's 0x711b0ecb072c27de0e50c9944d7195a51b202522
+#_STAKING_FOUNDATION_ADDRESS=
 	""" > ./scan.env
 	echo "We have created a config file, scan.env."
 	echo "Edit it and run this script again"
@@ -347,6 +360,20 @@ else
 	if [ "" != "$_VALIDATOR_RPC" ]; then
 		_VALIDATOR_RPC="validatorRpc: '$_VALIDATOR_RPC',"
 	fi
+	if [ "" != "$_ETH_RPC" ]; then
+		_ETH_RPC="ether: { url: '$_ETH_RPC' },"
+	fi
+	_STAKING=""
+	if [ "true" = "$_STAKING_ENABLED" ]; then
+		_BLOCK_REWARDS="enabled: ${_STAKING_BLOCK_REWARDS:-false},"
+		if [ "" != "$_STAKING_BLOCK_REWARDS_START" ]; then
+			_BLOCK_REWARDS="$_BLOCK_REWARDS startBlock: $_STAKING_BLOCK_REWARDS_START,"
+		fi
+		if [ "" != "$_STAKING_FOUNDATION_ADDRESS" ]; then
+			_BLOCK_REWARDS="$_BLOCK_REWARDS foundationAddress: '$_STAKING_FOUNDATION_ADDRESS',"
+		fi
+		_STAKING="staking: { enabled: true, genesis: '${_STAKING_GENESIS:-mainnet}', blockRewards: { $_BLOCK_REWARDS } },"
+	fi
 	echo """
 'use strict';
 Object.defineProperty(exports, '__esModule', { value: true });
@@ -364,6 +391,8 @@ exports.default = {
     preload: 4,
     $_IS_EVM $_NO_CORE_SPACE $traceNotAvailable $CORE_RPC
     $_VALIDATOR_RPC
+    $_ETH_RPC
+    $_STAKING
     influxDB: {disable: true},
     database: { USE_MYSQL: true, syncSchema: true, },
   databaseRW: {

@@ -46,6 +46,15 @@ const KEY_BEACON_BACKFILLED = 'STAKING_BEACON_UPGRADES';
  */
 const ADDRESS_CHUNK = 32;
 
+/**
+ * The Ethereum JSON-RPC the staking index reads (`ether.url`, written by
+ * run.sh from `_ETH_RPC`). Not `conflux.url`: that one feeds js-conflux-sdk
+ * and on 0G points at a cfx bridge speaking cfx_*, not eth_*.
+ */
+export function stakingRpcUrl(): string {
+    return ConfigInstance.ether?.url;
+}
+
 export function stakingOption(): Required<StakingOption> {
     const o = ConfigInstance.staking || {};
     return {
@@ -112,9 +121,9 @@ export async function getStakingCursor(): Promise<number> {
 
 export async function initStakingSync() {
     const opt = stakingOption();
-    ctx.provider = initEthSdk(ConfigInstance.ether?.url);
+    ctx.provider = initEthSdk(stakingRpcUrl());
     if (!ctx.provider) {
-        throw new Error(`staking sync needs config.ether.url`);
+        throw new Error(`staking sync needs config.ether.url (an eth_* JSON-RPC; _ETH_RPC in scan.env)`);
     }
     if (!GENESIS_VALIDATORS[opt.genesis]) {
         throw new Error(`config.staking.genesis must be one of ${Object.keys(GENESIS_VALIDATORS)}, got [${opt.genesis}]`);
@@ -310,7 +319,7 @@ async function blockTimes(numbers: number[]): Promise<Map<number, Date>> {
         const body = chunk.map((n, id) => ({jsonrpc: '2.0', id, method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
         for (let attempt = 0; ; attempt++) {
             try {
-                const resp: any[] = await (await fetch(ConfigInstance.ether.url, {
+                const resp: any[] = await (await fetch(stakingRpcUrl(), {
                     method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
                 })).json();
                 const byId = new Map(resp.map(r => [r.id, r]));

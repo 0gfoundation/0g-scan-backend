@@ -1,10 +1,9 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {StakingBlockReward, StakingBlockSlash, StakingRewardDaily, StakingValidator} from "../../model/Staking";
 import {otherFoundationAddresses} from "./StakingBlockSync";
-import {blockRewardOption, stakingOption} from "./StakingSync";
+import {blockRewardOption, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
  * Read side of the per-block collection: validator rewards / commission /
@@ -230,7 +229,7 @@ let communityPool: string = null;
 async function communityPoolAddress(): Promise<string> {
     if (!communityPool) {
         const staking = new ethers.Contract(stakingOption().contract,
-            ['function communityPoolAddress() view returns (address)'], new ethers.providers.JsonRpcProvider(ConfigInstance.ether.url));
+            ['function communityPoolAddress() view returns (address)'], new ethers.providers.JsonRpcProvider(stakingRpcUrl()));
         communityPool = await staking.communityPoolAddress().catch(() => null);
     }
     return communityPool;

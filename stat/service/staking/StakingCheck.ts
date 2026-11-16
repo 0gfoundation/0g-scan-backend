@@ -1,6 +1,5 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {
     IStakingCommissionCheck,
@@ -11,7 +10,7 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
-import {blockRewardOption, getStakingCursor, stakingOption} from "./StakingSync";
+import {blockRewardOption, getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
  * Checks run alongside the block sync (PLAN.md "对账与告警"):
@@ -61,7 +60,7 @@ async function callsAt(calls: {to: string, data: string}[], block: number): Prom
         for (let attempt = 0; ; attempt++) {
             let json: any[];
             try {
-                const resp = await fetch(ConfigInstance.ether.url, {
+                const resp = await fetch(stakingRpcUrl(), {
                     method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
                 });
                 json = await resp.json();

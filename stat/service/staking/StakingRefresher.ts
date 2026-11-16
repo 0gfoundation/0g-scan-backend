@@ -1,12 +1,11 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
-import {getStakingCursor, stakingOption, trackedBeacon, withStakingLock} from "./StakingSync";
+import {getStakingCursor, stakingOption, stakingRpcUrl, trackedBeacon, withStakingLock} from "./StakingSync";
 
 /**
  * Periodic refresh of the validator rows from chain state, plus the checks
@@ -46,7 +45,7 @@ const ctx = {
 function provider() {
     if (!ctx.provider) {
         // batches the per-validator view calls issued in the same tick
-        ctx.provider = new ethers.providers.JsonRpcBatchProvider(ConfigInstance.ether.url);
+        ctx.provider = new ethers.providers.JsonRpcBatchProvider(stakingRpcUrl());
     }
     return ctx.provider;
 }

@@ -184,7 +184,44 @@ staking?: {
 }
 ```
 
-- `run.sh` 生成的 `Prod.js` 连 `ether` 都没有（`_RPC` 在 EVM 模式下是 cfx-bridge，不是 EVM RPC），所以 `staking`、`ether`、`validatorRpc` 都要在部署的 `Prod` 里手工加，没有改 `run.sh`。
+- `_RPC`（写成 `conflux.url`）在 EVM 模式下是 cfx-bridge，讲 `cfx_*`，staking 用不了。staking 只读 `ether.url`（`stakingRpcUrl()`），必须是 `eth_*` 的 JSON-RPC。
+- `run.sh` 从 `scan.env` 生成 `Prod.js` 时支持下面这些变量（2026-11-16）：
+
+  | 变量 | 生成的配置 | 说明 |
+  |---|---|---|
+  | `_ETH_RPC` | `ether.url` | 必填 |
+  | `_STAKING_ENABLED=true` | `staking.enabled` | 不设就不生成 `staking` 段 |
+  | `_STAKING_GENESIS` | `staking.genesis` | `mainnet` / `testnet` / `none`，默认 `mainnet` |
+  | `_STAKING_BLOCK_REWARDS=true` | `staking.blockRewards.enabled` | 默认关闭 |
+  | `_STAKING_BLOCK_REWARDS_START` | `blockRewards.startBlock` | 空则从 10,877,918 开始 |
+  | `_STAKING_FOUNDATION_ADDRESS` | `blockRewards.foundationAddress` | 空则用主网的 `0x711b…2522` |
+
+  这只用于新搭建的环境：`run.sh` 只在 `Prod.js` 不存在时才生成它。
+
+**已部署环境的发布**（不需要 `run.sh`）：容器挂载仓库目录，直接运行编译出来的 `.js`，启动时不编译。
+1. `git pull`，然后 `npm run compile`；
+2. 在现有的 `stat/config/Prod.js` 里手工加 `ether: { url: ... }`（`eth_*` 的 RPC）和 `staking: {...}` 两段；
+3. `docker-compose restart token_x api open_api`。staking 的同步、refresher 和逐块采集都在 `token_x`（`TokenMiscSync`）里，比平时多重启这一个；新表在这些进程启动时自动创建。
+
+**测试网部署参数**（2026-11-16 探测）。`scan.env` 的写法如下，已部署环境照此在 `Prod.js` 里写 `ether.url = https://evmrpc-testnet.0g.ai`、`staking = {enabled: true, genesis: 'testnet', blockRewards: {enabled: true, startBlock, foundationAddress}}`：
+
+```
+_ETH_RPC="https://evmrpc-testnet.0g.ai"
+_STAKING_ENABLED=true
+_STAKING_GENESIS=testnet
+_STAKING_BLOCK_REWARDS=true
+_STAKING_BLOCK_REWARDS_START=<最近一段，比如 head - 100 万块>
+_STAKING_FOUNDATION_ADDRESS=0xecdae9c3dde3fef0f8cad725bb9b89f656109b92
+```
+
+- 测试网的基金会地址和主网不同，不配会每块告警。
+- 测试网从块 1 起就有 withdrawals，全量约 6,589 万块，按每分钟 8,000 块要 130 多个小时，所以只采最近一段。
+- 测试网的共识层接口未知，CL 对账会自动关闭（启动时记一条日志）。
+- 测试网的 RPC 不保留历史状态，"是否达标"多数会退回估算。
+- 本地验证：
+  - 事件从块 1 同步到 65,891,093 大约 6 分钟（之前同步过一部分）；
+  - beacon 回填出 13 次升级，达标公式在块 38,333,448 切换；
+  - 社区池是 `0x565e…0ab2`，税率 100000。
 
 ## 查询与 API
 

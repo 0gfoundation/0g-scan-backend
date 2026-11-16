@@ -1,6 +1,5 @@
 import {ethers} from "ethers";
 import {Op} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {
     StakingBlockSlash,
     StakingDelegation,
@@ -10,7 +9,7 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {GENESIS_VALIDATORS, VALIDATOR_ABI} from "./StakingAbi";
-import {getStakingCursor, stakingOption} from "./StakingSync";
+import {getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
  * What a block's commission depends on, per validator. _distributeRewards
@@ -77,7 +76,7 @@ export class CommissionModel {
     private provider: ethers.providers.JsonRpcProvider;
 
     constructor(private startBlock: number) {
-        this.provider = new ethers.providers.JsonRpcProvider(ConfigInstance.ether.url);
+        this.provider = new ethers.providers.JsonRpcProvider(stakingRpcUrl());
         for (const g of GENESIS_VALIDATORS[stakingOption().genesis] || []) {
             this.genesisOperator.set(g.address, g.operator);
         }
