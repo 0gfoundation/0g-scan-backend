@@ -1251,6 +1251,44 @@ paths:
             "application/json":
               schema:
                 $ref: "#/components/schemas/StakingResult"
+  /staking/restaking/rewards:
+    get:
+      tags:
+        - 'Staking'
+      description: "Restaking rewards: each block's withdrawals[1], credited straight to the recipient's balance (no contract involved), so they belong to the recipient and are not part of any validator's rewards. Cumulative and over [start, end). Without `address`, the total plus `addresses`, one row per recipient ranked by amount (over the range when given, else cumulative). Blocks paying nothing are not counted. Figures are collected from `startBlock` up to `asOfBlock` (both in the response). Amounts are wei."
+      parameters:
+        - name: address
+          in: query
+          description: "A recipient (withdrawals[1].address). Omit for all recipients."
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          description: "Unix timestamp in seconds, inclusive. Without it only cumulative figures are returned."
+          required: false
+          schema:
+            type: integer
+        - name: end
+          in: query
+          description: "Unix timestamp in seconds, exclusive. Default now; clamped to the collected data. The range is limited to 366 days."
+          required: false
+          schema:
+            type: integer
+        - name: interval
+          in: query
+          description: "`day` adds a per-UTC-day breakdown of the range."
+          required: false
+          schema:
+            type: string
+            enum: [day]
+      responses:
+        200:
+          description: ''
+          content:
+            "application/json":
+              schema:
+                $ref: "#/components/schemas/StakingResult"
   /staking/slashes:
     get:
       tags:

@@ -566,3 +566,45 @@ export class StakingCommissionCheck extends Model<IStakingCommissionCheck> imple
         })
     }
 }
+
+export interface IStakingRestakingDaily {
+    id?: number
+    day: string
+    /** withdrawals[1].address, the recipient */
+    address: string
+    blockCount: number
+    amount: string
+}
+
+/**
+ * Restaking rewards (withdrawals[1]) per UTC day and recipient. 0g-geth only
+ * credits the recipient's balance, through no contract, so the rewards belong
+ * to the recipient and not to the block's proposer; staking_reward_daily is
+ * keyed by proposer and cannot answer per recipient. Blocks paying nothing
+ * (recipient 0x0, amount 0) are not counted.
+ */
+export class StakingRestakingDaily extends Model<IStakingRestakingDaily> implements IStakingRestakingDaily {
+    id?: number;
+    day: string;
+    address: string;
+    blockCount: number;
+    amount: string;
+
+    static register(seq: Sequelize) {
+        StakingRestakingDaily.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            day: {type: DataTypes.DATEONLY, allowNull: false},
+            address: {type: DataTypes.STRING(42), allowNull: false},
+            blockCount: {type: DataTypes.INTEGER, allowNull: false, defaultValue: 0},
+            amount: {type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0},
+        }, {
+            sequelize: seq,
+            tableName: 'staking_restaking_daily',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_day_address', fields: ['day', 'address'], unique: true},
+                {name: 'idx_address_day', fields: ['address', 'day']},
+            ],
+        })
+    }
+}

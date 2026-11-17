@@ -90,6 +90,7 @@ import {
     getRewards,
     getTax,
     getFoundation,
+    getRestaking,
     getSlashes,
     getValidatorBlocks,
 } from "../service/OpenStakingService";
@@ -1158,6 +1159,7 @@ export function registerRouter(router: Router) {
     router.get('/staking/validator/blocks', getValidatorBlocks);
     router.get('/staking/community/tax', getTax);
     router.get('/staking/foundation/rewards', getFoundation);
+    router.get('/staking/restaking/rewards', getRestaking);
     router.get('/staking/slashes', getSlashes);
     router.get('/staking/delegator/validators', getDelegatorValidators);
     router.get('/staking/delegator/delegations/sum', getDelegatorDelegationSum);

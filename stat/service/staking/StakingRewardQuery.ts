@@ -1,7 +1,7 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
 import {KV} from "../../model/KV";
-import {StakingBlockReward, StakingBlockSlash, StakingRewardDaily, StakingValidator} from "../../model/Staking";
+import {StakingBlockReward, StakingBlockSlash, StakingRestakingDaily, StakingRewardDaily, StakingValidator} from "../../model/Staking";
 import {otherFoundationAddresses} from "./StakingBlockSync";
 import {staticProvider} from "./StakingRpc";
 import {blockRewardOption, stakingOption, stakingRpcUrl} from "./StakingSync";
@@ -285,6 +285,90 @@ export async function getFoundationRewards(opt: RangeOpt) {
     };
 }
 
+type Restaking = {blockCount: number, amount: bigint};
+type RestakingGrouped = Map<string, Restaking>;
+
+function mergeRestaking(into: RestakingGrouped, key: string, blockCount: number, amount: bigint) {
+    const t = into.get(key) || into.set(key, {blockCount: 0, amount: ZERO}).get(key);
+    t.blockCount += blockCount;
+    t.amount += amount;
+}
+
+/** restaking rewards over whole days [dayFrom, dayTo) from the daily table, by recipient or day */
+async function restakingFromDaily(groupBy: 'address' | 'day', address?: string, dayFrom?: number, dayTo?: number): Promise<RestakingGrouped> {
+    const cond = [], replacements = [];
+    if (address) { cond.push('address = ?'); replacements.push(address); }
+    if (dayFrom != null) { cond.push('day >= ?'); replacements.push(new Date(dayFrom).toISOString().slice(0, 10)); }
+    if (dayTo != null) { cond.push('day < ?'); replacements.push(new Date(dayTo).toISOString().slice(0, 10)); }
+    const key = groupBy === 'day' ? `date_format(day, '%Y-%m-%d')` : 'address';
+    const rows: any[] = await StakingRestakingDaily.sequelize.query(
+        `select ${key} as k, cast(sum(blockCount) as char) as n, cast(sum(amount) as char) as a
+         from ${StakingRestakingDaily.getTableName()} ${cond.length ? 'where ' + cond.join(' and ') : ''} group by k`,
+        {type: QueryTypes.SELECT, replacements});
+    const out: RestakingGrouped = new Map();
+    rows.forEach(r => mergeRestaking(out, r.k, Number(r.n), big(r.a)));
+    return out;
+}
+
+/** restaking rewards over [from, to) from the per-block table */
+async function restakingFromBlocks(groupBy: 'address' | 'day', address: string | undefined, from: number, to: number): Promise<RestakingGrouped> {
+    const out: RestakingGrouped = new Map();
+    if (from >= to) {
+        return out;
+    }
+    const key = groupBy === 'day' ? `date_format(createdAt, '%Y-%m-%d')` : 'restakingAddress';
+    const rows: any[] = await StakingBlockReward.sequelize.query(
+        `select ${key} as k, count(*) as n, cast(sum(restakingReward) as char) as a from ${StakingBlockReward.getTableName()}
+         where createdAt >= ? and createdAt < ? and restakingReward > 0${address ? ' and restakingAddress = ?' : ''} group by k`,
+        {type: QueryTypes.SELECT, replacements: [new Date(from), new Date(to), ...(address ? [address] : [])]});
+    rows.forEach(r => mergeRestaking(out, r.k, Number(r.n), big(r.a)));
+    return out;
+}
+
+async function restakingRange(groupBy: 'address' | 'day', address: string | undefined, from: number, to: number): Promise<RestakingGrouped> {
+    const firstDay = midnight(from) === from ? from : midnight(from) + DAY;
+    const lastDay = midnight(to);
+    if (firstDay >= lastDay) {
+        return restakingFromBlocks(groupBy, address, from, to);
+    }
+    const parts = await Promise.all([
+        restakingFromDaily(groupBy, address, firstDay, lastDay),
+        restakingFromBlocks(groupBy, address, from, firstDay),
+        restakingFromBlocks(groupBy, address, lastDay, to),
+    ]);
+    const out: RestakingGrouped = new Map();
+    parts.forEach(p => p.forEach((t, k) => mergeRestaking(out, k, t.blockCount, t.amount)));
+    return out;
+}
+
+/**
+ * (4) restaking rewards, i.e. withdrawals[1], per recipient. They are credited
+ * straight to the recipient's balance, so they are not part of any validator's
+ * rewards. Without `address`: the total plus one row per recipient, ranked by
+ * amount (over the range when one is given, else cumulative).
+ */
+export async function getRestakingRewards(opt: RangeOpt & {address?: string}) {
+    const head = await asOf();
+    const range = await resolveRange(opt, head.asOfTime);
+    const fmt = (t: Restaking) => ({amount: (t?.amount ?? ZERO).toString(), blockCount: t?.blockCount ?? 0});
+    const sum = (g: RestakingGrouped) => [...g.values()].reduce((s, t) => ({blockCount: s.blockCount + t.blockCount, amount: s.amount + t.amount}), {blockCount: 0, amount: ZERO});
+    const cumulative = await restakingFromDaily('address', opt.address);
+    const inRange = range ? await restakingRange('address', opt.address, range.from, range.to) : null;
+    const list = range && opt.interval === 'day' ? await restakingRange('day', opt.address, range.from, range.to) : null;
+    const rangeBody = range ? {
+        ...rangeHeader(range), ...fmt(sum(inRange)),
+        ...(list ? {list: [...list].sort(([a], [b]) => a.localeCompare(b)).map(([date, t]) => ({date, ...fmt(t)}))} : {}),
+    } : undefined;
+    if (opt.address) {
+        return {address: checksum(opt.address), ...head, cumulative: fmt(sum(cumulative)), ...(rangeBody ? {range: rangeBody} : {})};
+    }
+    const per = inRange || cumulative;
+    const addresses = [...per]
+        .sort(([, a], [, b]) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0))
+        .map(([address, t]) => ({address: checksum(address), ...fmt(t)}));
+    return {...head, cumulative: fmt(sum(cumulative)), ...(rangeBody ? {range: rangeBody} : {}), addresses};
+}
+
 /** slashes from the blocks' slashed arrays, newest first */
 export async function listSlashes(opt: {validator?: string, start?: Date, end?: Date, skip: number, limit: number}) {
     const where: any = {};
@@ -334,7 +418,8 @@ export async function listValidatorBlocks(opt: {validator: string, start?: Date,
             blockNumber: Number(r.blockNumber), timestamp: Math.floor(new Date(r.createdAt).getTime() / 1000),
             reward: String(r.reward), communityTax: String(r.communityTax), commission: String(r.commission),
             delegatorReward: (big(r.reward) - big(r.communityTax) - big(r.commission)).toString(),
-            restakingReward: String(r.restakingReward), foundationReward: String(r.foundationReward),
+            restakingAddress: checksum(r.restakingAddress), restakingReward: String(r.restakingReward),
+            foundationReward: String(r.foundationReward),
         })),
     };
 }

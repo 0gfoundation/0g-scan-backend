@@ -480,6 +480,8 @@ group by validator;
 
 **`staking_block_slash`**，罚没原样保存：`blockNumber`、`createdAt`、`position`、`slashIndex`、`validatorIndex`、`address`、`amount`（wei）、`validator`（= `address`，即被罚 validator 的合约地址；`slashIndex` 存证据高度，`validatorIndex` 存共识层编号）。唯一键 `(blockNumber, position)`。
 
+**`staking_restaking_daily`**（2026-11-17 新增），按 (UTC 日, 收款地址) 汇总 restaking 奖励：`day`、`address`、`blockCount`、`amount`，唯一键 `(day, address)`。`staking_reward_daily` 按出块 validator 分组，回答不了"某个收款地址收到多少"，所以单独建表。和逐块数据在同一个事务里累加；已经采集过逐块数据的部署，在第一轮时从逐块表一次性重建（KV `STAKING_RESTAKING_DAILY_BUILT`）。
+
 **`staking_reward_daily`**，按 (UTC 日, validator) 汇总，和逐块数据在同一个事务里累加：`day`、`validator`、`blockCount`、`reward`、`communityTax`、`commission`、`restakingReward`、`foundationReward`、`slashCount`、`slashedAmount`。唯一键 `(day, validator)`，一年约 4 万行。社区税和基金会奖励都按出块 validator 记，全网合计 = 所有行之和。
 
 **`staking_rate_timeline`**，佣金计算用的时间线：`validator`（社区税率用空字符串）、`fromBlock`、`kind`（`commission_rate` / `self_delegation_ok` / `community_tax_rate`）、`value`，以及 `source`（`event` / `state_read` / `bisect`）。
@@ -548,6 +550,23 @@ group by validator;
 
 如果 `withdrawals[2]` 出现过别的地址，响应里另加 `byAddress` 拆分。正常情况下只有一个地址。
 
+**（4）restaking 奖励**（2026-11-17 新增）—— `GET /restaking/rewards?address=&start=&end=&interval=`
+
+`withdrawals[1]` 由 geth 的 `ProcessRestakingDistribution` 直接加到收款地址的余额上，不经过任何合约，所以**只按收款地址统计，不计入出块 validator 的奖励**。主网最近约 10.3 万块：约 70% 的块没有 restaking 奖励（地址为零地址、金额为 0），其余轮流发给 3 个地址（都是 295 字节的代理合约），每个约 1,800 0G。
+
+```json
+{
+  "asOfBlock": 49344845, "asOfTime": 1793900000,
+  "cumulative": {"amount": "…", "blockCount": 33062},
+  "range": {"start": …, "end": …, "amount": "…", "blockCount": 17883, "list": [{"date": "2026-11-04", "amount": "…", "blockCount": 13164}]},
+  "addresses": [{"address": "0x8163…36b5", "amount": "…", "blockCount": 11370}]
+}
+```
+
+- 不带 `address` 时返回全网合计，外加 `addresses`，每个收款地址一行，按金额排序；有时间段时按时间段排，没有就按累计排。
+- 数据来自新表 `staking_restaking_daily`（见数据模型）；时间段的整天部分读日汇总表，零头查逐块表。
+- 不发奖励的块不计入。
+
 **明细接口**（保留）：
 - `GET /slashes?validator=&start=&end=&skip=&limit=`：罚没明细；
 - `GET /validator/blocks?address=&start=&end=&skip=&limit=`：某 validator 出的块，以及每块的 `reward` / `communityTax` / `commission`。
@@ -562,7 +581,7 @@ group by validator;
 | `StakingBlockSync.ts` | 逐块采集：JSON-RPC 批量取块（每批 50）、解析 `withdrawals[0..2]` 和 `slashed`、算社区税和佣金、写逐块表和日汇总、推进游标（不超过事件游标）；每轮与 CL 累计 `rewards` 对账 |
 | `StakingCommission.ts` | 佣金：费率由 `CommissionRateChanged` 推出；是否达标在可能跳变的块上读历史状态判断，结果缓存在 `staking_self_delegation`，读不到时退回估算（`source = approx`） |
 | `StakingRewardQuery.ts` | 5 个接口的查询：时间段的完整天查日汇总表，两端零头查逐块表 |
-| `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/slashes`、`/validator/blocks`；`/validators` 和 `/validator` 带累计 `rewards` |
+| `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/restaking/rewards`（2026-11-17）、`/slashes`、`/validator/blocks`（每块带 `restakingAddress`）；`/validators` 和 `/validator` 带累计 `rewards` |
 | `StakingCheck.ts` | 佣金检查点对账、社区税率检查、新鲜度告警；每轮逐块采集后调用 |
 | `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check`（立即在游标处打一个检查点）、`check-commission <validator> <from> <to>` |
 | `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`）、`checkIntervalSec`（默认 3600）、`freshnessAlertSec`（默认 600） |
@@ -634,6 +653,10 @@ group by validator;
    - 新鲜度：游标块落后约 89,000 秒时告警。
    - 读不到状态：让 `eth_call` 一律返回 `missing trie node` 时，检查点推迟、不写入；回灌期间之后的轮次直接跳过。
    - 公共 RPC 读历史状态时好时坏：这次读得到 49,240,000 这样一天前的块。
+
+9. **restaking 奖励**（2026-11-17，本地主网库）：
+   - 从已有的 103,068 块重建日汇总表，再增量采集 5,000 块。按（日，收款地址）和逐块表逐行对比，0 处不一致；CL 对账仍然逐 gwei 一致。
+   - 接口的累计、跨日期的时间段（按天分组）、单个地址、一小时的零头，都和直接用 SQL 从逐块表算出的结果一致。
 
 ## 验证（仓库没有测试套件）
 

@@ -24,6 +24,7 @@ import {
 import {
     getCommunityTax,
     getFoundationRewards,
+    getRestakingRewards,
     getValidatorRewards,
     listSlashes,
     listValidatorBlocks,
@@ -254,6 +255,11 @@ export async function getTax(ctx) {
 
 export async function getFoundation(ctx) {
     setBody(ctx, await getFoundationRewards(rewardRange(ctx.query)));
+}
+
+export async function getRestaking(ctx) {
+    const q = ctx.query;
+    setBody(ctx, await getRestakingRewards({address: address(q, 'address', false), ...rewardRange(q)}));
 }
 
 export async function getSlashes(ctx) {

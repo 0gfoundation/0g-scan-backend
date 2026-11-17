@@ -5,6 +5,7 @@ import {
     IStakingBlockSlash,
     StakingBlockReward,
     StakingBlockSlash,
+    StakingRestakingDaily,
     StakingRewardDaily,
     StakingValidator,
 } from "../../model/Staking";
@@ -42,6 +43,8 @@ const KEY_CL_BASE = 'STAKING_BLOCK_REWARD_CL_BASE';
 const SENTINEL = '0xffffffffffffffff';
 /** JSON array of withdrawals[2] recipients other than the configured foundation address */
 const KEY_OTHER_FOUNDATION = 'STAKING_FOUNDATION_OTHER_ADDRESSES';
+/** set once staking_restaking_daily holds everything the per-block table does */
+const KEY_RESTAKING_BUILT = 'STAKING_RESTAKING_DAILY_BUILT';
 const GWEI = BigInt(1e9);
 const RATE_BASE = BigInt(1_000_000);
 const BLOCKS_PER_ROUND = 1000;
@@ -193,9 +196,48 @@ async function addDaily(map: Map<string, Daily>, dbTx: Transaction) {
         {type: QueryTypes.INSERT, replacements, transaction: dbTx});
 }
 
+async function addRestakingDaily(map: Map<string, {blockCount: number, amount: bigint}>, dbTx: Transaction) {
+    if (!map.size) {
+        return;
+    }
+    const values = [], replacements = [];
+    for (const [k, d] of map) {
+        const [day, address] = k.split('|');
+        values.push('(?,?,?,?)');
+        replacements.push(day, address, d.blockCount, d.amount.toString());
+    }
+    await StakingRestakingDaily.sequelize.query(
+        `insert into ${StakingRestakingDaily.getTableName()} (day, address, blockCount, amount) values ${values.join(',')}
+         on duplicate key update blockCount = blockCount + values(blockCount), amount = amount + values(amount)`,
+        {type: QueryTypes.INSERT, replacements, transaction: dbTx});
+}
+
+/**
+ * staking_restaking_daily came after staking_block_reward, so a deployment
+ * that already collected blocks gets it built from them once; from then on
+ * each round adds to it in the same transaction as its blocks.
+ */
+async function buildRestakingDaily() {
+    if (await KV.getString(KEY_RESTAKING_BUILT, '')) {
+        return;
+    }
+    await StakingBlockReward.sequelize.transaction(async dbTx => {
+        await StakingRestakingDaily.destroy({where: {}, transaction: dbTx});
+        await StakingRestakingDaily.sequelize.query(
+            `insert into ${StakingRestakingDaily.getTableName()} (day, address, blockCount, amount)
+             select date(createdAt), restakingAddress, count(*), sum(restakingReward)
+             from ${StakingBlockReward.getTableName()} where restakingReward > 0
+             group by date(createdAt), restakingAddress`,
+            {type: QueryTypes.INSERT, transaction: dbTx});
+        await KV.upsert({key: KEY_RESTAKING_BUILT, value: new Date().toISOString()}, {transaction: dbTx});
+    });
+    console.log(`staking blocks: built staking_restaking_daily from the collected blocks`);
+}
+
 /** One round. Returns true when caught up with the event sync. */
 export async function stakingBlockSyncOnce(): Promise<boolean> {
     const opt = blockRewardOption();
+    await buildRestakingDaily();
     const cursor = await getBlockRewardCursor();
     if (await KV.getString(KEY_CL_BASE, '') === '') {
         const base = await clRewards(opt.startBlock - 1).catch(e => {
@@ -239,7 +281,14 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
     const rewards: IStakingBlockReward[] = [];
     const slashes: IStakingBlockSlash[] = [];
     const daily = new Map<string, Daily>();
+    const restaking = new Map<string, {blockCount: number, amount: bigint}>();
     for (const {reward: r, slashes: ss} of parsed) {
+        if (r && BigInt(r.restakingReward) > BigInt(0)) {
+            const k = `${r.createdAt.toISOString().slice(0, 10)}|${r.restakingAddress}`;
+            const d = restaking.get(k) || restaking.set(k, {blockCount: 0, amount: BigInt(0)}).get(k);
+            d.blockCount++;
+            d.amount += BigInt(r.restakingReward);
+        }
         if (r) {
             const reward = BigInt(r.reward);
             const tax = reward * opt.communityTaxRate / RATE_BASE;
@@ -273,6 +322,7 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
         if (rewards.length) await StakingBlockReward.bulkCreate(rewards, {transaction: dbTx});
         if (slashes.length) await StakingBlockSlash.bulkCreate(slashes, {transaction: dbTx});
         await addDaily(daily, dbTx);
+        await addRestakingDaily(restaking, dbTx);
         const others = parsed.map(p => p.otherFoundation).filter(Boolean);
         if (others.length) {
             const seen = await otherFoundationAddresses(dbTx);

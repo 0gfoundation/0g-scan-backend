@@ -5,7 +5,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
-import {staticBatchProvider} from "./StakingRpc";
+import {staticBatchProvider, withRateRetry} from "./StakingRpc";
 import {getStakingCursor, stakingOption, stakingRpcUrl, trackedBeacon, withStakingLock} from "./StakingSync";
 
 /**
@@ -27,16 +27,15 @@ const MAX_STATE_LAG = 64;
 const FULL_RECONCILE_INTERVAL = 3600 * SECOND;
 /**
  * The batch provider sends every call issued in the same tick as one JSON-RPC
- * batch, and the 0G RPCs reject the part of a batch beyond 50 calls with
- * -32005 "request rate exceeded" (ethers then reports a bare CALL_EXCEPTION).
- * Chunk sizes keep each batch under that: up to 16 calls per validator when
- * refreshing state (3 x 16 = 48), 2 per validator per step in the share check,
- * 1 per delegation when reconciling.
+ * batch. The 0G RPCs allow ~50 calls per IP and window, shared with whatever
+ * else runs on the host, and report a rejection as -32005 (which ethers wraps
+ * in a bare CALL_EXCEPTION). Chunks keep batches well under that: 16 calls
+ * for one validator's state, 2 per validator per step in the share check, 1
+ * per delegation when reconciling. Rejections are waited out (StakingRpc).
  */
-const CHUNK_STATE = 3;
+const CHUNK_STATE = 1;
 const CHUNK_SHARE_CHECK = 10;
-const CHUNK_RECONCILE = 40;
-const RATE_LIMIT_RETRIES = 5;
+const CHUNK_RECONCILE = 20;
 
 const ctx = {
     provider: null as ethers.providers.JsonRpcBatchProvider,
@@ -61,24 +60,7 @@ async function inChunks<T>(list: T[], size: number, fn: (t: T) => Promise<any>) 
     }
 }
 
-function isRateLimited(e: any): boolean {
-    const text = `${e?.message || ''} ${JSON.stringify(e?.error || '')}`;
-    return /-32005|rate exceeded|too many requests/i.test(text);
-}
-
-/** Retries RPC calls rejected by the rate limit, backing off 200ms, 400ms, ... */
-async function rpc<T>(fn: () => Promise<T>): Promise<T> {
-    for (let attempt = 0; ; attempt++) {
-        try {
-            return await fn();
-        } catch (e) {
-            if (attempt >= RATE_LIMIT_RETRIES || !isRateLimited(e)) {
-                throw e;
-            }
-            await new Promise(r => setTimeout(r, 200 * 2 ** attempt));
-        }
-    }
-}
+const rpc = withRateRetry;
 
 const lower = (a: string) => (a || '').toLowerCase();
 const str = (v: any) => v.toString();
