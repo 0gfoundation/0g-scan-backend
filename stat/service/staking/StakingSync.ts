@@ -5,7 +5,7 @@ import {KV} from "../../model/KV";
 import {IStakingEvent, StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {ethers} from "ethers";
-import {initEthSdk, SECOND} from "../common/utils";
+import {SECOND} from "../common/utils";
 import {
     decodeStakingLog,
     DecodedStakingEvent,
@@ -17,6 +17,7 @@ import {
     TOPIC,
     VALIDATOR_TOPICS,
 } from "./StakingAbi";
+import {isRateLimited, postBatch, staticProvider, withRateRetry} from "./StakingRpc";
 
 /**
  * Forward sync of the 0G staking contracts into staking_validator /
@@ -80,7 +81,8 @@ export function blockRewardOption() {
     return {
         enabled: !!o.enabled,
         startBlock: o.startBlock ?? WITHDRAWAL_ACTIVATION_BLOCK,
-        batchSize: o.batchSize ?? 50,
+        // 20 x 2 in flight stays under the RPC's ~50 calls per IP and window
+        batchSize: o.batchSize ?? 20,
         concurrency: o.concurrency ?? 2,
         foundationAddress: (o.foundationAddress || FOUNDATION_ADDRESS).toLowerCase(),
         communityTaxRate: BigInt(o.communityTaxRate ?? 100_000),
@@ -121,7 +123,7 @@ export async function getStakingCursor(): Promise<number> {
 
 export async function initStakingSync() {
     const opt = stakingOption();
-    ctx.provider = initEthSdk(stakingRpcUrl());
+    ctx.provider = stakingRpcUrl() ? staticProvider(stakingRpcUrl()) : null;
     if (!ctx.provider) {
         throw new Error(`staking sync needs config.ether.url (an eth_* JSON-RPC; _ETH_RPC in scan.env)`);
     }
@@ -165,7 +167,7 @@ async function seedGenesis(network: string) {
 }
 
 async function safeHead(): Promise<number> {
-    return (await ctx.provider.getBlockNumber()) - stakingOption().confirmations;
+    return (await withRateRetry(() => ctx.provider.getBlockNumber())) - stakingOption().confirmations;
 }
 
 /**
@@ -173,9 +175,9 @@ async function safeHead(): Promise<number> {
  * ("invalid address or ENS name"), and the validator query needs one.
  */
 async function getLogs(address: string | string[], topics: string[], from: number, to: number): Promise<RawLog[]> {
-    const logs: any[] = await ctx.provider.send('eth_getLogs', [{
+    const logs: any[] = await withRateRetry(() => ctx.provider.send('eth_getLogs', [{
         address, topics: [topics], fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16),
-    }]);
+    }]));
     return logs.map(l => ({
         address: l.address,
         topics: l.topics,
@@ -207,7 +209,7 @@ async function getLogs(address: string | string[], topics: string[], from: numbe
 const implementations = new Map<string, {emitsExited: boolean, selfDelegation: 'delegated-tokens' | 'shares-tokens'}>();
 async function classifyImplementation(impl: string) {
     if (!implementations.has(impl)) {
-        const code = (await ctx.provider.getCode(impl)).toLowerCase();
+        const code = (await withRateRetry(() => ctx.provider.getCode(impl))).toLowerCase();
         if (code === '0x') {
             throw new Error(`implementation ${impl} has no code`);
         }
@@ -306,7 +308,8 @@ async function applyShareDeltas(map: Map<string, ShareDelta>, dbTx: Transaction)
 }
 
 /** the 0G RPCs reject the part of a JSON-RPC batch beyond 50 calls */
-const BLOCK_BATCH = 50;
+/** calls per JSON-RPC batch: the 0G RPCs allow ~50 per IP and window, shared with everything else on the host */
+const BLOCK_BATCH = 20;
 
 /**
  * Block timestamps, fetched in JSON-RPC batches: one request per block made a
@@ -316,15 +319,12 @@ async function blockTimes(numbers: number[]): Promise<Map<number, Date>> {
     const out = new Map<number, Date>();
     for (let i = 0; i < numbers.length; i += BLOCK_BATCH) {
         const chunk = numbers.slice(i, i + BLOCK_BATCH);
-        const body = chunk.map((n, id) => ({jsonrpc: '2.0', id, method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
+        const calls = chunk.map(n => ({method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
         for (let attempt = 0; ; attempt++) {
             try {
-                const resp: any[] = await (await fetch(stakingRpcUrl(), {
-                    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
-                })).json();
-                const byId = new Map(resp.map(r => [r.id, r]));
+                const resp = await postBatch(stakingRpcUrl(), calls);
                 chunk.forEach((n, id) => {
-                    const r = byId.get(id);
+                    const r = resp[id];
                     if (!r?.result) {
                         throw new Error(`block ${n}: ${JSON.stringify(r?.error || 'missing')}`);
                     }
@@ -368,7 +368,7 @@ async function commissionJump(validator: string, block: number): Promise<string 
     const c = new ethers.Contract(validator, ['function commission() view returns (uint256)'], ctx.provider);
     for (let attempt = 0; attempt < 6; attempt++) {
         try {
-            const [before, after] = await Promise.all([c.commission({blockTag: block - 1}), c.commission({blockTag: block})]);
+            const [before, after] = await withRateRetry(() => Promise.all([c.commission({blockTag: block - 1}), c.commission({blockTag: block})]));
             return (BigInt(after.toString()) - BigInt(before.toString())).toString();
         } catch (e) {
             if (!/missing trie node|is not available|header not found/i.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
@@ -556,9 +556,14 @@ export async function runStakingSync() {
         const caughtUp = await stakingSyncOnce();
         delay = caughtUp ? SECOND * 5 : 0;
     } catch (e) {
-        // most RPC failures here are an oversized getLogs window
-        ctx.range = Math.max(1, Math.floor(ctx.range / 2));
-        console.log(`staking sync failed, window now ${ctx.range} blocks:`, e?.message || e);
+        // a rate-limit rejection that outlasted the retries says nothing about
+        // the window; other failures here are mostly an oversized getLogs window
+        if (isRateLimited(e)) {
+            console.log(`staking sync: still rate limited after retries, window stays ${ctx.range} blocks`);
+        } else {
+            ctx.range = Math.max(1, Math.floor(ctx.range / 2));
+            console.log(`staking sync failed, window now ${ctx.range} blocks:`, e?.message || e);
+        }
         safeAddErrorLog('staking', 'sync', e);
         delay = SECOND * 10;
     }

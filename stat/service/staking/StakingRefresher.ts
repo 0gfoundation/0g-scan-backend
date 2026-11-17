@@ -5,6 +5,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
+import {staticBatchProvider} from "./StakingRpc";
 import {getStakingCursor, stakingOption, stakingRpcUrl, trackedBeacon, withStakingLock} from "./StakingSync";
 
 /**
@@ -45,7 +46,7 @@ const ctx = {
 function provider() {
     if (!ctx.provider) {
         // batches the per-validator view calls issued in the same tick
-        ctx.provider = new ethers.providers.JsonRpcBatchProvider(stakingRpcUrl());
+        ctx.provider = staticBatchProvider(stakingRpcUrl());
     }
     return ctx.provider;
 }

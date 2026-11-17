@@ -3,6 +3,7 @@ import {Op, QueryTypes} from "sequelize";
 import {KV} from "../../model/KV";
 import {StakingBlockReward, StakingBlockSlash, StakingRewardDaily, StakingValidator} from "../../model/Staking";
 import {otherFoundationAddresses} from "./StakingBlockSync";
+import {staticProvider} from "./StakingRpc";
 import {blockRewardOption, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
@@ -229,7 +230,7 @@ let communityPool: string = null;
 async function communityPoolAddress(): Promise<string> {
     if (!communityPool) {
         const staking = new ethers.Contract(stakingOption().contract,
-            ['function communityPoolAddress() view returns (address)'], new ethers.providers.JsonRpcProvider(stakingRpcUrl()));
+            ['function communityPoolAddress() view returns (address)'], staticProvider(stakingRpcUrl()));
         communityPool = await staking.communityPoolAddress().catch(() => null);
     }
     return communityPool;

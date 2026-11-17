@@ -43,7 +43,7 @@ export interface StakingOption {
         // first block to collect; mainnet withdrawals start at 10,877,918. A later
         // start only covers part of the history: cumulative figures then count from it.
         startBlock?: number,
-        batchSize?: number, // blocks per JSON-RPC batch, default 50 (the 0G RPCs reject more)
+        batchSize?: number, // blocks per JSON-RPC batch, default 20; the 0G RPCs allow ~50 calls per IP and window
         concurrency?: number, // batches in flight, default 2
         foundationAddress?: string, // expected withdrawals[2].address, default 0x711b...2522
         communityTaxRate?: number, // raw, 1e6 = 100%; default 100000 (10%)

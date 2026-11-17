@@ -12,6 +12,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {CommissionModel} from "./StakingCommission";
 import {runChecks} from "./StakingCheck";
+import {postBatch} from "./StakingRpc";
 import {blockRewardOption, getStakingCursor, stakingRpcUrl, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
 
 /**
@@ -61,25 +62,20 @@ export async function getBlockRewardCursor(): Promise<number> {
     return (await KV.getNumber(KEY_CURSOR)) ?? blockRewardOption().startBlock - 1;
 }
 
+/** rate-limit rejections are retried inside postBatch; this retries the rest (dropped connections, a lagging node) */
 async function rpcBatch(calls: {method: string, params: any[]}[]): Promise<any[]> {
-    const body = calls.map((c, id) => ({jsonrpc: '2.0', id, ...c}));
     for (let attempt = 0; ; attempt++) {
         try {
-            const resp = await fetch(stakingRpcUrl(), {
-                method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
-            });
-            const json: any[] = await resp.json();
-            const byId = new Map(json.map(r => [r.id, r]));
-            const failed = json.find(r => r.error);
+            const res = await postBatch(stakingRpcUrl(), calls);
+            const failed = res.find(r => r.error);
             if (failed) {
                 throw new Error(`rpc error: ${JSON.stringify(failed.error)}`);
             }
-            return calls.map((_, id) => byId.get(id)?.result);
+            return res.map(r => r.result);
         } catch (e) {
             if (attempt >= RPC_RETRIES) {
                 throw e;
             }
-            // mostly -32005 "request rate exceeded" or a dropped connection
             await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
         }
     }

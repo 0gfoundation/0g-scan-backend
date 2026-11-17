@@ -9,6 +9,7 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {GENESIS_VALIDATORS, VALIDATOR_ABI} from "./StakingAbi";
+import {staticProvider, withRateRetry} from "./StakingRpc";
 import {getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
@@ -76,7 +77,7 @@ export class CommissionModel {
     private provider: ethers.providers.JsonRpcProvider;
 
     constructor(private startBlock: number) {
-        this.provider = new ethers.providers.JsonRpcProvider(stakingRpcUrl());
+        this.provider = staticProvider(stakingRpcUrl());
         for (const g of GENESIS_VALIDATORS[stakingOption().genesis] || []) {
             this.genesisOperator.set(g.address, g.operator);
         }
@@ -300,12 +301,12 @@ export class CommissionModel {
         for (let attempt = 0; attempt < STATE_READ_ATTEMPTS; attempt++) {
             try {
                 if (formula === 'delegated-tokens') {
-                    const [tokens, minSelf] = await Promise.all([c.getDelegatedTokens(owner, at), c.minSelfDelegationInGwei(at)]);
+                    const [tokens, minSelf] = await withRateRetry(() => Promise.all([c.getDelegatedTokens(owner, at), c.minSelfDelegationInGwei(at)]));
                     return BigInt(tokens.toString()) >= BigInt(minSelf.toString()) * BigInt(1e9);
                 }
-                const [[, shares], tokens, total, minSelf] = await Promise.all([
+                const [[, shares], tokens, total, minSelf] = await withRateRetry(() => Promise.all([
                     c.getDelegation(owner, at), c.tokens(at), c.delegatorShares(at), c.minSelfDelegationInGwei(at),
-                ]);
+                ]));
                 return sharesTokensOk(BigInt(shares.toString()), BigInt(tokens.toString()), BigInt(total.toString()), BigInt(minSelf.toString()));
             } catch (e) {
                 if (!STATE_UNAVAILABLE.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {

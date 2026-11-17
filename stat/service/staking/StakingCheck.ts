@@ -10,6 +10,7 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
+import {postBatch} from "./StakingRpc";
 import {blockRewardOption, getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
@@ -56,23 +57,18 @@ async function callsAt(calls: {to: string, data: string}[], block: number): Prom
     const out: string[] = [];
     const tag = '0x' + block.toString(16);
     for (let i = 0; i < calls.length; i += CALLS_PER_BATCH) {
-        const body = calls.slice(i, i + CALLS_PER_BATCH).map((c, id) => ({jsonrpc: '2.0', id, method: 'eth_call', params: [c, tag]}));
+        const batch = calls.slice(i, i + CALLS_PER_BATCH).map(c => ({method: 'eth_call', params: [c, tag]}));
         for (let attempt = 0; ; attempt++) {
-            let json: any[];
+            let res: {result?: any, error?: any}[];
             try {
-                const resp = await fetch(stakingRpcUrl(), {
-                    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
-                });
-                json = await resp.json();
-                if (!Array.isArray(json)) {
-                    throw new Error(`rpc: ${JSON.stringify(json).slice(0, 200)}`);
-                }
+                // rate-limit rejections are retried inside postBatch
+                res = await postBatch(stakingRpcUrl(), batch);
             } catch (e) {
                 if (attempt >= RPC_RETRIES) throw e;
                 await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
                 continue;
             }
-            const failed = json.find(r => r.error);
+            const failed = res.find(r => r.error);
             if (failed) {
                 // only some nodes behind the public RPC keep history: retry, then give up
                 const msg = JSON.stringify(failed.error);
@@ -82,8 +78,7 @@ async function callsAt(calls: {to: string, data: string}[], block: number): Prom
                 await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
                 continue;
             }
-            const byId = new Map(json.map(r => [r.id, r.result]));
-            body.forEach(b => out.push(byId.get(b.id)));
+            res.forEach(r => out.push(r.result));
             break;
         }
     }

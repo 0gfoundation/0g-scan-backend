@@ -9,6 +9,7 @@ import {StakingBlockReward, StakingEvent, StakingEventType} from "../../model/St
 import {getBlockRewardCursor, reconcileBlockRewards, runStakingBlockSync, stakingBlockSyncOnce} from "./StakingBlockSync";
 import {VALIDATOR_ABI} from "./StakingAbi";
 import {commissionCheckOnce} from "./StakingCheck";
+import {staticProvider} from "./StakingRpc";
 import {
     blockRewardOption,
     getStakingCursor,
@@ -108,7 +109,7 @@ if (module === require.main) {
  * Ours: the per-block commission collected for those blocks.
  */
 async function checkCommission(validator: string, from: number, to: number) {
-    const c = new ethers.Contract(validator, VALIDATOR_ABI, new ethers.providers.JsonRpcProvider(stakingRpcUrl()));
+    const c = new ethers.Contract(validator, VALIDATOR_ABI, staticProvider(stakingRpcUrl()));
     const [before, after] = await Promise.all([c.commission({blockTag: from - 1}), c.commission({blockTag: to})]);
     const [w]: any[] = await StakingEvent.sequelize.query(
         `select cast(coalesce(sum(amount), 0) as char) as s from ${StakingEvent.getTableName()}
