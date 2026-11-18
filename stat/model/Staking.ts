@@ -303,6 +303,14 @@ export interface IStakingBlockReward {
     communityTax: string
     /** reward * commissionRate / 1e6 while the owner meets minSelfDelegation, else 0 */
     commission: string
+    /**
+     * The whole reward when the distribution reverted: _distributeRewards
+     * requires communityTaxRate + commissionRate <= 100%, and 0g-geth credits
+     * the validator contract's balance before calling it, so the reward stays in
+     * the contract unaccounted (no tax, no commission, no delegator rewards).
+     * Mainnet: 0x47d2...7de5 at a 100% rate until block 12,885,933. Else 0.
+     */
+    undistributed?: string
     /** withdrawals[1]: the recipient varies by block, so it is kept */
     restakingAddress: string
     restakingReward: string
@@ -321,6 +329,7 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
     reward: string;
     communityTax: string;
     commission: string;
+    undistributed?: string;
     restakingAddress: string;
     restakingReward: string;
     foundationReward: string;
@@ -334,6 +343,7 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
             reward: amount(),
             communityTax: amount(),
             commission: amount(),
+            undistributed: amount(),
             restakingAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
             restakingReward: amount(),
             foundationReward: amount(),
@@ -406,6 +416,7 @@ export interface IStakingRewardDaily {
     reward: string
     communityTax: string
     commission: string
+    undistributed?: string
     restakingReward: string
     foundationReward: string
     slashCount: number
@@ -425,6 +436,7 @@ export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IS
     reward: string;
     communityTax: string;
     commission: string;
+    undistributed?: string;
     restakingReward: string;
     foundationReward: string;
     slashCount: number;
@@ -440,6 +452,7 @@ export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IS
             reward: amount(),
             communityTax: amount(),
             commission: amount(),
+            undistributed: amount(),
             restakingReward: amount(),
             foundationReward: amount(),
             slashCount: {type: DataTypes.INTEGER({unsigned: true}), allowNull: false, defaultValue: 0},
@@ -562,6 +575,48 @@ export class StakingCommissionCheck extends Model<IStakingCommissionCheck> imple
                 {name: 'uk_block_validator', fields: ['blockNumber', 'validator'], unique: true},
                 {name: 'idx_validator_block', fields: ['validator', 'blockNumber']},
                 {name: 'idx_status', fields: ['status']},
+            ],
+        })
+    }
+}
+
+export interface IStakingRestakingDaily {
+    id?: number
+    day: string
+    /** withdrawals[1].address, the recipient */
+    address: string
+    blockCount: number
+    amount: string
+}
+
+/**
+ * Restaking rewards (withdrawals[1]) per UTC day and recipient. 0g-geth only
+ * credits the recipient's balance, through no contract, so the rewards belong
+ * to the recipient and not to the block's proposer; staking_reward_daily is
+ * keyed by proposer and cannot answer per recipient. Blocks paying nothing
+ * (recipient 0x0, amount 0) are not counted.
+ */
+export class StakingRestakingDaily extends Model<IStakingRestakingDaily> implements IStakingRestakingDaily {
+    id?: number;
+    day: string;
+    address: string;
+    blockCount: number;
+    amount: string;
+
+    static register(seq: Sequelize) {
+        StakingRestakingDaily.init({
+            id: {type: DataTypes.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true},
+            day: {type: DataTypes.DATEONLY, allowNull: false},
+            address: {type: DataTypes.STRING(42), allowNull: false},
+            blockCount: {type: DataTypes.INTEGER, allowNull: false, defaultValue: 0},
+            amount: {type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0},
+        }, {
+            sequelize: seq,
+            tableName: 'staking_restaking_daily',
+            timestamps: false,
+            indexes: [
+                {name: 'uk_day_address', fields: ['day', 'address'], unique: true},
+                {name: 'idx_address_day', fields: ['address', 'day']},
             ],
         })
     }

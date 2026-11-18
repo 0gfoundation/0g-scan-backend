@@ -5,17 +5,19 @@ import {diffWithXangle} from "./StakingDiff";
 import {reconcileAllShares, runStakingRefresher, stakingRefreshOnce} from "./StakingRefresher";
 import {ethers} from "ethers";
 import {QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {StakingBlockReward, StakingEvent, StakingEventType} from "../../model/Staking";
 import {getBlockRewardCursor, reconcileBlockRewards, runStakingBlockSync, stakingBlockSyncOnce} from "./StakingBlockSync";
 import {VALIDATOR_ABI} from "./StakingAbi";
 import {commissionCheckOnce} from "./StakingCheck";
+import {accuracyReport} from "./StakingReport";
+import {staticProvider} from "./StakingRpc";
 import {
     blockRewardOption,
     getStakingCursor,
     initStakingSync,
     runStakingSync,
     stakingOption,
+    stakingRpcUrl,
     stakingSyncOnce,
 } from "./StakingSync";
 
@@ -50,6 +52,7 @@ export async function startStaking() {
  *   reconcile         full reconciliation at the cursor block only
  *   diff <xangleDir>  compare with the Xangle indexer's Mongo exports
  *   blocks            collect block rewards until caught up with the event sync, then reconcile
+ *   report            whether the data can be signed off as complete and exact; exits 2 when not
  *   check             write a commission / tax-rate checkpoint at the block-reward cursor now
  *                     and compare it with the previous one (needs state at the cursor block)
  *   check-commission <validator> <fromBlock> <toBlock>
@@ -83,6 +86,13 @@ async function main() {
         }, 'blocks');
         console.log(`block rewards caught up at ${await getBlockRewardCursor()}`);
         console.log(`reconciliation:`, await reconcileBlockRewards());
+    } else if (cmd === 'report') {
+        const r = await accuracyReport();
+        r.checks.forEach(c => console.log(`${c.status.toUpperCase().padEnd(4)}  ${c.name.padEnd(32)} ${c.detail}`));
+        console.log(r.pass ? 'PASS: complete and exact as far as checked' : 'FAIL: see the checks above');
+        if (!r.pass) {
+            process.exitCode = 2;
+        }
     } else if (cmd === 'check') {
         const r = await commissionCheckOnce(await getBlockRewardCursor(), true);
         console.log(r ? JSON.stringify(r, null, 2) : 'nothing to check: no new collected blocks since the last checkpoint');
@@ -96,7 +106,8 @@ async function main() {
 if (module === require.main) {
     // no redirectLog: these are interactive, the output belongs on the terminal
     regExitHook();
-    main().then(() => process.exit(0)).catch(e => {
+    // process.exit() keeps an exitCode set by the command (report)
+    main().then(() => process.exit()).catch(e => {
         console.log(e);
         process.exit(1);
     });
@@ -108,7 +119,7 @@ if (module === require.main) {
  * Ours: the per-block commission collected for those blocks.
  */
 async function checkCommission(validator: string, from: number, to: number) {
-    const c = new ethers.Contract(validator, VALIDATOR_ABI, new ethers.providers.JsonRpcProvider(ConfigInstance.ether.url));
+    const c = new ethers.Contract(validator, VALIDATOR_ABI, staticProvider(stakingRpcUrl()));
     const [before, after] = await Promise.all([c.commission({blockTag: from - 1}), c.commission({blockTag: to})]);
     const [w]: any[] = await StakingEvent.sequelize.query(
         `select cast(coalesce(sum(amount), 0) as char) as s from ${StakingEvent.getTableName()}

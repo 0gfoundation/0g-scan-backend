@@ -24,11 +24,13 @@ import {
 import {
     getCommunityTax,
     getFoundationRewards,
+    getRestakingRewards,
     getValidatorRewards,
     listSlashes,
     listValidatorBlocks,
     RewardSort,
 } from "../../stat/service/staking/StakingRewardQuery";
+import {blockRewardOption, stakingOption} from "../../stat/service/staking/StakingSync";
 import {setBody} from "../router/middleware";
 
 /**
@@ -39,6 +41,28 @@ import {setBody} from "../router/middleware";
 
 const MAX_SUM_RANGE_DAYS = 366;
 const MAX_ACTIVITY_DAYS = 30;
+
+/**
+ * Route guards. The routes are always registered, so a deployment without the
+ * index would otherwise answer with empty lists and zeros, indistinguishable
+ * from "nothing staked". These say what is missing instead.
+ */
+export async function requireStaking(ctx, next) {
+    if (!stakingOption().enabled) {
+        setBody(ctx, null, 503, 'staking index is not enabled on this deployment');
+        return;
+    }
+    await next();
+}
+
+/** for the endpoints built on the per-block collection (staking.blockRewards) */
+export async function requireBlockRewards(ctx, next) {
+    if (!blockRewardOption().enabled) {
+        setBody(ctx, null, 503, 'block rewards are not collected on this deployment');
+        return;
+    }
+    await next();
+}
 
 function paramError(message: string): never {
     throw new Errors.ParameterError(message);
@@ -254,6 +278,11 @@ export async function getTax(ctx) {
 
 export async function getFoundation(ctx) {
     setBody(ctx, await getFoundationRewards(rewardRange(ctx.query)));
+}
+
+export async function getRestaking(ctx) {
+    const q = ctx.query;
+    setBody(ctx, await getRestakingRewards({address: address(q, 'address', false), ...rewardRange(q)}));
 }
 
 export async function getSlashes(ctx) {

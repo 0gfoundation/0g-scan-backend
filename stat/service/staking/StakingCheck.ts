@@ -1,6 +1,5 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {KV} from "../../model/KV";
 import {
     IStakingCommissionCheck,
@@ -11,7 +10,8 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
-import {blockRewardOption, getStakingCursor, stakingOption} from "./StakingSync";
+import {postBatch} from "./StakingRpc";
+import {blockRewardOption, getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
 
 /**
  * Checks run alongside the block sync (PLAN.md "对账与告警"):
@@ -50,30 +50,25 @@ const ctx = {
     lastDeferLog: 0,
 };
 
-class StateUnavailable extends Error {}
+export class StateUnavailable extends Error {}
 
 /** eth_call results at `block`, in order; '0x' for an address with no code there */
 async function callsAt(calls: {to: string, data: string}[], block: number): Promise<string[]> {
     const out: string[] = [];
     const tag = '0x' + block.toString(16);
     for (let i = 0; i < calls.length; i += CALLS_PER_BATCH) {
-        const body = calls.slice(i, i + CALLS_PER_BATCH).map((c, id) => ({jsonrpc: '2.0', id, method: 'eth_call', params: [c, tag]}));
+        const batch = calls.slice(i, i + CALLS_PER_BATCH).map(c => ({method: 'eth_call', params: [c, tag]}));
         for (let attempt = 0; ; attempt++) {
-            let json: any[];
+            let res: {result?: any, error?: any}[];
             try {
-                const resp = await fetch(ConfigInstance.ether.url, {
-                    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
-                });
-                json = await resp.json();
-                if (!Array.isArray(json)) {
-                    throw new Error(`rpc: ${JSON.stringify(json).slice(0, 200)}`);
-                }
+                // rate-limit rejections are retried inside postBatch
+                res = await postBatch(stakingRpcUrl(), batch);
             } catch (e) {
                 if (attempt >= RPC_RETRIES) throw e;
                 await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
                 continue;
             }
-            const failed = json.find(r => r.error);
+            const failed = res.find(r => r.error);
             if (failed) {
                 // only some nodes behind the public RPC keep history: retry, then give up
                 const msg = JSON.stringify(failed.error);
@@ -83,8 +78,7 @@ async function callsAt(calls: {to: string, data: string}[], block: number): Prom
                 await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
                 continue;
             }
-            const byId = new Map(json.map(r => [r.id, r.result]));
-            body.forEach(b => out.push(byId.get(b.id)));
+            res.forEach(r => out.push(r.result));
             break;
         }
     }
@@ -122,7 +116,30 @@ export async function commissionCheckOnce(cursor: number, force = false): Promis
     if (last && !force && new Date(head.createdAt).getTime() - new Date(last.createdAt).getTime() < opt.checkIntervalSec * 1000) {
         return null;
     }
+    return writeCheckpoint(cursor, head.createdAt);
+}
 
+/**
+ * A baseline at startBlock - 1, before anything is collected, so the
+ * checkpoints cover the collection from its first block. Without it the first
+ * checkpoint is a baseline taken after the first round, and that round's
+ * blocks are never reconciled. No-op once any checkpoint exists.
+ */
+export async function baselineAtStart(): Promise<CommissionCheckResult | null> {
+    if (await StakingCommissionCheck.count()) {
+        return null;
+    }
+    const block = blockRewardOption().startBlock - 1;
+    const [b] = await postBatch(stakingRpcUrl(), [{method: 'eth_getBlockByNumber', params: ['0x' + block.toString(16), false]}]);
+    if (!b?.result) {
+        throw new Error(`block ${block}: ${JSON.stringify(b?.error)}`);
+    }
+    return writeCheckpoint(block, new Date(parseInt(b.result.timestamp, 16) * 1000));
+}
+
+async function writeCheckpoint(cursor: number, createdAt: Date): Promise<CommissionCheckResult> {
+    const opt = blockRewardOption();
+    const head = {createdAt};
     const validators = (await StakingValidator.findAll({raw: true, attributes: ['address']})).map(v => v.address);
     const staking = stakingOption().contract;
     const results = await callsAt([
@@ -222,17 +239,18 @@ export async function commissionCheckOnce(cursor: number, force = false): Promis
     return {block: cursor, prevBlocks: [...windows.keys()], taxRate, counts, mismatches};
 }
 
-/** Called by the block sync loop after every round. Never throws. */
-export async function runChecks(cursor: number, caughtUp: boolean) {
+/** Called by the block sync loop after every round. Never throws; returns the checkpoint written, if any. */
+export async function runChecks(cursor: number, caughtUp: boolean): Promise<CommissionCheckResult | null> {
     ctx.everCaughtUp = ctx.everCaughtUp || caughtUp;
     await checkFreshness(cursor).catch(e => console.log(`staking check: freshness failed:`, e?.message || e));
     // without an archive node a backfill has no state to read: don't retry every round
     if (ctx.stateMissing && !caughtUp) {
-        return;
+        return null;
     }
     try {
-        await commissionCheckOnce(cursor);
+        const r = await commissionCheckOnce(cursor);
         ctx.stateMissing = false;
+        return r;
     } catch (e) {
         if (e instanceof StateUnavailable) {
             ctx.stateMissing = true;
@@ -244,6 +262,7 @@ export async function runChecks(cursor: number, caughtUp: boolean) {
             console.log(`staking check: commission check failed:`, e?.message || e);
             safeAddErrorLog('staking', 'commission-check', e);
         }
+        return null;
     }
 }
 

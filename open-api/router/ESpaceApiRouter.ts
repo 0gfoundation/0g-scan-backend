@@ -90,8 +90,11 @@ import {
     getRewards,
     getTax,
     getFoundation,
+    getRestaking,
     getSlashes,
     getValidatorBlocks,
+    requireBlockRewards,
+    requireStaking,
 } from "../service/OpenStakingService";
 import {requireScope, SCOPE_PARTNER_READ, SCOPE_PARTNER_WRITE} from "./partnerAuth";
 import {
@@ -1146,24 +1149,25 @@ export function registerRouter(router: Router) {
 
     // 0G validator / delegation index (stat/service/staking). EVM only, so
     // there is no core-space counterpart in ApiRouter.
-    router.get('/staking/summary', getSummary);
-    router.get('/staking/validators', getValidatorList);
-    router.get('/staking/validator', getValidatorDetail);
-    router.get('/staking/validator/delegators', getValidatorDelegators);
-    router.get('/staking/validator/delegations/sum', getValidatorDelegationSum);
-    router.get('/staking/validator/param-changes', getValidatorParamChanges);
-    router.get('/staking/validator/fee-withdrawals', getValidatorFeeWithdrawals);
-    router.get('/staking/fees', getValidatorFees);
-    router.get('/staking/validator/rewards', getRewards);
-    router.get('/staking/validator/blocks', getValidatorBlocks);
-    router.get('/staking/community/tax', getTax);
-    router.get('/staking/foundation/rewards', getFoundation);
-    router.get('/staking/slashes', getSlashes);
-    router.get('/staking/delegator/validators', getDelegatorValidators);
-    router.get('/staking/delegator/delegations/sum', getDelegatorDelegationSum);
-    router.get('/staking/events', getEvents);
-    router.get('/staking/charts/breakdown', getBreakdown);
-    router.get('/staking/charts/activity', getActivity);
+    router.get('/staking/summary', requireStaking, getSummary);
+    router.get('/staking/validators', requireStaking, getValidatorList);
+    router.get('/staking/validator', requireStaking, getValidatorDetail);
+    router.get('/staking/validator/delegators', requireStaking, getValidatorDelegators);
+    router.get('/staking/validator/delegations/sum', requireStaking, getValidatorDelegationSum);
+    router.get('/staking/validator/param-changes', requireStaking, getValidatorParamChanges);
+    router.get('/staking/validator/fee-withdrawals', requireStaking, getValidatorFeeWithdrawals);
+    router.get('/staking/fees', requireStaking, getValidatorFees);
+    router.get('/staking/validator/rewards', requireStaking, requireBlockRewards, getRewards);
+    router.get('/staking/validator/blocks', requireStaking, requireBlockRewards, getValidatorBlocks);
+    router.get('/staking/community/tax', requireStaking, requireBlockRewards, getTax);
+    router.get('/staking/foundation/rewards', requireStaking, requireBlockRewards, getFoundation);
+    router.get('/staking/restaking/rewards', requireStaking, requireBlockRewards, getRestaking);
+    router.get('/staking/slashes', requireStaking, requireBlockRewards, getSlashes);
+    router.get('/staking/delegator/validators', requireStaking, getDelegatorValidators);
+    router.get('/staking/delegator/delegations/sum', requireStaking, getDelegatorDelegationSum);
+    router.get('/staking/events', requireStaking, getEvents);
+    router.get('/staking/charts/breakdown', requireStaking, getBreakdown);
+    router.get('/staking/charts/activity', requireStaking, getActivity);
 
     registerDataApi(router)
 }

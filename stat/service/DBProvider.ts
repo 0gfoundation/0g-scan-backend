@@ -99,6 +99,7 @@ import {
     StakingRewardDaily,
     StakingSelfDelegation,
     StakingCommissionCheck,
+    StakingRestakingDaily,
     StakingValidator,
 } from "../model/Staking";
 
@@ -251,6 +252,7 @@ export async function initPartialModel(sequelize) {
     StakingRewardDaily.register(sequelize)
     StakingSelfDelegation.register(sequelize)
     StakingCommissionCheck.register(sequelize)
+    StakingRestakingDaily.register(sequelize)
 }
 export async function initModel(sequelize: Sequelize) {
     console.log(`init models ...`)
@@ -378,6 +380,10 @@ async function migDB(seq: Sequelize) {
         type: DataTypes.STRING(255), allowNull: false, defaultValue: '',
     });
 
+    // added after the per-block tables were first created (testnet has them)
+    for (const t of [StakingBlockReward.getTableName().toString(), StakingRewardDaily.getTableName().toString()]) {
+        await addColumnIfNotExistsV2(qi, t, 'undistributed', {type: DataTypes.DECIMAL(65, 0), allowNull: false, defaultValue: 0});
+    }
     // added after staking_self_delegation was first created (not yet released)
     await addColumnIfNotExistsV2(qi, StakingSelfDelegation.getTableName().toString(), 'stateBlock', {
         type: DataTypes.BIGINT, allowNull: true,

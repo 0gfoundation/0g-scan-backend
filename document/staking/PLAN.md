@@ -184,7 +184,60 @@ staking?: {
 }
 ```
 
-- `run.sh` 生成的 `Prod.js` 连 `ether` 都没有（`_RPC` 在 EVM 模式下是 cfx-bridge，不是 EVM RPC），所以 `staking`、`ether`、`validatorRpc` 都要在部署的 `Prod` 里手工加，没有改 `run.sh`。
+- `_RPC`（写成 `conflux.url`）在 EVM 模式下是 cfx-bridge，讲 `cfx_*`，staking 用不了。staking 只读 `ether.url`（`stakingRpcUrl()`），必须是 `eth_*` 的 JSON-RPC。
+- `run.sh` 从 `scan.env` 生成 `Prod.js` 时支持下面这些变量（2026-11-16）：
+
+  | 变量 | 生成的配置 | 说明 |
+  |---|---|---|
+  | `_ETH_RPC` | `ether.url` | 必填 |
+  | `_STAKING_ENABLED=true` | `staking.enabled` | 不设就不生成 `staking` 段 |
+  | `_STAKING_GENESIS` | `staking.genesis` | `mainnet` / `testnet` / `none`，默认 `mainnet` |
+  | `_STAKING_BLOCK_REWARDS=true` | `staking.blockRewards.enabled` | 默认关闭 |
+  | `_STAKING_BLOCK_REWARDS_START` | `blockRewards.startBlock` | 空则从 10,877,918 开始 |
+  | `_STAKING_FOUNDATION_ADDRESS` | `blockRewards.foundationAddress` | 空则用主网的 `0x711b…2522` |
+
+  这只用于新搭建的环境：`run.sh` 只在 `Prod.js` 不存在时才生成它。
+
+**没有配置时的行为**（2026-11-18）：
+- 没有 `staking` 或 `staking.enabled` 不是 true：`token_x` 不启动 staking，其他同步照常。表照样会建，但都是空的。`/open/staking/*` 统一返回 `{"status":"0","message":"staking index is not enabled on this deployment"}`，以前返回的是空列表和 0，没法和"真的没有质押"区分开。
+- 开了 staking 但没有 `ether.url`：初始化报错 `staking sync needs config.ether.url`，记日志并告警，staking 不运行。不会退回去用 `conflux.url`。
+- 开了 staking 但 `blockRewards.enabled` 没开：`/validator/rewards`、`/validator/blocks`、`/community/tax`、`/foundation/rewards`、`/restaking/rewards`、`/slashes` 返回 `block rewards are not collected on this deployment`，其余接口正常。
+- 没有 `ether.url` 时，`/community/tax` 的 `communityPool` 直接为 null。以前 ethers 会默认去连 `localhost:8545`。
+
+**已部署环境的发布**（不需要 `run.sh`）：容器挂载仓库目录，直接运行编译出来的 `.js`，启动时不编译。
+1. `git pull`，然后 `npm run compile`；
+2. 在现有的 `stat/config/Prod.js` 里手工加 `ether: { url: ... }`（`eth_*` 的 RPC）和 `staking: {...}` 两段；
+3. `docker-compose restart token_x api open_api`。staking 的同步、refresher 和逐块采集都在 `token_x`（`TokenMiscSync`）里，比平时多重启这一个；新表在这些进程启动时自动创建。
+
+**测试网部署参数**（2026-11-16 探测）。`scan.env` 的写法如下，已部署环境照此在 `Prod.js` 里写 `ether.url = https://evmrpc-testnet.0g.ai`、`staking = {enabled: true, genesis: 'testnet', blockRewards: {enabled: true, startBlock, foundationAddress}}`：
+
+```
+_ETH_RPC="https://evmrpc-testnet.0g.ai"
+_STAKING_ENABLED=true
+_STAKING_GENESIS=testnet
+_STAKING_BLOCK_REWARDS=true
+_STAKING_BLOCK_REWARDS_START=<最近一段，比如 head - 100 万块>
+_STAKING_FOUNDATION_ADDRESS=0xecdae9c3dde3fef0f8cad725bb9b89f656109b92
+```
+
+- 测试网的基金会地址和主网不同，不配会每块告警。
+- 测试网从块 1 起就有 withdrawals，全量约 6,589 万块，按每分钟 8,000 块要 130 多个小时，所以只采最近一段。
+- 测试网的共识层接口未知，CL 对账会自动关闭（启动时记一条日志）。
+- 测试网的 RPC 不保留历史状态，"是否达标"多数会退回估算。
+- **限流**（2026-11-17，测试网部署后发现）：0G 的公共 RPC 按出口 IP 限流，每个时间窗约 50 个调用，批量请求里的每个调用都算一个。服务器上别的进程也在用同一个 RPC，于是逐块采集几乎每批都被拒，`-32005 request rate exceeded`：
+  - 原来每批 50 个调用、同时 2 批，单靠逐块采集自己就会超限；每批只重试 6 次，任何一批失败整轮作废，所以一轮都完不成；
+  - 事件同步把限流当成窗口过大，把窗口从 10 万块缩到了 5 万块；
+  - ethers 的 `JsonRpcProvider` 几乎每次调用前都先发一个 `eth_chainId`，请求数多了将近一倍，被拒时报的是 "could not detect network"。
+
+  修正：新增 `StakingRpc.ts`。限流错误（含 "could not detect network"）单独重试，带退避和抖动，最多约 30 次、单次最长 5 秒，不消耗普通错误的重试次数，也不再缩小窗口。所有 provider 改成只确认一次网络。逐块采集和取区块时间的每批从 50 个调用降到 20 个。
+
+  验证：在本地用模拟限流的代理随机拒绝约一半请求，跑 5 分钟，没有任何失败，事件同步一直跟着链头，逐块采集约每分钟 600 块；直连测试网约每分钟 2,000 块。
+  - **测试网的起始块：** 速度受限于公共 RPC，100 万块要 8–28 小时，建议只采最近 20 万块左右。
+  - **根本办法：** 给 staking 配一个不限流的 RPC（`_ETH_RPC` 指向自己的节点）。主网上线前也要考虑，和归档节点的需求可以一起解决。
+- 本地验证：
+  - 事件从块 1 同步到 65,891,093 大约 6 分钟（之前同步过一部分）；
+  - beacon 回填出 13 次升级，达标公式在块 38,333,448 切换；
+  - 社区池是 `0x565e…0ab2`，税率 100000。
 
 ## 查询与 API
 
@@ -433,6 +486,8 @@ group by validator;
 
 **`staking_block_slash`**，罚没原样保存：`blockNumber`、`createdAt`、`position`、`slashIndex`、`validatorIndex`、`address`、`amount`（wei）、`validator`（= `address`，即被罚 validator 的合约地址；`slashIndex` 存证据高度，`validatorIndex` 存共识层编号）。唯一键 `(blockNumber, position)`。
 
+**`staking_restaking_daily`**（2026-11-17 新增），按 (UTC 日, 收款地址) 汇总 restaking 奖励：`day`、`address`、`blockCount`、`amount`，唯一键 `(day, address)`。`staking_reward_daily` 按出块 validator 分组，回答不了"某个收款地址收到多少"，所以单独建表。和逐块数据在同一个事务里累加；已经采集过逐块数据的部署，在第一轮时从逐块表一次性重建（KV `STAKING_RESTAKING_DAILY_BUILT`）。
+
 **`staking_reward_daily`**，按 (UTC 日, validator) 汇总，和逐块数据在同一个事务里累加：`day`、`validator`、`blockCount`、`reward`、`communityTax`、`commission`、`restakingReward`、`foundationReward`、`slashCount`、`slashedAmount`。唯一键 `(day, validator)`，一年约 4 万行。社区税和基金会奖励都按出块 validator 记，全网合计 = 所有行之和。
 
 **`staking_rate_timeline`**，佣金计算用的时间线：`validator`（社区税率用空字符串）、`fromBlock`、`kind`（`commission_rate` / `self_delegation_ok` / `community_tax_rate`）、`value`，以及 `source`（`event` / `state_read` / `bisect`）。
@@ -501,6 +556,23 @@ group by validator;
 
 如果 `withdrawals[2]` 出现过别的地址，响应里另加 `byAddress` 拆分。正常情况下只有一个地址。
 
+**（4）restaking 奖励**（2026-11-17 新增）—— `GET /restaking/rewards?address=&start=&end=&interval=`
+
+`withdrawals[1]` 由 geth 的 `ProcessRestakingDistribution` 直接加到收款地址的余额上，不经过任何合约，所以**只按收款地址统计，不计入出块 validator 的奖励**。主网最近约 10.3 万块：约 70% 的块没有 restaking 奖励（地址为零地址、金额为 0），其余轮流发给 3 个地址（都是 295 字节的代理合约），每个约 1,800 0G。
+
+```json
+{
+  "asOfBlock": 49344845, "asOfTime": 1793900000,
+  "cumulative": {"amount": "…", "blockCount": 33062},
+  "range": {"start": …, "end": …, "amount": "…", "blockCount": 17883, "list": [{"date": "2026-11-04", "amount": "…", "blockCount": 13164}]},
+  "addresses": [{"address": "0x8163…36b5", "amount": "…", "blockCount": 11370}]
+}
+```
+
+- 不带 `address` 时返回全网合计，外加 `addresses`，每个收款地址一行，按金额排序；有时间段时按时间段排，没有就按累计排。
+- 数据来自新表 `staking_restaking_daily`（见数据模型）；时间段的整天部分读日汇总表，零头查逐块表。
+- 不发奖励的块不计入。
+
 **明细接口**（保留）：
 - `GET /slashes?validator=&start=&end=&skip=&limit=`：罚没明细；
 - `GET /validator/blocks?address=&start=&end=&skip=&limit=`：某 validator 出的块，以及每块的 `reward` / `communityTax` / `commission`。
@@ -515,7 +587,7 @@ group by validator;
 | `StakingBlockSync.ts` | 逐块采集：JSON-RPC 批量取块（每批 50）、解析 `withdrawals[0..2]` 和 `slashed`、算社区税和佣金、写逐块表和日汇总、推进游标（不超过事件游标）；每轮与 CL 累计 `rewards` 对账 |
 | `StakingCommission.ts` | 佣金：费率由 `CommissionRateChanged` 推出；是否达标在可能跳变的块上读历史状态判断，结果缓存在 `staking_self_delegation`，读不到时退回估算（`source = approx`） |
 | `StakingRewardQuery.ts` | 5 个接口的查询：时间段的完整天查日汇总表，两端零头查逐块表 |
-| `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/slashes`、`/validator/blocks`；`/validators` 和 `/validator` 带累计 `rewards` |
+| `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/restaking/rewards`（2026-11-17）、`/slashes`、`/validator/blocks`（每块带 `restakingAddress`）；`/validators` 和 `/validator` 带累计 `rewards` |
 | `StakingCheck.ts` | 佣金检查点对账、社区税率检查、新鲜度告警；每轮逐块采集后调用 |
 | `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check`（立即在游标处打一个检查点）、`check-commission <validator> <from> <to>` |
 | `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`）、`checkIntervalSec`（默认 3600）、`freshnessAlertSec`（默认 600） |
@@ -588,6 +660,10 @@ group by validator;
    - 读不到状态：让 `eth_call` 一律返回 `missing trie node` 时，检查点推迟、不写入；回灌期间之后的轮次直接跳过。
    - 公共 RPC 读历史状态时好时坏：这次读得到 49,240,000 这样一天前的块。
 
+9. **restaking 奖励**（2026-11-17，本地主网库）：
+   - 从已有的 103,068 块重建日汇总表，再增量采集 5,000 块。按（日，收款地址）和逐块表逐行对比，0 处不一致；CL 对账仍然逐 gwei 一致。
+   - 接口的累计、跨日期的时间段（按天分组）、单个地址、一小时的零头，都和直接用 SQL 从逐块表算出的结果一致。
+
 ## 验证（仓库没有测试套件）
 
 1. `StakingSync.js backfill` 跑完主网，执行 `StakingSync.js diff <xangle-dir>`。其中 delegator 累计委托接口的结果直接对比 `delegator_tokens.csv` 的 `TOTAL_DELEGATION` 列；如果有差异，先查是不是 Xangle 把旧版初始化交易里的 Delegate 或失败交易的金额也算进去了，跟 Xangle 导出的数据比对：
@@ -622,6 +698,86 @@ group by validator;
 3. **失败交易**：交易列表里要不要展示失败的 delegate / undelegate？
 4. **USD 价值**：Xangle 的 `*Value` 字段一直是 0。要不要接现有的代币价格（`TokenQuoteTrack`）？
 5. 过渡期 Xangle 的服务是否继续运行、什么时候下线。
+
+### 主网的准确性：严格模式与准确性报告（2026-11-18）
+
+原则：测试网只验证功能，允许不全、允许估算；主网要求数据**齐全精确**，而且精确要能被证明。
+
+**严格模式**（`staking.strict = true`，主网打开）：宁可停下，也不悄悄降级。
+
+| 情况 | 非严格模式 | 严格模式 |
+|---|---|---|
+| 读不到达标判断所需的历史状态 | 用当前份额估算，记为 `approx` | 这一轮作废，每 60 秒重试并告警 |
+| 读不到旧版退出的本金 | `exitSettlement` 记为 null | 事件同步停在这个窗口，每 60 秒重试 |
+| 取不到 CL 基准值 | 关闭 CL 对账 | 不开始采集，每 60 秒重试 |
+| 块里没有可解析的奖励 | 跳过这个块，记告警 | 逐块采集停住 |
+| CL 对账不一致 | 记告警，继续采集 | 逐块采集停住（严格模式每轮都对账） |
+| 佣金检查点不一致 | 记告警，继续采集 | 逐块采集停住，告警里带上 `check-commission` 定位命令 |
+| 事件日志解码失败 | 跳过这条日志，记告警 | 事件同步停在这个窗口（每 60 秒重试并告警），修好解码后重启 |
+| 链上社区税率和配置不一致 | 按配置值计算社区税，记告警（CL 对账只看奖励总额，发现不了） | 每轮写入前读本轮末块（第一轮还读起始块的前一块）的 `communityTaxRate()`，不一致就停住，这一轮不写入 |
+| 共识层罚没扣掉 owner 的份额（系统调用，没有事件） | refresher 发现份额不一致后，把数据库改成链上值，并写一条 `SlashDetected` | 逐块采集在罚没的块 b 读 owner 在 b−1 和 b 的份额，减去块 b 里 owner 自己的委托/解押，得到罚没扣掉的份额；写一条 `SlashDetected`（`extra.source = block-slash`，以它为幂等键），在份额表上精确减掉。refresher 和全量对账只报告、不修改；逐块采集还没处理到核对的块时只记日志、不告警 |
+
+- 停住只影响逐块采集，事件同步、refresher 和接口照常运行。停住的原因记在进程内，告警每 10 分钟重发一次；查明原因后重启 `token_x` 恢复。
+- 无论哪种模式，在还没有采集任何块时，都会先在 `startBlock - 1` 打一个基准检查点。这样检查点从第一块起就覆盖全部数据；原来要等第一轮结束才有基准，第一轮的块从来没被核对过。
+- 前提是 RPC 能提供任意历史块的状态。主网公共 RPC 只保留最近约 100 块的状态（约 80 秒），严格模式在上面几乎无法推进。2026-11-18 实测：从链头开始采，5 分钟只推进了 146 块；换一个新起点，第一轮就因为读不到起始块前一块的状态而一直等待。所以**归档节点是主网的硬性前提**。
+
+**准确性报告**（`node stat/service/staking/StakingMain.js report`）：一次性给出能否签收的结论，有一项失败就以 2 退出。
+
+| 检查项 | 通过条件 |
+|---|---|
+| strict mode | 已打开 |
+| events caught up | 事件游标落后链头不超过 100 块 |
+| implementation upgrades | beacon 的升级历史已回填 |
+| shares vs chain | 全部非零份额和游标处的 `getDelegation` 一致（只读，不修改） |
+| exit settlements | 没有本金未知的旧版退出，也没有未分类的退出（旧代码同步的事件要重新同步） |
+| blocks caught up / block coverage | 区块游标追上事件游标；逐块表从 `startBlock` 到游标一块不缺 |
+| consensus-layer reconciliation | 逐 gwei 一致 |
+| daily totals | 两张日汇总表都和逐块表一致 |
+| owner qualification | 没有估算（`approx`） |
+| commission checkpoints | 报告前先在游标处打一个检查点；检查点从 `startBlock - 1` 开始，到游标为止，没有 `mismatch` 和 `unknown` |
+| slashes vs consensus layer | 记录的罚没和共识层 `slashed` 标记一致 |
+| slash share accounting | 每个被罚没的（validator, 块）都有对应的份额记账（`SlashDetected`，`source = block-slash`） |
+| foundation address / community tax rate | 没有异常地址；链上税率等于配置 |
+
+**验证**（2026-11-18，本地主网库）：
+- 对旧库：报告给出 FAIL，指出非严格模式、没追上链头、23 次估算、税率从没读过、20 条退出未分类。最后一项一开始被漏判成通过，已修正。
+- 严格模式从链头采集 146 块：数据覆盖、CL、日汇总、达标判断（17 次全部读到真实状态）、检查点（从起始块前一块开始覆盖，160 个 `ok`）、罚没、基金会地址、税率全部通过。
+- 读不到状态时：严格模式停下等待，没有写任何估算值。
+- 检查点不一致时：用一个把历史 `eth_call` 改成读最新状态的代理制造不一致，块 50,573,134 的检查点发现 22 个 validator 不一致后，逐块采集停住不再推进，事件同步照常运行。
+- 补充的三项（同日，测试代理模拟）：
+  - **解码失败：** 代理在 Staking 合约的日志里插一条形状不对的 `ValidatorCreated`。严格模式下事件同步停住，游标不动；非严格模式跳过这条日志，30 秒推进约 89.5 万块。
+  - **税率：** 配置 90000、链上 100000，第一轮写入前就停住，0 行写入。
+  - **罚没份额：** 代理往块 50,590,699 注入一条 `slashed`，并让 owner 在这一块的份额比前一块少 5e18。逐块采集记下 `taken = 5e18`，owner 份额从 500 精确变成 495。之后 refresher 发现数据库和链上不一致（495 对 500），只记日志、不修改；全量对账检查 2,198 条，报告 1 条不一致，也不修改。
+  - 局限：主网没有真实罚没，公共 RPC 也读不到历史状态，所以罚没份额的计算是用模拟的状态差验证的，公式本身（前后份额之差减去本块 owner 自己的事件）没有在真实罚没上跑过。
+
+**主网上线流程**：
+1. 专用归档节点（不限流、能读任意历史状态），`ether.url` 指向它；`staking.strict = true`；
+2. 事件从块 1、区块奖励从 10,877,918 全量回灌。回灌中有任何不一致都会停住，用 `check-commission` 定位、修正后重启；
+3. 回灌完成后跑 `report`，全部 PASS 才对前端开放；另外可以用 `diff` 命令和 Xangle 的导出数据做一次交叉核对。
+
+### 归档节点与主网演练（2026-11-18）
+
+**归档节点**：主网 `34.58.152.235:3545`，测试网 `35.197.33.167:3545`；测试网共识层 `35.199.145.95:3500`。
+- 都是 **reth v1.8.1**。任意历史块的状态都能读；一批 200 个调用也不限流；`eth_getLogs` 块范围上限 10 万；一批 100 个、并发 4 时，约每分钟 8,700（主网）/ 9,800（测试网）块。
+- **reth 不返回区块的 `slashed`**：0g-alloy 的 RPC `Block` 没有这个字段，转换时丢掉了。存储层（`BlockSlashed` 表）有数据，只差 RPC 这一层。主网公共 RPC `evmrpc.0g.ai` 也是 reth。所以目前任何节点都拿不到逐块罚没，`/slashes` 和罚没份额记账在节点修好之前都没有数据。真发生罚没时会被发现：严格模式下 refresher 报份额差异、检查点可能对不上、`report` 的罚没检查（对照共识层的 `slashed` 标记）会失败。已起草 0g-alloy / 0g-reth 补丁交给节点团队。
+
+**本地演练**（库 `staking_rehearsal`，主网归档节点，严格模式）：
+- 事件从块 1 同步到 50,631,350：14 次升级全部回填；16 个旧版退出的本金**全部读到**（合计 6,235.38 0G，之前公共 RPC 下 15 个是 null）；份额全量对账 2,198 条，0 差异。
+- 区块奖励分四段，每段 2 万块，从空表开始：
+
+| 段 | 区间 | CL 对账 | 达标判断 | 检查点 |
+|---|---|---|---|---|
+| R1 | 10,877,918–10,897,917（激活块起，旧公式） | 一致 | 24 次，0 估算 | 184 ok |
+| R2 | 23,620,000–23,639,999（含旧版退出） | 一致 | 29 次，0 估算 | 272 ok |
+| R3 | 37,016,750–37,036,749（跨切换点） | 一致 | 57 次，0 估算 | 385 ok |
+| R4 | 最近 2 万块 | 一致 | 27 次，0 估算 | 320 ok |
+
+  各段的数据覆盖、日汇总、罚没、基金会地址、税率检查也全部通过。"事件/区块追上"两项失败是分段演练本身造成的（采的是历史区间，演练期间链头也在走）。
+
+**演练发现并修复的三个问题**（都会在线上全量回灌时出错，而公共 RPC 和已有数据的库把它们掩盖了）：
+1. **激活块的 CL 基准值**：共识层在激活块 10,877,918 处的累计值一开始就是 12,409,468.82 0G，激活前的块返回 404。激活前累积的奖励一次性计入了这个计数，但从来没有作为 withdrawals 发出。原来在 404 时把基准值当成 0，于是这一大笔都算进了差额。现在从激活块开始采集时，基准值取"起始块的累计值减去起始块自己的 withdrawals[0..2]"（`clBaseline`）。
+2. **佣金费率依赖 refresher**：没有 `CommissionRateChanged` 的 validator，模型原来用 `staking_validator.commissionRate`，而这一列由 refresher 写入。逐块采集比 refresher 先跑时，这些 validator 的佣金全按 0 算。现在改为读本轮最后一块的链上 `commissionRate()`，并缓存；到事件游标为止都没变过，所以对之前所有块都适用。
+3. **分配回滚**：`_distributeRewards` 要求社区税率 + 佣金费率 ≤ 100%，否则回滚。0g-geth 是先把奖励加到 validator 合约的余额上，再调用分配，所以回滚后奖励留在合约里，没有计入社区税、佣金和委托人奖励中的任何一项。主网上只有 `0x47d2…7de5` 在块 12,885,933 之前费率是 100%。现在这种块记社区税 0、佣金 0，整块奖励计入新列 `undistributed`（逐块表和日汇总表，migDB 加列）；委托人奖励 = 奖励 − 社区税 − 佣金 − 未分配，接口返回 `undistributed`。R1 里块 10,889,103 验证通过：链上 `commission`、`rewards` 不变，合约余额正好增加了这一块的奖励。
 
 ### 已定事项（2026-11-09）
 

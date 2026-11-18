@@ -5,7 +5,7 @@ import {KV} from "../../model/KV";
 import {IStakingEvent, StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {ethers} from "ethers";
-import {initEthSdk, SECOND} from "../common/utils";
+import {SECOND} from "../common/utils";
 import {
     decodeStakingLog,
     DecodedStakingEvent,
@@ -17,6 +17,7 @@ import {
     TOPIC,
     VALIDATOR_TOPICS,
 } from "./StakingAbi";
+import {isRateLimited, postBatch, staticProvider, withRateRetry} from "./StakingRpc";
 
 /**
  * Forward sync of the 0G staking contracts into staking_validator /
@@ -46,6 +47,15 @@ const KEY_BEACON_BACKFILLED = 'STAKING_BEACON_UPGRADES';
  */
 const ADDRESS_CHUNK = 32;
 
+/**
+ * The Ethereum JSON-RPC the staking index reads (`ether.url`, written by
+ * run.sh from `_ETH_RPC`). Not `conflux.url`: that one feeds js-conflux-sdk
+ * and on 0G points at a cfx bridge speaking cfx_*, not eth_*.
+ */
+export function stakingRpcUrl(): string {
+    return ConfigInstance.ether?.url;
+}
+
 export function stakingOption(): Required<StakingOption> {
     const o = ConfigInstance.staking || {};
     return {
@@ -58,6 +68,7 @@ export function stakingOption(): Required<StakingOption> {
         logRange: o.logRange ?? 100_000,
         refreshIntervalMs: o.refreshIntervalMs ?? 60 * SECOND,
         validatorBeacon: (o.validatorBeacon || '').toLowerCase(),
+        strict: !!o.strict,
         blockRewards: o.blockRewards || {},
     };
 }
@@ -71,7 +82,8 @@ export function blockRewardOption() {
     return {
         enabled: !!o.enabled,
         startBlock: o.startBlock ?? WITHDRAWAL_ACTIVATION_BLOCK,
-        batchSize: o.batchSize ?? 50,
+        // 20 x 2 in flight stays under the RPC's ~50 calls per IP and window
+        batchSize: o.batchSize ?? 20,
         concurrency: o.concurrency ?? 2,
         foundationAddress: (o.foundationAddress || FOUNDATION_ADDRESS).toLowerCase(),
         communityTaxRate: BigInt(o.communityTaxRate ?? 100_000),
@@ -100,6 +112,13 @@ export function withStakingLock<T>(fn: () => Promise<T>): Promise<T> {
     return run;
 }
 
+/**
+ * Strict mode refusing to record an approximation or an unknown. Thrown out
+ * of a round, which is then retried after a pause instead of being treated
+ * as an RPC failure.
+ */
+export class StrictModeWait extends Error {}
+
 /** the beacon whose upgrades are tracked; set by initStakingSync */
 export function trackedBeacon(): string {
     return ctx.beacon;
@@ -112,9 +131,9 @@ export async function getStakingCursor(): Promise<number> {
 
 export async function initStakingSync() {
     const opt = stakingOption();
-    ctx.provider = initEthSdk(ConfigInstance.ether?.url);
+    ctx.provider = stakingRpcUrl() ? staticProvider(stakingRpcUrl()) : null;
     if (!ctx.provider) {
-        throw new Error(`staking sync needs config.ether.url`);
+        throw new Error(`staking sync needs config.ether.url (an eth_* JSON-RPC; _ETH_RPC in scan.env)`);
     }
     if (!GENESIS_VALIDATORS[opt.genesis]) {
         throw new Error(`config.staking.genesis must be one of ${Object.keys(GENESIS_VALIDATORS)}, got [${opt.genesis}]`);
@@ -156,7 +175,7 @@ async function seedGenesis(network: string) {
 }
 
 async function safeHead(): Promise<number> {
-    return (await ctx.provider.getBlockNumber()) - stakingOption().confirmations;
+    return (await withRateRetry(() => ctx.provider.getBlockNumber())) - stakingOption().confirmations;
 }
 
 /**
@@ -164,9 +183,9 @@ async function safeHead(): Promise<number> {
  * ("invalid address or ENS name"), and the validator query needs one.
  */
 async function getLogs(address: string | string[], topics: string[], from: number, to: number): Promise<RawLog[]> {
-    const logs: any[] = await ctx.provider.send('eth_getLogs', [{
+    const logs: any[] = await withRateRetry(() => ctx.provider.send('eth_getLogs', [{
         address, topics: [topics], fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16),
-    }]);
+    }]));
     return logs.map(l => ({
         address: l.address,
         topics: l.topics,
@@ -198,7 +217,7 @@ async function getLogs(address: string | string[], topics: string[], from: numbe
 const implementations = new Map<string, {emitsExited: boolean, selfDelegation: 'delegated-tokens' | 'shares-tokens'}>();
 async function classifyImplementation(impl: string) {
     if (!implementations.has(impl)) {
-        const code = (await ctx.provider.getCode(impl)).toLowerCase();
+        const code = (await withRateRetry(() => ctx.provider.getCode(impl))).toLowerCase();
         if (code === '0x') {
             throw new Error(`implementation ${impl} has no code`);
         }
@@ -296,8 +315,8 @@ async function applyShareDeltas(map: Map<string, ShareDelta>, dbTx: Transaction)
     await StakingDelegation.sequelize.query(sql, {type: QueryTypes.INSERT, replacements, transaction: dbTx});
 }
 
-/** the 0G RPCs reject the part of a JSON-RPC batch beyond 50 calls */
-const BLOCK_BATCH = 50;
+/** calls per JSON-RPC batch: the 0G RPCs allow ~50 per IP and window, shared with everything else on the host */
+const BLOCK_BATCH = 20;
 
 /**
  * Block timestamps, fetched in JSON-RPC batches: one request per block made a
@@ -307,15 +326,12 @@ async function blockTimes(numbers: number[]): Promise<Map<number, Date>> {
     const out = new Map<number, Date>();
     for (let i = 0; i < numbers.length; i += BLOCK_BATCH) {
         const chunk = numbers.slice(i, i + BLOCK_BATCH);
-        const body = chunk.map((n, id) => ({jsonrpc: '2.0', id, method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
+        const calls = chunk.map(n => ({method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), false]}));
         for (let attempt = 0; ; attempt++) {
             try {
-                const resp: any[] = await (await fetch(ConfigInstance.ether.url, {
-                    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
-                })).json();
-                const byId = new Map(resp.map(r => [r.id, r]));
+                const resp = await postBatch(stakingRpcUrl(), calls);
                 chunk.forEach((n, id) => {
-                    const r = byId.get(id);
+                    const r = resp[id];
                     if (!r?.result) {
                         throw new Error(`block ${n}: ${JSON.stringify(r?.error || 'missing')}`);
                     }
@@ -359,7 +375,7 @@ async function commissionJump(validator: string, block: number): Promise<string 
     const c = new ethers.Contract(validator, ['function commission() view returns (uint256)'], ctx.provider);
     for (let attempt = 0; attempt < 6; attempt++) {
         try {
-            const [before, after] = await Promise.all([c.commission({blockTag: block - 1}), c.commission({blockTag: block})]);
+            const [before, after] = await withRateRetry(() => Promise.all([c.commission({blockTag: block - 1}), c.commission({blockTag: block})]));
             return (BigInt(after.toString()) - BigInt(before.toString())).toString();
         } catch (e) {
             if (!/missing trie node|is not available|header not found/i.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
@@ -369,6 +385,14 @@ async function commissionJump(validator: string, block: number): Promise<string 
     }
     console.log(`staking sync: no state for the exit of ${validator} at ${block}, exitSettlement left unknown`);
     return null;
+}
+
+async function strictSettlement(validator: string, block: number): Promise<string | null> {
+    const settlement = await commissionJump(validator, block);
+    if (settlement == null && stakingOption().strict) {
+        throw new StrictModeWait(`no state for the exit of ${validator} at ${block}; strict mode waits for an RPC that serves it`);
+    }
+    return settlement;
 }
 
 interface WindowResult {
@@ -394,6 +418,10 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             return ev;
         } catch (e) {
             if (e instanceof StakingDecodeError) {
+                if (stakingOption().strict) {
+                    // skipping it would lose an event for good: shares, flows and fees would be wrong
+                    throw new StrictModeWait(`event sync stopped (strict mode) at an undecodable log: ${e.message}; fix the decoder and restart`);
+                }
                 console.log(`staking sync: skip undecodable log: ${e.message}`);
                 safeAddErrorLog('staking', 'decode', e);
                 return null;
@@ -437,7 +465,7 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             const owner = await ownerAt(ev.validator, log.blockNumber, decoded);
             exits.set(`${log.blockNumber}|${log.logIndex}`, newStyleExit.has(`${log.transactionHash}|${ev.validator}`)
                 ? {owner, exitSettlement: '0', implementation: 'emits-exited'}
-                : {owner, exitSettlement: await commissionJump(ev.validator, log.blockNumber), implementation: 'stake-to-commission'});
+                : {owner, exitSettlement: await strictSettlement(ev.validator, log.blockNumber), implementation: 'stake-to-commission'});
         }
     }
 
@@ -547,11 +575,19 @@ export async function runStakingSync() {
         const caughtUp = await stakingSyncOnce();
         delay = caughtUp ? SECOND * 5 : 0;
     } catch (e) {
-        // most RPC failures here are an oversized getLogs window
-        ctx.range = Math.max(1, Math.floor(ctx.range / 2));
-        console.log(`staking sync failed, window now ${ctx.range} blocks:`, e?.message || e);
-        safeAddErrorLog('staking', 'sync', e);
         delay = SECOND * 10;
+        if (e instanceof StrictModeWait) {
+            console.log(`staking sync: ${e.message}`);
+            delay = SECOND * 60;
+        } else if (isRateLimited(e)) {
+            // a rejection that outlasted the retries says nothing about the window
+            console.log(`staking sync: still rate limited after retries, window stays ${ctx.range} blocks`);
+        } else {
+            // other failures here are mostly an oversized getLogs window
+            ctx.range = Math.max(1, Math.floor(ctx.range / 2));
+            console.log(`staking sync failed, window now ${ctx.range} blocks:`, e?.message || e);
+        }
+        safeAddErrorLog('staking', e instanceof StrictModeWait ? 'strict' : 'sync', e);
     }
     setTimeout(runStakingSync, delay);
 }

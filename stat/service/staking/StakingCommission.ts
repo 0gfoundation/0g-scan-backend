@@ -1,6 +1,5 @@
 import {ethers} from "ethers";
 import {Op} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {
     StakingBlockSlash,
     StakingDelegation,
@@ -10,7 +9,8 @@ import {
     StakingValidator,
 } from "../../model/Staking";
 import {GENESIS_VALIDATORS, VALIDATOR_ABI} from "./StakingAbi";
-import {getStakingCursor, stakingOption} from "./StakingSync";
+import {staticProvider, withRateRetry} from "./StakingRpc";
+import {getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait} from "./StakingSync";
 
 /**
  * What a block's commission depends on, per validator. _distributeRewards
@@ -19,8 +19,12 @@ import {getStakingCursor, stakingOption} from "./StakingSync";
  * block n:
  *
  * - the commission rate: from CommissionRateChanged events. Before the first
- *   change it is that event's old value; with no change at all, the current
- *   rate. No historical state needed.
+ *   change it is that event's old value. With no change up to the event
+ *   cursor, commissionRate() read from the chain at the round's last block --
+ *   unchanged since initialization, so valid for every block before it. Not
+ *   staking_validator.commissionRate: the refresher fills that, and the block
+ *   sync can run before it has (a fresh deployment, a rehearsal), which priced
+ *   every such validator's commission at 0.
  * - whether the owner met the minimum: it can only change at certain blocks,
  *   where it is evaluated by reading historical state, and cached in
  *   staking_self_delegation. Where the RPC has no state for the block it is
@@ -65,6 +69,8 @@ export class CommissionModel {
     private loadedUpTo = 0;
     private slashesLoadedUpTo = 0;
     private changes = new Map<string, Change[]>();
+    /** commissionRate() of validators with no CommissionRateChanged up to the event cursor */
+    private unchangedRate = new Map<string, bigint>();
     private transfers = new Map<string, Transfer[]>();
     private flows = new Map<string, Flow[]>();
     private slashes = new Map<string, Set<number>>();
@@ -77,7 +83,7 @@ export class CommissionModel {
     private provider: ethers.providers.JsonRpcProvider;
 
     constructor(private startBlock: number) {
-        this.provider = new ethers.providers.JsonRpcProvider(ConfigInstance.ether.url);
+        this.provider = staticProvider(stakingRpcUrl());
         for (const g of GENESIS_VALIDATORS[stakingOption().genesis] || []) {
             this.genesisOperator.set(g.address, g.operator);
         }
@@ -99,6 +105,11 @@ export class CommissionModel {
         rows.forEach(r => this.validators.set(r.address, {commissionRate: r.commissionRate, owner: r.owner, isGenesis: !!r.isGenesis}));
         await this.loadTimeline([...validators]);
         for (const v of validators) {
+            if (!(this.changes.get(v) || []).length && !this.unchangedRate.has(v)) {
+                this.unchangedRate.set(v, await this.readRate(v, toBlock));
+            }
+        }
+        for (const v of validators) {
             for (const c of this.candidates(v, toBlock)) {
                 if (!this.evaluated.has(`${v}|${c.fromBlock}`)) {
                     await this.evaluate(v, c);
@@ -116,7 +127,8 @@ export class CommissionModel {
         }
         if (rate != null) return rate;
         if (list.length) return list[0].old;
-        return BigInt(this.validators.get(v)?.commissionRate ?? 0);
+        if (this.unchangedRate.has(v)) return this.unchangedRate.get(v);
+        throw new Error(`no commission rate for ${v}: prepare() was not called for it`);
     }
 
     qualifiedAt(v: string, n: number): boolean {
@@ -277,6 +289,8 @@ export class CommissionModel {
             if (read != null) {
                 ok = read;
                 source = 'state_read';
+            } else if (stakingOption().strict) {
+                throw new StrictModeWait(`no state at ${c.stateBlock} to tell whether ${v}'s owner met the minimum; strict mode waits for an RPC that serves it`);
             } else {
                 ok = await this.approximate(v, owner, formula);
                 source = 'approx';
@@ -301,12 +315,12 @@ export class CommissionModel {
         for (let attempt = 0; attempt < STATE_READ_ATTEMPTS; attempt++) {
             try {
                 if (formula === 'delegated-tokens') {
-                    const [tokens, minSelf] = await Promise.all([c.getDelegatedTokens(owner, at), c.minSelfDelegationInGwei(at)]);
+                    const [tokens, minSelf] = await withRateRetry(() => Promise.all([c.getDelegatedTokens(owner, at), c.minSelfDelegationInGwei(at)]));
                     return BigInt(tokens.toString()) >= BigInt(minSelf.toString()) * BigInt(1e9);
                 }
-                const [[, shares], tokens, total, minSelf] = await Promise.all([
+                const [[, shares], tokens, total, minSelf] = await withRateRetry(() => Promise.all([
                     c.getDelegation(owner, at), c.tokens(at), c.delegatorShares(at), c.minSelfDelegationInGwei(at),
-                ]);
+                ]));
                 return sharesTokensOk(BigInt(shares.toString()), BigInt(tokens.toString()), BigInt(total.toString()), BigInt(minSelf.toString()));
             } catch (e) {
                 if (!STATE_UNAVAILABLE.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
@@ -315,6 +329,24 @@ export class CommissionModel {
             }
         }
         return null;
+    }
+
+    /** commissionRate() at `block`; without state, strict mode waits and otherwise the refresher's value is used */
+    private async readRate(v: string, block: number): Promise<bigint> {
+        const c = new ethers.Contract(v, VALIDATOR_ABI, this.provider);
+        for (let attempt = 0; attempt < STATE_READ_ATTEMPTS; attempt++) {
+            try {
+                return BigInt((await withRateRetry(() => c.commissionRate({blockTag: block}))).toString());
+            } catch (e) {
+                if (!STATE_UNAVAILABLE.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
+                    throw e;
+                }
+            }
+        }
+        if (stakingOption().strict) {
+            throw new StrictModeWait(`no state at ${block} to read ${v}'s commission rate; strict mode waits for an RPC that serves it`);
+        }
+        return BigInt(this.validators.get(v)?.commissionRate ?? 0);
     }
 
     /** the owner's current indexed shares at the current share price, against the current minimum */

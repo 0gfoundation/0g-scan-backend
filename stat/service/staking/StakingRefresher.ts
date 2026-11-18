@@ -1,12 +1,13 @@
 import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
-import {ConfigInstance} from "../../config/StatConfig";
 import {StakingDelegation, StakingEvent, StakingEventType, StakingValidator} from "../../model/Staking";
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
-import {getStakingCursor, stakingOption, trackedBeacon, withStakingLock} from "./StakingSync";
+import {getBlockRewardCursor} from "./StakingBlockSync";
+import {staticBatchProvider, withRateRetry} from "./StakingRpc";
+import {getStakingCursor, stakingOption, stakingRpcUrl, trackedBeacon, withStakingLock} from "./StakingSync";
 
 /**
  * Periodic refresh of the validator rows from chain state, plus the checks
@@ -27,16 +28,15 @@ const MAX_STATE_LAG = 64;
 const FULL_RECONCILE_INTERVAL = 3600 * SECOND;
 /**
  * The batch provider sends every call issued in the same tick as one JSON-RPC
- * batch, and the 0G RPCs reject the part of a batch beyond 50 calls with
- * -32005 "request rate exceeded" (ethers then reports a bare CALL_EXCEPTION).
- * Chunk sizes keep each batch under that: up to 16 calls per validator when
- * refreshing state (3 x 16 = 48), 2 per validator per step in the share check,
- * 1 per delegation when reconciling.
+ * batch. The 0G RPCs allow ~50 calls per IP and window, shared with whatever
+ * else runs on the host, and report a rejection as -32005 (which ethers wraps
+ * in a bare CALL_EXCEPTION). Chunks keep batches well under that: 16 calls
+ * for one validator's state, 2 per validator per step in the share check, 1
+ * per delegation when reconciling. Rejections are waited out (StakingRpc).
  */
-const CHUNK_STATE = 3;
+const CHUNK_STATE = 1;
 const CHUNK_SHARE_CHECK = 10;
-const CHUNK_RECONCILE = 40;
-const RATE_LIMIT_RETRIES = 5;
+const CHUNK_RECONCILE = 20;
 
 const ctx = {
     provider: null as ethers.providers.JsonRpcBatchProvider,
@@ -46,7 +46,7 @@ const ctx = {
 function provider() {
     if (!ctx.provider) {
         // batches the per-validator view calls issued in the same tick
-        ctx.provider = new ethers.providers.JsonRpcBatchProvider(ConfigInstance.ether.url);
+        ctx.provider = staticBatchProvider(stakingRpcUrl());
     }
     return ctx.provider;
 }
@@ -61,24 +61,7 @@ async function inChunks<T>(list: T[], size: number, fn: (t: T) => Promise<any>) 
     }
 }
 
-function isRateLimited(e: any): boolean {
-    const text = `${e?.message || ''} ${JSON.stringify(e?.error || '')}`;
-    return /-32005|rate exceeded|too many requests/i.test(text);
-}
-
-/** Retries RPC calls rejected by the rate limit, backing off 200ms, 400ms, ... */
-async function rpc<T>(fn: () => Promise<T>): Promise<T> {
-    for (let attempt = 0; ; attempt++) {
-        try {
-            return await fn();
-        } catch (e) {
-            if (attempt >= RATE_LIMIT_RETRIES || !isRateLimited(e)) {
-                throw e;
-            }
-            await new Promise(r => setTimeout(r, 200 * 2 ** attempt));
-        }
-    }
-}
+const rpc = withRateRetry;
 
 const lower = (a: string) => (a || '').toLowerCase();
 const str = (v: any) => v.toString();
@@ -184,7 +167,18 @@ async function checkOperatorShares(block: number) {
             // too, so a leftover here is a correction, not a slash
             const exitSettled = row.exitedBlock != null && onChain === BigInt(0);
             const slash = onChain < dbShares && !exitSettled;
-            if (dbShares !== onChain) {
+            if (dbShares !== onChain && stakingOption().strict) {
+                // strict mode never overwrites shares with the chain's value: that would
+                // hide the cause. Slashes are accounted for by the block sync at their
+                // block, so a gap is only reported once the block sync has passed `block`.
+                const msg = `operator ${operator} of ${row.address} shares db ${dbShares} chain ${onChain} at ${block}`;
+                if (await getBlockRewardCursor() >= block) {
+                    console.log(`staking refresh: unexplained share difference (strict mode, not corrected), ${msg}`);
+                    safeAddErrorLog('staking', 'operator-shares', new Error(`strict mode, not corrected: ${msg}`));
+                } else {
+                    console.log(`staking refresh: share difference pending the block sync (a slash not yet applied?), ${msg}`);
+                }
+            } else if (dbShares !== onChain) {
                 await StakingDelegation.sequelize.transaction(async dbTx => {
                     if (opRow) {
                         await StakingDelegation.update({shares: onChain.toString()}, {where: {id: opRow.id}, transaction: dbTx});
@@ -228,7 +222,12 @@ async function checkOperatorShares(block: number) {
 }
 
 /** Every non-zero delegation against getDelegation at the cursor block. Under the sync lock. */
-export async function reconcileAllShares(block: number) {
+/**
+ * Compares every non-zero delegation with getDelegation at `block`; corrects
+ * the DB unless `dryRun`. Alerts on differences unless `alert` is false (the
+ * accuracy report reports them itself).
+ */
+export async function reconcileAllShares(block: number, {dryRun = false, alert = true} = {}) {
     const rows = await StakingDelegation.findAll({
         attributes: ['id', 'validator', 'delegator', 'shares'], raw: true, where: {shares: {[Op.ne]: 0}},
     });
@@ -239,12 +238,14 @@ export async function reconcileAllShares(block: number) {
         if (onChain !== BigInt(row.shares)) {
             mismatched++;
             console.log(`staking reconcile: ${row.validator} ${row.delegator} db ${row.shares} chain ${onChain} at ${block}`);
-            await StakingDelegation.update({shares: onChain.toString()}, {where: {id: row.id}});
+            if (!dryRun) {
+                await StakingDelegation.update({shares: onChain.toString()}, {where: {id: row.id}});
+            }
         }
     });
-    console.log(`staking reconcile: ${rows.length} delegations checked at ${block}, ${mismatched} corrected`);
-    if (mismatched) {
-        safeAddErrorLog('staking', 'reconcile', new Error(`${mismatched} of ${rows.length} delegations corrected at ${block}`));
+    console.log(`staking reconcile: ${rows.length} delegations checked at ${block}, ${mismatched} ${dryRun ? 'differ' : 'corrected'}`);
+    if (mismatched && alert) {
+        safeAddErrorLog('staking', 'reconcile', new Error(`${mismatched} of ${rows.length} delegations ${dryRun ? 'differ from the chain (not corrected)' : 'corrected'} at ${block}`));
     }
     return {checked: rows.length, mismatched};
 }
@@ -263,7 +264,8 @@ export async function stakingRefreshOnce({fullReconcile = false} = {}) {
         }
         await checkOperatorShares(cursor);
         if (fullReconcile || Date.now() - ctx.lastFullReconcile > FULL_RECONCILE_INTERVAL) {
-            await reconcileAllShares(cursor);
+            // strict mode reports differences instead of overwriting them
+            await reconcileAllShares(cursor, {dryRun: stakingOption().strict});
             ctx.lastFullReconcile = Date.now();
         }
     });
