@@ -67,7 +67,7 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
             `${n} upgrades of beacon ${tracked || '(not backfilled)'}`);
     });
     await safely('shares vs chain', async () => {
-        const r = await reconcileAllShares(eventCursor, {dryRun: true});
+        const r = await reconcileAllShares(eventCursor, {dryRun: true, alert: false});
         add('shares vs chain', r.mismatched ? 'fail' : 'pass', `${r.checked} delegations at ${eventCursor}, ${r.mismatched} differ`);
     });
     await safely('exit settlements', async () => {
@@ -145,6 +145,15 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
         add('slashes vs consensus layer', missing.length || extra.length ? 'fail' : 'pass',
             `consensus layer marks ${cl.size} slashed, ${ours.size} recorded` + (missing.length ? `; not recorded: ${missing.join(',')}` : '')
             + (extra.length ? `; not marked slashed: ${extra.join(',')}` : ''));
+    });
+    await safely('slash share accounting', async () => {
+        // strict mode records, for each slashed (validator, block), the shares the slash took
+        const row = await one(`select count(*) as slashed,
+                sum(exists(select 1 from ${StakingEvent.getTableName()} e where e.validator = s.validator and e.blockNumber = s.blockNumber
+                    and e.eventType = ? and json_unquote(json_extract(e.extra, '$.source')) = 'block-slash')) as accounted
+            from (select distinct validator, blockNumber from ${StakingBlockSlash.getTableName()}) s`, [StakingEventType.SlashDetected]);
+        const missing = Number(row.slashed) - Number(row.accounted || 0);
+        add('slash share accounting', missing ? 'fail' : 'pass', `${row.slashed} slashed (validator, block), ${missing} without the owner's share change recorded`);
     });
     await safely('foundation address', async () => {
         const others = await otherFoundationAddresses();

@@ -1,3 +1,4 @@
+import {ethers} from "ethers";
 import {Op, QueryTypes, Transaction} from "sequelize";
 import {KV} from "../../model/KV";
 import {
@@ -5,6 +6,9 @@ import {
     IStakingBlockSlash,
     StakingBlockReward,
     StakingBlockSlash,
+    StakingDelegation,
+    StakingEvent,
+    StakingEventType,
     StakingRestakingDaily,
     StakingRewardDaily,
     StakingValidator,
@@ -13,8 +17,17 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {CommissionModel} from "./StakingCommission";
 import {baselineAtStart, runChecks, StateUnavailable} from "./StakingCheck";
-import {postBatch} from "./StakingRpc";
-import {blockRewardOption, getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
+import {VALIDATOR_ABI} from "./StakingAbi";
+import {postBatch, staticProvider, withRateRetry} from "./StakingRpc";
+import {
+    blockRewardOption,
+    getStakingCursor,
+    stakingOption,
+    stakingRpcUrl,
+    StrictModeWait,
+    withStakingLock,
+    WITHDRAWAL_ACTIVATION_BLOCK,
+} from "./StakingSync";
 
 /**
  * Per-block collection of rewards and slashes (PLAN.md "区块奖励、佣金、社区税、
@@ -57,6 +70,108 @@ const ctx = {
     halted: null as string,
     lastHaltAlert: 0,
 };
+
+const STATE_MISSING = /missing trie node|is not available|header not found|state.*pruned/i;
+let stateProvider: ethers.providers.JsonRpcProvider;
+
+/** a historical state read; strict mode waits rather than going without it */
+async function stateRead<T>(fn: () => Promise<T>, what: string): Promise<T> {
+    for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+            return await withRateRetry(fn);
+        } catch (e) {
+            if (!STATE_MISSING.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
+                throw e;
+            }
+        }
+    }
+    throw new StrictModeWait(`no state for ${what}; strict mode waits for an RPC that serves it`);
+}
+
+function contract(address: string, abi: string[]) {
+    stateProvider = stateProvider || staticProvider(stakingRpcUrl());
+    return new ethers.Contract(address, abi, stateProvider);
+}
+
+/**
+ * Strict mode: setCommunityTaxRate emits nothing, and community tax is
+ * computed with the configured rate, so a round is only written when the
+ * chain's rate at its end (and, on the first round, before its start) is the
+ * configured one. The previous round checked this round's start.
+ */
+async function taxRateHolds(blocks: number[]): Promise<boolean> {
+    const staking = contract(stakingOption().contract, ['function communityTaxRate() view returns (uint32)']);
+    for (const b of blocks) {
+        const rate = BigInt((await stateRead(() => staking.communityTaxRate({blockTag: b}), `communityTaxRate() at ${b}`)).toString());
+        if (rate !== blockRewardOption().communityTaxRate) {
+            halt(`communityTaxRate() is ${rate} at block ${b}, configured ${blockRewardOption().communityTaxRate}; `
+                + `community tax would be wrong from the change on; set blockRewards.communityTaxRate (or add a rate timeline)`);
+            return false;
+        }
+    }
+    return true;
+}
+
+interface SlashShares {
+    validator: string
+    blockNumber: number
+    logIndex: number
+    operator: string
+    /** shares the slash took from the operator (owner), as a positive number */
+    taken: bigint
+}
+
+/**
+ * Strict mode: a consensus-layer slash is a system call, so the shares it
+ * takes from the owner leave no event. Outside strict mode the refresher
+ * notices the gap and overwrites the row with the chain's value; strict mode
+ * instead accounts for it here, at the slash's own block: the owner's shares
+ * after the block minus before it, less the owner's own Delegate/Undelegate in
+ * that block, is what the slash took. Needs historical state.
+ */
+async function slashedShares(slashes: IStakingBlockSlash[]): Promise<SlashShares[]> {
+    const out: SlashShares[] = [];
+    const seen = new Set<string>();
+    for (const s of slashes) {
+        // several entries for one validator in one block: one state difference covers them
+        const key = `${s.validator}|${s.blockNumber}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const c = contract(s.validator, VALIDATOR_ABI);
+        const b = s.blockNumber;
+        const operator = String(await stateRead(() => c.operatorAddress({blockTag: b}), `the operator of ${s.validator} at ${b}`)).toLowerCase();
+        const [[, before], [, after]] = await stateRead(() => Promise.all([
+            c.getDelegation(operator, {blockTag: b - 1}), c.getDelegation(operator, {blockTag: b}),
+        ]), `the operator's shares of ${s.validator} at ${b - 1} and ${b}`);
+        const [own]: any[] = await StakingEvent.sequelize.query(
+            `select cast(coalesce(sum(case when eventType = ? then shares else -shares end), 0) as char) as d
+             from ${StakingEvent.getTableName()} where validator = ? and account = ? and blockNumber = ? and eventType in (?, ?)`,
+            {type: QueryTypes.SELECT, replacements: [StakingEventType.Delegate, s.validator, operator, b, StakingEventType.Delegate, StakingEventType.Undelegate]});
+        const taken = BigInt(before.toString()) + BigInt(own.d) - BigInt(after.toString());
+        out.push({validator: s.validator, blockNumber: b, logIndex: -1 - s.position, operator, taken});
+    }
+    return out;
+}
+
+/** writes each slash's share change once (keyed by its SlashDetected row) */
+async function applySlashedShares(changes: SlashShares[], createdAt: Map<number, Date>, dbTx: Transaction) {
+    for (const ch of changes) {
+        const [, created] = await StakingEvent.findOrCreate({
+            where: {blockNumber: ch.blockNumber, logIndex: ch.logIndex, validator: ch.validator},
+            defaults: {
+                blockNumber: ch.blockNumber, blockHash: '', createdAt: createdAt.get(ch.blockNumber), txHash: '', txIndex: -1,
+                logIndex: ch.logIndex, validator: ch.validator, eventType: StakingEventType.SlashDetected,
+                account: ch.operator, shares: ch.taken.toString(), extra: {source: 'block-slash'},
+            },
+            transaction: dbTx,
+        });
+        if (created && ch.taken !== BigInt(0)) {
+            await StakingDelegation.sequelize.query(
+                `update ${StakingDelegation.getTableName()} set shares = shares - ? where validator = ? and delegator = ?`,
+                {type: QueryTypes.UPDATE, replacements: [ch.taken.toString(), ch.validator, ch.operator], transaction: dbTx});
+        }
+    }
+}
 
 function halt(reason: string) {
     ctx.halted = reason;
@@ -349,7 +464,16 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
         }
     }
 
-    await StakingBlockReward.sequelize.transaction(async dbTx => {
+    // strict mode: no round is written under a tax rate other than the configured one,
+    // and the shares a slash took are accounted for at its block
+    if (strict && !await taxRateHolds(cursor === opt.startBlock - 1 ? [cursor, to] : [to])) {
+        return false;
+    }
+    const slashShares = strict && slashes.length ? await slashedShares(slashes) : [];
+    const blockTimeOf = new Map(slashes.map(s => [s.blockNumber, s.createdAt]));
+
+    // the share update for slashes runs under the event sync's lock: both write staking_delegation
+    const write = () => StakingBlockReward.sequelize.transaction(async dbTx => {
         // a window applied before (e.g. a manual rerun) must not be added to the daily totals twice
         const done = await StakingBlockReward.count({where: {blockNumber: {[Op.between]: [from, to]}}, transaction: dbTx});
         if (done) {
@@ -367,10 +491,13 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
                 await KV.upsert({key: KEY_OTHER_FOUNDATION, value: JSON.stringify(merged)}, {transaction: dbTx});
             }
         }
+        await applySlashedShares(slashShares, blockTimeOf, dbTx);
         await KV.saveNumber(KEY_CURSOR, to, dbTx);
     });
+    await (slashShares.length ? withStakingLock(write) : write());
     if (slashes.length) {
-        console.log(`staking blocks: ${slashes.length} slashes in ${from}-${to}`);
+        console.log(`staking blocks: ${slashes.length} slashes in ${from}-${to}`
+            + (slashShares.length ? `, shares taken: ${slashShares.map(x => `${x.validator} ${x.taken}`).join(', ')}` : ''));
     }
     return to >= head;
 }

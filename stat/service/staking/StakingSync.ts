@@ -315,7 +315,6 @@ async function applyShareDeltas(map: Map<string, ShareDelta>, dbTx: Transaction)
     await StakingDelegation.sequelize.query(sql, {type: QueryTypes.INSERT, replacements, transaction: dbTx});
 }
 
-/** the 0G RPCs reject the part of a JSON-RPC batch beyond 50 calls */
 /** calls per JSON-RPC batch: the 0G RPCs allow ~50 per IP and window, shared with everything else on the host */
 const BLOCK_BATCH = 20;
 
@@ -419,6 +418,10 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             return ev;
         } catch (e) {
             if (e instanceof StakingDecodeError) {
+                if (stakingOption().strict) {
+                    // skipping it would lose an event for good: shares, flows and fees would be wrong
+                    throw new StrictModeWait(`event sync stopped (strict mode) at an undecodable log: ${e.message}; fix the decoder and restart`);
+                }
                 console.log(`staking sync: skip undecodable log: ${e.message}`);
                 safeAddErrorLog('staking', 'decode', e);
                 return null;

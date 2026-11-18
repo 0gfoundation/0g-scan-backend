@@ -5,6 +5,7 @@ import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {validatorRpcUrl} from "../ZGSupply";
 import {VALIDATOR_ABI} from "./StakingAbi";
+import {getBlockRewardCursor} from "./StakingBlockSync";
 import {staticBatchProvider, withRateRetry} from "./StakingRpc";
 import {getStakingCursor, stakingOption, stakingRpcUrl, trackedBeacon, withStakingLock} from "./StakingSync";
 
@@ -166,7 +167,18 @@ async function checkOperatorShares(block: number) {
             // too, so a leftover here is a correction, not a slash
             const exitSettled = row.exitedBlock != null && onChain === BigInt(0);
             const slash = onChain < dbShares && !exitSettled;
-            if (dbShares !== onChain) {
+            if (dbShares !== onChain && stakingOption().strict) {
+                // strict mode never overwrites shares with the chain's value: that would
+                // hide the cause. Slashes are accounted for by the block sync at their
+                // block, so a gap is only reported once the block sync has passed `block`.
+                const msg = `operator ${operator} of ${row.address} shares db ${dbShares} chain ${onChain} at ${block}`;
+                if (await getBlockRewardCursor() >= block) {
+                    console.log(`staking refresh: unexplained share difference (strict mode, not corrected), ${msg}`);
+                    safeAddErrorLog('staking', 'operator-shares', new Error(`strict mode, not corrected: ${msg}`));
+                } else {
+                    console.log(`staking refresh: share difference pending the block sync (a slash not yet applied?), ${msg}`);
+                }
+            } else if (dbShares !== onChain) {
                 await StakingDelegation.sequelize.transaction(async dbTx => {
                     if (opRow) {
                         await StakingDelegation.update({shares: onChain.toString()}, {where: {id: opRow.id}, transaction: dbTx});
@@ -210,8 +222,12 @@ async function checkOperatorShares(block: number) {
 }
 
 /** Every non-zero delegation against getDelegation at the cursor block. Under the sync lock. */
-/** Compares every non-zero delegation with getDelegation at `block`; corrects the DB unless `dryRun`. */
-export async function reconcileAllShares(block: number, {dryRun = false} = {}) {
+/**
+ * Compares every non-zero delegation with getDelegation at `block`; corrects
+ * the DB unless `dryRun`. Alerts on differences unless `alert` is false (the
+ * accuracy report reports them itself).
+ */
+export async function reconcileAllShares(block: number, {dryRun = false, alert = true} = {}) {
     const rows = await StakingDelegation.findAll({
         attributes: ['id', 'validator', 'delegator', 'shares'], raw: true, where: {shares: {[Op.ne]: 0}},
     });
@@ -228,8 +244,8 @@ export async function reconcileAllShares(block: number, {dryRun = false} = {}) {
         }
     });
     console.log(`staking reconcile: ${rows.length} delegations checked at ${block}, ${mismatched} ${dryRun ? 'differ' : 'corrected'}`);
-    if (mismatched && !dryRun) {
-        safeAddErrorLog('staking', 'reconcile', new Error(`${mismatched} of ${rows.length} delegations corrected at ${block}`));
+    if (mismatched && alert) {
+        safeAddErrorLog('staking', 'reconcile', new Error(`${mismatched} of ${rows.length} delegations ${dryRun ? 'differ from the chain (not corrected)' : 'corrected'} at ${block}`));
     }
     return {checked: rows.length, mismatched};
 }
@@ -248,7 +264,8 @@ export async function stakingRefreshOnce({fullReconcile = false} = {}) {
         }
         await checkOperatorShares(cursor);
         if (fullReconcile || Date.now() - ctx.lastFullReconcile > FULL_RECONCILE_INTERVAL) {
-            await reconcileAllShares(cursor);
+            // strict mode reports differences instead of overwriting them
+            await reconcileAllShares(cursor, {dryRun: stakingOption().strict});
             ctx.lastFullReconcile = Date.now();
         }
     });
