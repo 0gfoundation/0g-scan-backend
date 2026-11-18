@@ -18,13 +18,16 @@ import {getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait} from "./
  * is owner()) meets minSelfDelegationInGwei * 1e9, so two things are needed for
  * block n:
  *
- * - the commission rate: from CommissionRateChanged events. Before the first
- *   change it is that event's old value. With no change up to the event
- *   cursor, commissionRate() read from the chain at the round's last block --
- *   unchanged since initialization, so valid for every block before it. Not
- *   staking_validator.commissionRate: the refresher fills that, and the block
- *   sync can run before it has (a fresh deployment, a rehearsal), which priced
- *   every such validator's commission at 0.
+ * - the commission rate: read from chain state, not from events. Early
+ *   implementations changed it without emitting CommissionRateChanged (mainnet
+ *   0x33f5...225f: setCommissionRate at 8,284,294 took it from 500 to 100000
+ *   with no log, so the first event, at 14,682,377, says "old 100000" and the
+ *   events alone priced its block 8,272,755 at 10% instead of 0.05%). For each
+ *   proposer the rate is read at the round's last block and compared with the
+ *   last rate known; on a difference the change is bisected to its block. A
+ *   change in block b is a transaction, so it already applies to b's reward,
+ *   which is what reading state at b gives. A change undone within one round
+ *   would slip through; the commission checkpoints catch that.
  * - whether the owner met the minimum: it can only change at certain blocks,
  *   where it is evaluated by reading historical state, and cached in
  *   staking_self_delegation. Where the RPC has no state for the block it is
@@ -53,7 +56,6 @@ import {getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait} from "./
  */
 
 type Formula = 'shares-tokens' | 'delegated-tokens';
-type Change = {block: number, old: bigint, next: bigint};
 type Transfer = {block: number, next: string};
 type Flow = {block: number, account: string, type: StakingEventType};
 type Point = {fromBlock: number, ok: boolean};
@@ -68,9 +70,9 @@ const DEFAULT_FORMULA: Formula = 'shares-tokens';
 export class CommissionModel {
     private loadedUpTo = 0;
     private slashesLoadedUpTo = 0;
-    private changes = new Map<string, Change[]>();
-    /** commissionRate() of validators with no CommissionRateChanged up to the event cursor */
-    private unchangedRate = new Map<string, bigint>();
+    /** per validator, the commissionRate() from each block on, read from state; and the last block it covers */
+    private rates = new Map<string, {block: number, rate: bigint}[]>();
+    private ratesUpTo = new Map<string, number>();
     private transfers = new Map<string, Transfer[]>();
     private flows = new Map<string, Flow[]>();
     private slashes = new Map<string, Set<number>>();
@@ -105,9 +107,7 @@ export class CommissionModel {
         rows.forEach(r => this.validators.set(r.address, {commissionRate: r.commissionRate, owner: r.owner, isGenesis: !!r.isGenesis}));
         await this.loadTimeline([...validators]);
         for (const v of validators) {
-            if (!(this.changes.get(v) || []).length && !this.unchangedRate.has(v)) {
-                this.unchangedRate.set(v, await this.readRate(v, toBlock));
-            }
+            await this.trackRate(v, toBlock);
         }
         for (const v of validators) {
             for (const c of this.candidates(v, toBlock)) {
@@ -119,16 +119,48 @@ export class CommissionModel {
     }
 
     rateAt(v: string, n: number): bigint {
-        const list = this.changes.get(v) || [];
         let rate: bigint = null;
-        for (const c of list) {
-            if (c.block <= n) rate = c.next;
+        for (const r of this.rates.get(v) || []) {
+            if (r.block <= n) rate = r.rate;
             else break;
         }
-        if (rate != null) return rate;
-        if (list.length) return list[0].old;
-        if (this.unchangedRate.has(v)) return this.unchangedRate.get(v);
-        throw new Error(`no commission rate for ${v}: prepare() was not called for it`);
+        if (rate == null || n > (this.ratesUpTo.get(v) ?? -1)) {
+            throw new Error(`no commission rate for ${v} at ${n}: prepare() did not cover it`);
+        }
+        return rate;
+    }
+
+    /** extends v's rate timeline to `toBlock`, bisecting any change since the last block covered */
+    private async trackRate(v: string, toBlock: number) {
+        const covered = this.ratesUpTo.get(v);
+        if (covered != null && covered >= toBlock) {
+            return;
+        }
+        const list = this.rates.get(v) || this.rates.set(v, []).get(v);
+        if (covered == null) {
+            // first sight: the rate at the collection start (or at the validator's initialization)
+            const init = this.initBlock.get(v);
+            const first = init != null && init >= this.startBlock ? init : this.startBlock;
+            list.push({block: first, rate: await this.readRate(v, first)});
+            this.ratesUpTo.set(v, first);
+            if (first >= toBlock) return;
+        }
+        let lo = this.ratesUpTo.get(v);
+        let loRate = list[list.length - 1].rate;
+        const hiRate = await this.readRate(v, toBlock);
+        // each pass finds the first block in (lo, toBlock] whose rate differs from loRate
+        while (hiRate !== loRate) {
+            let a = lo, b = toBlock;
+            while (b - a > 1) {
+                const m = Math.floor((a + b) / 2);
+                if (await this.readRate(v, m) === loRate) a = m; else b = m;
+            }
+            const rate = await this.readRate(v, b);
+            list.push({block: b, rate});
+            lo = b;
+            loRate = rate;
+        }
+        this.ratesUpTo.set(v, toBlock);
     }
 
     qualifiedAt(v: string, n: number): boolean {
@@ -179,7 +211,7 @@ export class CommissionModel {
                 blockNumber: {[Op.gt]: this.loadedUpTo, [Op.lte]: upTo},
                 eventType: {[Op.in]: [
                     StakingEventType.ValidatorInitialized, StakingEventType.OwnershipTransferred,
-                    StakingEventType.CommissionRateChanged, StakingEventType.Delegate,
+                    StakingEventType.Delegate,
                     StakingEventType.Undelegate, StakingEventType.WithdrawCommission,
                     StakingEventType.SlashDetected, StakingEventType.ImplementationUpgraded,
                 ]},
@@ -195,11 +227,6 @@ export class CommissionModel {
                 case StakingEventType.OwnershipTransferred:
                     this.push(this.transfers, r.validator, {block, next: r.counterparty});
                     break;
-                case StakingEventType.CommissionRateChanged: {
-                    const e = extra(r);
-                    this.push(this.changes, r.validator, {block, old: BigInt(e.old), next: BigInt(e.new)});
-                    break;
-                }
                 case StakingEventType.Delegate:
                 case StakingEventType.Undelegate:
                 case StakingEventType.WithdrawCommission:
