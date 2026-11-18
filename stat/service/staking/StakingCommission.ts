@@ -10,7 +10,7 @@ import {
 } from "../../model/Staking";
 import {GENESIS_VALIDATORS, VALIDATOR_ABI} from "./StakingAbi";
 import {staticProvider, withRateRetry} from "./StakingRpc";
-import {getStakingCursor, stakingOption, stakingRpcUrl} from "./StakingSync";
+import {getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait} from "./StakingSync";
 
 /**
  * What a block's commission depends on, per validator. _distributeRewards
@@ -277,6 +277,8 @@ export class CommissionModel {
             if (read != null) {
                 ok = read;
                 source = 'state_read';
+            } else if (stakingOption().strict) {
+                throw new StrictModeWait(`no state at ${c.stateBlock} to tell whether ${v}'s owner met the minimum; strict mode waits for an RPC that serves it`);
             } else {
                 ok = await this.approximate(v, owner, formula);
                 source = 'approx';

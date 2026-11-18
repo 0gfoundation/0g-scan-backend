@@ -68,6 +68,7 @@ export function stakingOption(): Required<StakingOption> {
         logRange: o.logRange ?? 100_000,
         refreshIntervalMs: o.refreshIntervalMs ?? 60 * SECOND,
         validatorBeacon: (o.validatorBeacon || '').toLowerCase(),
+        strict: !!o.strict,
         blockRewards: o.blockRewards || {},
     };
 }
@@ -110,6 +111,13 @@ export function withStakingLock<T>(fn: () => Promise<T>): Promise<T> {
     lockTail = run.catch(() => undefined);
     return run;
 }
+
+/**
+ * Strict mode refusing to record an approximation or an unknown. Thrown out
+ * of a round, which is then retried after a pause instead of being treated
+ * as an RPC failure.
+ */
+export class StrictModeWait extends Error {}
 
 /** the beacon whose upgrades are tracked; set by initStakingSync */
 export function trackedBeacon(): string {
@@ -380,6 +388,14 @@ async function commissionJump(validator: string, block: number): Promise<string 
     return null;
 }
 
+async function strictSettlement(validator: string, block: number): Promise<string | null> {
+    const settlement = await commissionJump(validator, block);
+    if (settlement == null && stakingOption().strict) {
+        throw new StrictModeWait(`no state for the exit of ${validator} at ${block}; strict mode waits for an RPC that serves it`);
+    }
+    return settlement;
+}
+
 interface WindowResult {
     events: number
     newValidators: number
@@ -446,7 +462,7 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
             const owner = await ownerAt(ev.validator, log.blockNumber, decoded);
             exits.set(`${log.blockNumber}|${log.logIndex}`, newStyleExit.has(`${log.transactionHash}|${ev.validator}`)
                 ? {owner, exitSettlement: '0', implementation: 'emits-exited'}
-                : {owner, exitSettlement: await commissionJump(ev.validator, log.blockNumber), implementation: 'stake-to-commission'});
+                : {owner, exitSettlement: await strictSettlement(ev.validator, log.blockNumber), implementation: 'stake-to-commission'});
         }
     }
 
@@ -556,16 +572,19 @@ export async function runStakingSync() {
         const caughtUp = await stakingSyncOnce();
         delay = caughtUp ? SECOND * 5 : 0;
     } catch (e) {
-        // a rate-limit rejection that outlasted the retries says nothing about
-        // the window; other failures here are mostly an oversized getLogs window
-        if (isRateLimited(e)) {
+        delay = SECOND * 10;
+        if (e instanceof StrictModeWait) {
+            console.log(`staking sync: ${e.message}`);
+            delay = SECOND * 60;
+        } else if (isRateLimited(e)) {
+            // a rejection that outlasted the retries says nothing about the window
             console.log(`staking sync: still rate limited after retries, window stays ${ctx.range} blocks`);
         } else {
+            // other failures here are mostly an oversized getLogs window
             ctx.range = Math.max(1, Math.floor(ctx.range / 2));
             console.log(`staking sync failed, window now ${ctx.range} blocks:`, e?.message || e);
         }
-        safeAddErrorLog('staking', 'sync', e);
-        delay = SECOND * 10;
+        safeAddErrorLog('staking', e instanceof StrictModeWait ? 'strict' : 'sync', e);
     }
     setTimeout(runStakingSync, delay);
 }

@@ -210,7 +210,8 @@ async function checkOperatorShares(block: number) {
 }
 
 /** Every non-zero delegation against getDelegation at the cursor block. Under the sync lock. */
-export async function reconcileAllShares(block: number) {
+/** Compares every non-zero delegation with getDelegation at `block`; corrects the DB unless `dryRun`. */
+export async function reconcileAllShares(block: number, {dryRun = false} = {}) {
     const rows = await StakingDelegation.findAll({
         attributes: ['id', 'validator', 'delegator', 'shares'], raw: true, where: {shares: {[Op.ne]: 0}},
     });
@@ -221,11 +222,13 @@ export async function reconcileAllShares(block: number) {
         if (onChain !== BigInt(row.shares)) {
             mismatched++;
             console.log(`staking reconcile: ${row.validator} ${row.delegator} db ${row.shares} chain ${onChain} at ${block}`);
-            await StakingDelegation.update({shares: onChain.toString()}, {where: {id: row.id}});
+            if (!dryRun) {
+                await StakingDelegation.update({shares: onChain.toString()}, {where: {id: row.id}});
+            }
         }
     });
-    console.log(`staking reconcile: ${rows.length} delegations checked at ${block}, ${mismatched} corrected`);
-    if (mismatched) {
+    console.log(`staking reconcile: ${rows.length} delegations checked at ${block}, ${mismatched} ${dryRun ? 'differ' : 'corrected'}`);
+    if (mismatched && !dryRun) {
         safeAddErrorLog('staking', 'reconcile', new Error(`${mismatched} of ${rows.length} delegations corrected at ${block}`));
     }
     return {checked: rows.length, mismatched};

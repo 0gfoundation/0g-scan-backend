@@ -12,9 +12,9 @@ import {
 import {safeAddErrorLog} from "../../monitor/ErrorMonitor";
 import {SECOND} from "../common/utils";
 import {CommissionModel} from "./StakingCommission";
-import {runChecks} from "./StakingCheck";
+import {baselineAtStart, runChecks, StateUnavailable} from "./StakingCheck";
 import {postBatch} from "./StakingRpc";
-import {blockRewardOption, getStakingCursor, stakingRpcUrl, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
+import {blockRewardOption, getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait, WITHDRAWAL_ACTIVATION_BLOCK} from "./StakingSync";
 
 /**
  * Per-block collection of rewards and slashes (PLAN.md "区块奖励、佣金、社区税、
@@ -53,7 +53,18 @@ const RPC_RETRIES = 6;
 const ctx = {
     commission: null as CommissionModel,
     rounds: 0,
+    /** strict mode: why the block sync stopped (a reconciliation disagreed); cleared by a restart */
+    halted: null as string,
+    lastHaltAlert: 0,
 };
+
+function halt(reason: string) {
+    ctx.halted = reason;
+    ctx.lastHaltAlert = Date.now();
+    const msg = `block sync stopped (strict mode): ${reason}. Restart token_x once the cause is found.`;
+    console.log(`staking blocks: ${msg}`);
+    safeAddErrorLog('staking', 'halted', new Error(msg));
+}
 
 /** withdrawals[2] recipients seen other than the configured foundation address; normally empty */
 export async function otherFoundationAddresses(transaction?: Transaction): Promise<string[]> {
@@ -119,6 +130,8 @@ async function clRewards(block: number): Promise<bigint | null> {
 interface Parsed {
     reward: IStakingBlockReward | null
     slashes: IStakingBlockSlash[]
+    /** the block has no reward row although withdrawals should be there */
+    unparsed?: boolean
     /** withdrawals[2].address when it is not the configured foundation address */
     otherFoundation?: string
 }
@@ -165,7 +178,7 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
         }
         return true;
     });
-    return {reward, slashes, otherFoundation};
+    return {reward, slashes, otherFoundation, unparsed: reward == null && number >= WITHDRAWAL_ACTIVATION_BLOCK};
 }
 
 type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint,
@@ -237,14 +250,32 @@ async function buildRestakingDaily() {
 /** One round. Returns true when caught up with the event sync. */
 export async function stakingBlockSyncOnce(): Promise<boolean> {
     const opt = blockRewardOption();
+    const strict = stakingOption().strict;
     await buildRestakingDaily();
     const cursor = await getBlockRewardCursor();
     if (await KV.getString(KEY_CL_BASE, '') === '') {
         const base = await clRewards(opt.startBlock - 1).catch(e => {
-            console.log(`staking blocks: no consensus layer baseline, reconciliation off:`, e?.message || e);
+            console.log(`staking blocks: no consensus layer baseline:`, e?.message || e);
             return null;
         });
+        if (base == null && strict) {
+            throw new StrictModeWait(`no consensus-layer baseline at ${opt.startBlock - 1} (blockRewards.clTotalWithdrawalsUrl / validatorRpc); strict mode does not run without the reconciliation`);
+        }
+        if (base == null) {
+            console.log(`staking blocks: reconciliation off`);
+        }
         await KV.upsert({key: KEY_CL_BASE, value: base == null ? 'none' : base.toString()});
+    }
+    if (cursor === opt.startBlock - 1) {
+        // nothing collected yet: anchor the commission checkpoints before the first block
+        try {
+            await baselineAtStart();
+        } catch (e) {
+            if (strict && e instanceof StateUnavailable) {
+                throw new StrictModeWait(`no state at ${opt.startBlock - 1} for the first commission checkpoint; strict mode waits for an RPC that serves it`);
+            }
+            console.log(`staking blocks: no commission baseline before ${opt.startBlock}, the first checkpoint after the first round is:`, e?.message || e);
+        }
     }
     // never ahead of the events the commission calculation reads
     const head = await getStakingCursor();
@@ -259,6 +290,11 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
 
     const warnings: string[] = [];
     const parsed = blocks.map(b => parseBlock(b, m => warnings.push(m)));
+    if (strict && parsed.some(p => p.unparsed)) {
+        const n = from + parsed.findIndex(p => p.unparsed);
+        halt(`block ${n} has no parseable rewards (${warnings[0] || 'no withdrawals'})`);
+        return false;
+    }
     const slashed = [...new Set(parsed.flatMap(p => p.slashes.map(s => s.validator)))];
     if (slashed.length) {
         // slashValidator is a no-op for an address that is not a registered validator
@@ -367,21 +403,46 @@ export async function reconcileBlockRewards(): Promise<{ok: boolean, message: st
 }
 
 export async function runStakingBlockSync() {
+    const strict = stakingOption().strict;
     let delay = 0;
     try {
-        const caughtUp = await stakingBlockSyncOnce();
-        await runChecks(await getBlockRewardCursor(), caughtUp);
-        if (caughtUp || ++ctx.rounds % 100 === 0) {
-            const r = await reconcileBlockRewards().catch(e => ({ok: false, message: e?.message || String(e)}));
-            if (r && !r.ok) {
-                console.log(`staking blocks: reconciliation failed, ${r.message}`);
+        if (ctx.halted) {
+            if (Date.now() - ctx.lastHaltAlert > 10 * 60 * SECOND) {
+                halt(ctx.halted);
             }
+            delay = 60 * SECOND;
+        } else {
+            const caughtUp = await stakingBlockSyncOnce();
+            const cursor = await getBlockRewardCursor();
+            const check = await runChecks(cursor, caughtUp);
+            if (strict && check?.mismatches.length) {
+                const m = check.mismatches[0];
+                halt(`commission checkpoint at ${check.block} disagrees for ${check.mismatches.length} validator(s), first ${m.validator}: `
+                    + `chain ${m.actual}, collected ${m.expected}; check-commission ${m.validator} ${m.prevBlock + 1} ${check.block}`);
+            }
+            // strict mode reconciles every round, so a drift stops the sync where it starts
+            if (!ctx.halted && (strict || caughtUp || ++ctx.rounds % 100 === 0)) {
+                const r = await reconcileBlockRewards().catch(e => {
+                    console.log(`staking blocks: reconciliation not run:`, e?.message || e);
+                    return null;
+                });
+                if (r && !r.ok) {
+                    console.log(`staking blocks: reconciliation failed, ${r.message}`);
+                    if (strict) halt(`consensus-layer reconciliation: ${r.message}`);
+                }
+            }
+            delay = caughtUp ? 5 * SECOND : 0;
         }
-        delay = caughtUp ? 5 * SECOND : 0;
     } catch (e) {
-        console.log(`staking blocks failed:`, e?.message || e);
-        safeAddErrorLog('staking', 'blocks', e);
-        delay = 10 * SECOND;
+        if (e instanceof StrictModeWait) {
+            console.log(`staking blocks: ${e.message}`);
+            safeAddErrorLog('staking', 'strict', e);
+            delay = 60 * SECOND;
+        } else {
+            console.log(`staking blocks failed:`, e?.message || e);
+            safeAddErrorLog('staking', 'blocks', e);
+            delay = 10 * SECOND;
+        }
     }
     setTimeout(runStakingBlockSync, delay);
 }

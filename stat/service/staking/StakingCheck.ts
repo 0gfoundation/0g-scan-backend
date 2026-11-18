@@ -50,7 +50,7 @@ const ctx = {
     lastDeferLog: 0,
 };
 
-class StateUnavailable extends Error {}
+export class StateUnavailable extends Error {}
 
 /** eth_call results at `block`, in order; '0x' for an address with no code there */
 async function callsAt(calls: {to: string, data: string}[], block: number): Promise<string[]> {
@@ -116,7 +116,30 @@ export async function commissionCheckOnce(cursor: number, force = false): Promis
     if (last && !force && new Date(head.createdAt).getTime() - new Date(last.createdAt).getTime() < opt.checkIntervalSec * 1000) {
         return null;
     }
+    return writeCheckpoint(cursor, head.createdAt);
+}
 
+/**
+ * A baseline at startBlock - 1, before anything is collected, so the
+ * checkpoints cover the collection from its first block. Without it the first
+ * checkpoint is a baseline taken after the first round, and that round's
+ * blocks are never reconciled. No-op once any checkpoint exists.
+ */
+export async function baselineAtStart(): Promise<CommissionCheckResult | null> {
+    if (await StakingCommissionCheck.count()) {
+        return null;
+    }
+    const block = blockRewardOption().startBlock - 1;
+    const [b] = await postBatch(stakingRpcUrl(), [{method: 'eth_getBlockByNumber', params: ['0x' + block.toString(16), false]}]);
+    if (!b?.result) {
+        throw new Error(`block ${block}: ${JSON.stringify(b?.error)}`);
+    }
+    return writeCheckpoint(block, new Date(parseInt(b.result.timestamp, 16) * 1000));
+}
+
+async function writeCheckpoint(cursor: number, createdAt: Date): Promise<CommissionCheckResult> {
+    const opt = blockRewardOption();
+    const head = {createdAt};
     const validators = (await StakingValidator.findAll({raw: true, attributes: ['address']})).map(v => v.address);
     const staking = stakingOption().contract;
     const results = await callsAt([
@@ -216,17 +239,18 @@ export async function commissionCheckOnce(cursor: number, force = false): Promis
     return {block: cursor, prevBlocks: [...windows.keys()], taxRate, counts, mismatches};
 }
 
-/** Called by the block sync loop after every round. Never throws. */
-export async function runChecks(cursor: number, caughtUp: boolean) {
+/** Called by the block sync loop after every round. Never throws; returns the checkpoint written, if any. */
+export async function runChecks(cursor: number, caughtUp: boolean): Promise<CommissionCheckResult | null> {
     ctx.everCaughtUp = ctx.everCaughtUp || caughtUp;
     await checkFreshness(cursor).catch(e => console.log(`staking check: freshness failed:`, e?.message || e));
     // without an archive node a backfill has no state to read: don't retry every round
     if (ctx.stateMissing && !caughtUp) {
-        return;
+        return null;
     }
     try {
-        await commissionCheckOnce(cursor);
+        const r = await commissionCheckOnce(cursor);
         ctx.stateMissing = false;
+        return r;
     } catch (e) {
         if (e instanceof StateUnavailable) {
             ctx.stateMissing = true;
@@ -238,6 +262,7 @@ export async function runChecks(cursor: number, caughtUp: boolean) {
             console.log(`staking check: commission check failed:`, e?.message || e);
             safeAddErrorLog('staking', 'commission-check', e);
         }
+        return null;
     }
 }
 

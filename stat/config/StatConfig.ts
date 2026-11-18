@@ -37,6 +37,15 @@ export interface StakingOption {
     refreshIntervalMs?: number, // default 60s
     // the validators' UpgradeableBeacon; default: the Staking contract's validatorBeacon()
     validatorBeacon?: string,
+    /**
+     * Accuracy over progress (mainnet). Where the data would otherwise be
+     * approximated or left unknown -- no historical state for owner
+     * qualification or an exit settlement, no consensus-layer baseline, an
+     * unparseable block -- the sync waits and retries instead. When the
+     * consensus-layer reconciliation or a commission checkpoint disagrees,
+     * the block sync stops until restarted. Default false.
+     */
+    strict?: boolean,
     /** per-block rewards, commission, community tax, foundation rewards and slashes */
     blockRewards?: {
         enabled?: boolean, // default false
