@@ -101,7 +101,7 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
         add('consensus-layer reconciliation', r == null ? 'fail' : r.ok ? 'pass' : 'fail', r ? r.message : 'no baseline or no endpoint, so it was never checked');
     });
     await safely('daily totals', async () => {
-        const cols = ['reward', 'communityTax', 'commission', 'restakingReward', 'foundationReward'];
+        const cols = ['reward', 'communityTax', 'commission', 'undistributed', 'restakingReward', 'foundationReward'];
         const sums = cols.map(c => `cast(coalesce(sum(${c}), 0) as char) as ${c}`).join(', ');
         const [d, b] = await Promise.all([
             one(`select cast(coalesce(sum(blockCount), 0) as char) as n, ${sums} from ${StakingRewardDaily.getTableName()}`),

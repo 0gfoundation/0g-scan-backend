@@ -26,6 +26,8 @@ export interface Totals {
     reward: bigint
     communityTax: bigint
     commission: bigint
+    /** rewards whose distribution reverted (tax + commission rates over 100%), left unaccounted in the contract */
+    undistributed: bigint
     restakingReward: bigint
     foundationReward: bigint
     slashCount: number
@@ -33,7 +35,7 @@ export interface Totals {
 }
 
 const empty = (): Totals => ({
-    blockCount: 0, reward: ZERO, communityTax: ZERO, commission: ZERO,
+    blockCount: 0, reward: ZERO, communityTax: ZERO, commission: ZERO, undistributed: ZERO,
     restakingReward: ZERO, foundationReward: ZERO, slashCount: 0, slashedAmount: ZERO,
 });
 
@@ -43,6 +45,7 @@ function add(a: Totals, b: Partial<Totals>): Totals {
         reward: a.reward + (b.reward ?? ZERO),
         communityTax: a.communityTax + (b.communityTax ?? ZERO),
         commission: a.commission + (b.commission ?? ZERO),
+        undistributed: a.undistributed + (b.undistributed ?? ZERO),
         restakingReward: a.restakingReward + (b.restakingReward ?? ZERO),
         foundationReward: a.foundationReward + (b.foundationReward ?? ZERO),
         slashCount: a.slashCount + (b.slashCount ?? 0),
@@ -50,14 +53,18 @@ function add(a: Totals, b: Partial<Totals>): Totals {
     };
 }
 
-/** the validator-facing fields; delegatorReward is what is left for the pool */
+/**
+ * The validator-facing fields; delegatorReward is what went to the pool, and
+ * undistributed what a reverted distribution left in the contract.
+ */
 export function formatValidatorTotals(t: Totals) {
     return {
         blockCount: t.blockCount,
         reward: t.reward.toString(),
         communityTax: t.communityTax.toString(),
         commission: t.commission.toString(),
-        delegatorReward: (t.reward - t.communityTax - t.commission).toString(),
+        delegatorReward: (t.reward - t.communityTax - t.commission - t.undistributed).toString(),
+        undistributed: t.undistributed.toString(),
         slashCount: t.slashCount,
         slashedAmount: t.slashedAmount.toString(),
     };
@@ -75,11 +82,11 @@ function merge(into: Grouped, key: string, t: Partial<Totals>) {
 
 const SUM_COLS = `count(*) as blockCount, cast(sum(reward) as char) as reward,
     cast(sum(communityTax) as char) as communityTax, cast(sum(commission) as char) as commission,
-    cast(sum(restakingReward) as char) as restakingReward, cast(sum(foundationReward) as char) as foundationReward`;
+    cast(sum(undistributed) as char) as undistributed, cast(sum(restakingReward) as char) as restakingReward, cast(sum(foundationReward) as char) as foundationReward`;
 
 const fromRow = (r: any): Partial<Totals> => ({
     blockCount: Number(r.blockCount ?? 0), reward: big(r.reward), communityTax: big(r.communityTax),
-    commission: big(r.commission), restakingReward: big(r.restakingReward), foundationReward: big(r.foundationReward),
+    commission: big(r.commission), undistributed: big(r.undistributed), restakingReward: big(r.restakingReward), foundationReward: big(r.foundationReward),
     slashCount: Number(r.slashCount ?? 0), slashedAmount: big(r.slashedAmount),
 });
 
@@ -96,7 +103,7 @@ async function fromDaily(groupBy: 'validator' | 'day', validator: string | undef
     const rows: any[] = await StakingRewardDaily.sequelize.query(
         `select ${key} as k, cast(sum(blockCount) as char) as blockCount, cast(sum(reward) as char) as reward,
                 cast(sum(communityTax) as char) as communityTax, cast(sum(commission) as char) as commission,
-                cast(sum(restakingReward) as char) as restakingReward, cast(sum(foundationReward) as char) as foundationReward,
+                cast(sum(undistributed) as char) as undistributed, cast(sum(restakingReward) as char) as restakingReward, cast(sum(foundationReward) as char) as foundationReward,
                 cast(sum(slashCount) as char) as slashCount, cast(sum(slashedAmount) as char) as slashedAmount
          from ${StakingRewardDaily.getTableName()} ${cond.length ? 'where ' + cond.join(' and ') : ''} group by k`,
         {type: QueryTypes.SELECT, replacements});
@@ -417,7 +424,8 @@ export async function listValidatorBlocks(opt: {validator: string, start?: Date,
         list: rows.map(r => ({
             blockNumber: Number(r.blockNumber), timestamp: Math.floor(new Date(r.createdAt).getTime() / 1000),
             reward: String(r.reward), communityTax: String(r.communityTax), commission: String(r.commission),
-            delegatorReward: (big(r.reward) - big(r.communityTax) - big(r.commission)).toString(),
+            delegatorReward: (big(r.reward) - big(r.communityTax) - big(r.commission) - big(r.undistributed)).toString(),
+            undistributed: String(r.undistributed ?? '0'),
             restakingAddress: checksum(r.restakingAddress), restakingReward: String(r.restakingReward),
             foundationReward: String(r.foundationReward),
         })),

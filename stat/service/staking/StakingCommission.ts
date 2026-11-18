@@ -19,8 +19,12 @@ import {getStakingCursor, stakingOption, stakingRpcUrl, StrictModeWait} from "./
  * block n:
  *
  * - the commission rate: from CommissionRateChanged events. Before the first
- *   change it is that event's old value; with no change at all, the current
- *   rate. No historical state needed.
+ *   change it is that event's old value. With no change up to the event
+ *   cursor, commissionRate() read from the chain at the round's last block --
+ *   unchanged since initialization, so valid for every block before it. Not
+ *   staking_validator.commissionRate: the refresher fills that, and the block
+ *   sync can run before it has (a fresh deployment, a rehearsal), which priced
+ *   every such validator's commission at 0.
  * - whether the owner met the minimum: it can only change at certain blocks,
  *   where it is evaluated by reading historical state, and cached in
  *   staking_self_delegation. Where the RPC has no state for the block it is
@@ -65,6 +69,8 @@ export class CommissionModel {
     private loadedUpTo = 0;
     private slashesLoadedUpTo = 0;
     private changes = new Map<string, Change[]>();
+    /** commissionRate() of validators with no CommissionRateChanged up to the event cursor */
+    private unchangedRate = new Map<string, bigint>();
     private transfers = new Map<string, Transfer[]>();
     private flows = new Map<string, Flow[]>();
     private slashes = new Map<string, Set<number>>();
@@ -99,6 +105,11 @@ export class CommissionModel {
         rows.forEach(r => this.validators.set(r.address, {commissionRate: r.commissionRate, owner: r.owner, isGenesis: !!r.isGenesis}));
         await this.loadTimeline([...validators]);
         for (const v of validators) {
+            if (!(this.changes.get(v) || []).length && !this.unchangedRate.has(v)) {
+                this.unchangedRate.set(v, await this.readRate(v, toBlock));
+            }
+        }
+        for (const v of validators) {
             for (const c of this.candidates(v, toBlock)) {
                 if (!this.evaluated.has(`${v}|${c.fromBlock}`)) {
                     await this.evaluate(v, c);
@@ -116,7 +127,8 @@ export class CommissionModel {
         }
         if (rate != null) return rate;
         if (list.length) return list[0].old;
-        return BigInt(this.validators.get(v)?.commissionRate ?? 0);
+        if (this.unchangedRate.has(v)) return this.unchangedRate.get(v);
+        throw new Error(`no commission rate for ${v}: prepare() was not called for it`);
     }
 
     qualifiedAt(v: string, n: number): boolean {
@@ -317,6 +329,24 @@ export class CommissionModel {
             }
         }
         return null;
+    }
+
+    /** commissionRate() at `block`; without state, strict mode waits and otherwise the refresher's value is used */
+    private async readRate(v: string, block: number): Promise<bigint> {
+        const c = new ethers.Contract(v, VALIDATOR_ABI, this.provider);
+        for (let attempt = 0; attempt < STATE_READ_ATTEMPTS; attempt++) {
+            try {
+                return BigInt((await withRateRetry(() => c.commissionRate({blockTag: block}))).toString());
+            } catch (e) {
+                if (!STATE_UNAVAILABLE.test(`${e?.message} ${JSON.stringify(e?.error?.body || '')}`)) {
+                    throw e;
+                }
+            }
+        }
+        if (stakingOption().strict) {
+            throw new StrictModeWait(`no state at ${block} to read ${v}'s commission rate; strict mode waits for an RPC that serves it`);
+        }
+        return BigInt(this.validators.get(v)?.commissionRate ?? 0);
     }
 
     /** the owner's current indexed shares at the current share price, against the current minimum */

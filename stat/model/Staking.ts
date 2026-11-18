@@ -303,6 +303,14 @@ export interface IStakingBlockReward {
     communityTax: string
     /** reward * commissionRate / 1e6 while the owner meets minSelfDelegation, else 0 */
     commission: string
+    /**
+     * The whole reward when the distribution reverted: _distributeRewards
+     * requires communityTaxRate + commissionRate <= 100%, and 0g-geth credits
+     * the validator contract's balance before calling it, so the reward stays in
+     * the contract unaccounted (no tax, no commission, no delegator rewards).
+     * Mainnet: 0x47d2...7de5 at a 100% rate until block 12,885,933. Else 0.
+     */
+    undistributed?: string
     /** withdrawals[1]: the recipient varies by block, so it is kept */
     restakingAddress: string
     restakingReward: string
@@ -321,6 +329,7 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
     reward: string;
     communityTax: string;
     commission: string;
+    undistributed?: string;
     restakingAddress: string;
     restakingReward: string;
     foundationReward: string;
@@ -334,6 +343,7 @@ export class StakingBlockReward extends Model<IStakingBlockReward> implements IS
             reward: amount(),
             communityTax: amount(),
             commission: amount(),
+            undistributed: amount(),
             restakingAddress: {type: DataTypes.STRING(42), allowNull: false, defaultValue: ''},
             restakingReward: amount(),
             foundationReward: amount(),
@@ -406,6 +416,7 @@ export interface IStakingRewardDaily {
     reward: string
     communityTax: string
     commission: string
+    undistributed?: string
     restakingReward: string
     foundationReward: string
     slashCount: number
@@ -425,6 +436,7 @@ export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IS
     reward: string;
     communityTax: string;
     commission: string;
+    undistributed?: string;
     restakingReward: string;
     foundationReward: string;
     slashCount: number;
@@ -440,6 +452,7 @@ export class StakingRewardDaily extends Model<IStakingRewardDaily> implements IS
             reward: amount(),
             communityTax: amount(),
             commission: amount(),
+            undistributed: amount(),
             restakingReward: amount(),
             foundationReward: amount(),
             slashCount: {type: DataTypes.INTEGER({unsigned: true}), allowNull: false, defaultValue: 0},

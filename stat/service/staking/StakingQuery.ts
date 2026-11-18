@@ -27,7 +27,7 @@ import {blockRewardOption} from "./StakingSync";
 
 const ZERO = BigInt(0);
 const ZERO_TOTALS = {
-    blockCount: 0, reward: ZERO, communityTax: ZERO, commission: ZERO,
+    blockCount: 0, reward: ZERO, communityTax: ZERO, commission: ZERO, undistributed: ZERO,
     restakingReward: ZERO, foundationReward: ZERO, slashCount: 0, slashedAmount: ZERO,
 };
 const HUNDRED = BigInt(100);

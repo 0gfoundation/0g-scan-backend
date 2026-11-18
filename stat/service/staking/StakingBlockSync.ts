@@ -225,8 +225,14 @@ async function fetchBlocks(from: number, to: number): Promise<any[]> {
     return out;
 }
 
-/** the consensus layer's cumulative rewards (gwei) at `block`; 0 before withdrawals began */
-async function clRewards(block: number): Promise<bigint | null> {
+const BEFORE_ACTIVATION = 'before-activation';
+
+/**
+ * The consensus layer's cumulative rewards (gwei) at `block`, BEFORE_ACTIVATION
+ * when the block precedes withdrawals (it answers 404 there), or null when no
+ * endpoint is configured.
+ */
+async function clRewards(block: number): Promise<bigint | typeof BEFORE_ACTIVATION | null> {
     const url = blockRewardOption().clTotalWithdrawalsUrl;
     if (!/\/blocks\/[^/]+\/total_withdrawals\/?$/.test(url)) {
         return null;
@@ -236,10 +242,32 @@ async function clRewards(block: number): Promise<bigint | null> {
     if (json?.data?.rewards != null) {
         return BigInt(json.data.rewards);
     }
-    if (json?.code === 404 && block < WITHDRAWAL_ACTIVATION_BLOCK) {
-        return BigInt(0);
+    if (json?.code === 404 && /before the withdrawal activation/i.test(json?.message || '')) {
+        return BEFORE_ACTIVATION;
     }
     throw new Error(`consensus layer total_withdrawals at ${block}: ${JSON.stringify(json).slice(0, 200)}`);
+}
+
+/**
+ * The consensus layer's cumulative rewards up to the block before `start`,
+ * what reconciliation subtracts. When `start` is the activation block there is
+ * no such value, and the counter at `start` is not just that block's rewards:
+ * it already holds everything accrued before activation (12,409,467.68 0G on
+ * mainnet), none of it ever paid as withdrawals. So the baseline is then the
+ * counter at `start` less that block's own withdrawals[0..2].
+ */
+async function clBaseline(start: number): Promise<bigint | null> {
+    const before = await clRewards(start - 1);
+    if (before !== BEFORE_ACTIVATION) {
+        return before;
+    }
+    const atStart = await clRewards(start);
+    if (atStart === BEFORE_ACTIVATION || atStart == null) {
+        throw new Error(`blockRewards.startBlock ${start} precedes the withdrawal activation`);
+    }
+    const [block] = await fetchBlocks(start, start);
+    const own = (block?.withdrawals || []).slice(0, 3).reduce((sum: bigint, w: any) => sum + BigInt(w.amount), BigInt(0));
+    return atStart - own;
 }
 
 interface Parsed {
@@ -296,13 +324,13 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
     return {reward, slashes, otherFoundation, unparsed: reward == null && number >= WITHDRAWAL_ACTIVATION_BLOCK};
 }
 
-type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint,
+type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint, undistributed: bigint,
     restakingReward: bigint, foundationReward: bigint, slashCount: number, slashedAmount: bigint};
 
 function dailyOf(map: Map<string, Daily>, day: string, validator: string): Daily {
     const k = `${day}|${validator}`;
     return map.get(k) || map.set(k, {
-        blockCount: 0, reward: BigInt(0), communityTax: BigInt(0), commission: BigInt(0),
+        blockCount: 0, reward: BigInt(0), communityTax: BigInt(0), commission: BigInt(0), undistributed: BigInt(0),
         restakingReward: BigInt(0), foundationReward: BigInt(0), slashCount: 0, slashedAmount: BigInt(0),
     }).get(k);
 }
@@ -311,7 +339,7 @@ async function addDaily(map: Map<string, Daily>, dbTx: Transaction) {
     if (!map.size) {
         return;
     }
-    const cols = ['blockCount', 'reward', 'communityTax', 'commission', 'restakingReward', 'foundationReward', 'slashCount', 'slashedAmount'];
+    const cols = ['blockCount', 'reward', 'communityTax', 'commission', 'undistributed', 'restakingReward', 'foundationReward', 'slashCount', 'slashedAmount'];
     const values = [], replacements = [];
     for (const [k, d] of map) {
         const [day, validator] = k.split('|');
@@ -369,7 +397,7 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
     await buildRestakingDaily();
     const cursor = await getBlockRewardCursor();
     if (await KV.getString(KEY_CL_BASE, '') === '') {
-        const base = await clRewards(opt.startBlock - 1).catch(e => {
+        const base = await clBaseline(opt.startBlock).catch(e => {
             console.log(`staking blocks: no consensus layer baseline:`, e?.message || e);
             return null;
         });
@@ -442,17 +470,24 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
         }
         if (r) {
             const reward = BigInt(r.reward);
-            const tax = reward * opt.communityTaxRate / RATE_BASE;
-            const commission = ctx.commission.qualifiedAt(r.validator, r.blockNumber)
-                ? reward * ctx.commission.rateAt(r.validator, r.blockNumber) / RATE_BASE : BigInt(0);
+            const rate = ctx.commission.rateAt(r.validator, r.blockNumber);
+            // _distributeRewards reverts when tax + commission rates exceed 100%: the reward then
+            // stays in the validator contract with nothing accounted (see IStakingBlockReward)
+            const reverted = opt.communityTaxRate + rate > RATE_BASE;
+            const tax = reverted ? BigInt(0) : reward * opt.communityTaxRate / RATE_BASE;
+            const commission = !reverted && ctx.commission.qualifiedAt(r.validator, r.blockNumber)
+                ? reward * rate / RATE_BASE : BigInt(0);
+            const undistributed = reverted ? reward : BigInt(0);
             r.communityTax = tax.toString();
             r.commission = commission.toString();
+            r.undistributed = undistributed.toString();
             rewards.push(r);
             const d = dailyOf(daily, r.createdAt.toISOString().slice(0, 10), r.validator);
             d.blockCount++;
             d.reward += reward;
             d.communityTax += tax;
             d.commission += commission;
+            d.undistributed += undistributed;
             d.restakingReward += BigInt(r.restakingReward);
             d.foundationReward += BigInt(r.foundationReward);
         }
@@ -513,7 +548,7 @@ export async function reconcileBlockRewards(): Promise<{ok: boolean, message: st
     }
     const cursor = await getBlockRewardCursor();
     const cl = await clRewards(cursor);
-    if (cl == null) {
+    if (cl == null || cl === BEFORE_ACTIVATION) {
         return null;
     }
     const [sum]: any[] = await StakingRewardDaily.sequelize.query(
