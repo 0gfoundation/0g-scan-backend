@@ -235,7 +235,8 @@ export async function getValidatorRewards(opt: RangeOpt & {validator?: string, s
 
 let communityPool: string = null;
 async function communityPoolAddress(): Promise<string> {
-    if (!communityPool) {
+    // without ether.url there is nothing to ask; ethers would default to localhost:8545
+    if (!communityPool && stakingRpcUrl()) {
         const staking = new ethers.Contract(stakingOption().contract,
             ['function communityPoolAddress() view returns (address)'], staticProvider(stakingRpcUrl()));
         communityPool = await staking.communityPoolAddress().catch(() => null);

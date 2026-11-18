@@ -198,6 +198,12 @@ staking?: {
 
   这只用于新搭建的环境：`run.sh` 只在 `Prod.js` 不存在时才生成它。
 
+**没有配置时的行为**（2026-11-18）：
+- 没有 `staking` 或 `staking.enabled` 不是 true：`token_x` 不启动 staking，其他同步照常。表照样会建，但都是空的。`/open/staking/*` 统一返回 `{"status":"0","message":"staking index is not enabled on this deployment"}`，以前返回的是空列表和 0，没法和"真的没有质押"区分开。
+- 开了 staking 但没有 `ether.url`：初始化报错 `staking sync needs config.ether.url`，记日志并告警，staking 不运行。不会退回去用 `conflux.url`。
+- 开了 staking 但 `blockRewards.enabled` 没开：`/validator/rewards`、`/validator/blocks`、`/community/tax`、`/foundation/rewards`、`/restaking/rewards`、`/slashes` 返回 `block rewards are not collected on this deployment`，其余接口正常。
+- 没有 `ether.url` 时，`/community/tax` 的 `communityPool` 直接为 null。以前 ethers 会默认去连 `localhost:8545`。
+
 **已部署环境的发布**（不需要 `run.sh`）：容器挂载仓库目录，直接运行编译出来的 `.js`，启动时不编译。
 1. `git pull`，然后 `npm run compile`；
 2. 在现有的 `stat/config/Prod.js` 里手工加 `ether: { url: ... }`（`eth_*` 的 RPC）和 `staking: {...}` 两段；
