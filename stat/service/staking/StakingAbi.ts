@@ -31,6 +31,8 @@ export const TOPIC = {
     WithdrawalFeeInGweiChanged: id('WithdrawalFeeInGweiChanged(uint96,uint96)'),
     WithdrawCommission: id('WithdrawCommission(address,address,uint256)'),
     WithdrawTipFee: id('WithdrawTipFee(address,address,uint256)'),
+    DistributeRewards: id('DistributeRewards(uint256,uint256,uint256)'),
+    PushWithdrawEntry: id('PushWithdrawEntry(address,uint256,uint256,bool)'),
     // fetched only to tell the two exit implementations apart, never stored (see StakingSync)
     Exited: id('Exited(address)'),
     /** OpenZeppelin UpgradeableBeacon */
@@ -43,6 +45,7 @@ export const VALIDATOR_TOPICS = [
     TOPIC.DelegateV1, TOPIC.UndelegateV1, TOPIC.DelegateV2, TOPIC.UndelegateV2,
     TOPIC.OwnershipTransferred, TOPIC.CommissionRateChanged, TOPIC.WithdrawalFeeInGweiChanged,
     TOPIC.WithdrawCommission, TOPIC.WithdrawTipFee, TOPIC.Exited,
+    TOPIC.DistributeRewards, TOPIC.PushWithdrawEntry,
 ];
 
 /**
@@ -235,6 +238,24 @@ export function decodeStakingLog(log: RawLog): DecodedStakingEvent | null {
             const eventType = t[0] === TOPIC.WithdrawCommission
                 ? StakingEventType.WithdrawCommission : StakingEventType.WithdrawTipFee;
             return {eventType, validator: emitter, account: owner, counterparty: withdrawal, amount: wordUint(w[0])};
+        }
+        case TOPIC.DistributeRewards: {
+            // (uint tax, uint rewards, uint commission), nothing indexed
+            if (t.length !== 1 || w.length < 3) bad(log, 'distribute rewards');
+            const [tax, rewards, commission] = w.slice(0, 3).map(x => BigInt(x));
+            return {
+                eventType: StakingEventType.DistributeRewards, validator: emitter, amount: (tax + rewards + commission).toString(),
+                extra: {tax: tax.toString(), rewards: rewards.toString(), commission: commission.toString()},
+            };
+        }
+        case TOPIC.PushWithdrawEntry: {
+            // (address indexed delegatorAddress, uint completionHeight, uint amount, bool isFailed)
+            const recipient = topicAddr(t[1]);
+            if (t.length !== 2 || !recipient || w.length < 3) bad(log, 'push withdraw entry');
+            return {
+                eventType: StakingEventType.PushWithdrawEntry, validator: emitter, account: recipient, amount: wordUint(w[1]),
+                extra: {completionHeight: wordUint(w[0]), isFailed: BigInt(w[2]) !== BigInt(0)},
+            };
         }
         case TOPIC.Exited: {
             const owner = topicAddr(t[1]);

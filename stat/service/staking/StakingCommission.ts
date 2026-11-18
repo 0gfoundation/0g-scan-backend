@@ -212,7 +212,7 @@ export class CommissionModel {
                 eventType: {[Op.in]: [
                     StakingEventType.ValidatorInitialized, StakingEventType.OwnershipTransferred,
                     StakingEventType.Delegate,
-                    StakingEventType.Undelegate, StakingEventType.WithdrawCommission,
+                    StakingEventType.Undelegate, StakingEventType.WithdrawCommission, StakingEventType.DistributeRewards,
                     StakingEventType.SlashDetected, StakingEventType.ImplementationUpgraded,
                 ]},
             },
@@ -230,6 +230,7 @@ export class CommissionModel {
                 case StakingEventType.Delegate:
                 case StakingEventType.Undelegate:
                 case StakingEventType.WithdrawCommission:
+                case StakingEventType.DistributeRewards:
                     this.push(this.flows, r.validator, {block, account: r.account, type: r.eventType});
                     break;
                 case StakingEventType.SlashDetected:
@@ -289,7 +290,10 @@ export class CommissionModel {
             if (u.formula !== this.formulaAt(u.block - 1)) add(u.block, u.block);
         }
         for (const f of this.flows.get(v) || []) {
-            if (this.formulaAt(f.block) === 'shares-tokens') {
+            if (f.type === StakingEventType.DistributeRewards) {
+                // a distribution sent by a transaction grows rewards: only the newer check counts them
+                if (this.formulaAt(f.block) === 'delegated-tokens') add(f.block, f.block);
+            } else if (this.formulaAt(f.block) === 'shares-tokens') {
                 // any Delegate / Undelegate / WithdrawCommission folds rewards into tokens
                 add(f.block, f.block);
             } else if (f.type !== StakingEventType.WithdrawCommission &&

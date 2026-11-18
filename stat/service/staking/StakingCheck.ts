@@ -180,6 +180,12 @@ async function writeCheckpoint(cursor: number, createdAt: Date): Promise<Commiss
             `select validator, cast(sum(commission) as char) as s from ${StakingBlockReward.getTableName()}
              where blockNumber > ? and blockNumber <= ? group by validator`,
             {type: QueryTypes.SELECT, replacements: range}));
+        // commission from distributions sent by ordinary transactions (StakingEventType.DistributeRewards)
+        const distributed = sumBy(await StakingEvent.sequelize.query(
+            `select validator, cast(sum(cast(json_unquote(json_extract(extra, '$.commission')) as decimal(65, 0))) as char) as s
+             from ${StakingEvent.getTableName()} where eventType = ? and blockNumber > ? and blockNumber <= ? group by validator`,
+            {type: QueryTypes.SELECT, replacements: [StakingEventType.DistributeRewards, ...range]}));
+        distributed.forEach((v, k) => expected.set(k, (expected.get(k) ?? BigInt(0)) + v));
         const withdrawn = sumBy(await StakingEvent.sequelize.query(
             `select validator, cast(sum(amount) as char) as s from ${StakingEvent.getTableName()}
              where eventType = ? and blockNumber > ? and blockNumber <= ? group by validator`,

@@ -800,6 +800,24 @@ group by validator;
 
 主网恢复：发布新代码后，清空区块奖励相关的表和游标，从块 1 重新采集。事件、份额、validator 表不用动。
 
+### 外部注入奖励与不发事件的佣金提取（2026-11-19，主网严格模式第二次停住）
+
+逐块采集在块 9,977,000 停住：佣金检查点发现 `0x6bd0…5896` 不一致。逐块佣金本身是对的（6 次出块，每块的链上增量都和记录一致），原因在两笔交易：
+- **外部注入奖励：** 块 9,971,416，owner 调用一个可以付款的函数（selector `0x6f4a2cd0`），附带 0.5222 0G。合约按奖励分配，并发出 `DistributeRewards(tax, rewards, commission)`：社区税 0.05222、委托人奖励 0.418、佣金 0.05222。这是普通交易发出的日志，`eth_getLogs` 能取到。每块的奖励分配是系统调用，它的 `DistributeRewards` 取不到（这一点不变）。
+- **不发事件的佣金提取：** 块 9,972,383，owner 调用 `withdrawCommission(address)`（`0x16c58d04`）提走全部 0.56938 0G，只有 `PushWithdrawEntry`，没有 `WithdrawCommission`。
+
+检查点原来只把出块佣金算作预期计提、只把 `WithdrawCommission` 算作提取，两笔都漏了。主网全链扫描结果：
+- 普通交易触发的 `DistributeRewards`：26 次，12 个 validator，从块 5,536,977 到 48,612,878，佣金合计 0.4973 0G。现在的实现也还能注入；
+- 没有事件的提取：只有 9,972,383 这一次。`WithdrawCommission` 从 10,135,795 才开始出现。
+
+修正：
+- 采集 `DistributeRewards`（新事件类型 26，`/events` 类型名 `distribute_rewards`，`extra` 里是税、委托人奖励、佣金）；佣金检查点把其中的佣金算进预期计提；新公式下，注入奖励的块也重新判断一次达标（rewards 增加了）。
+- 采集 `PushWithdrawEntry`，但不入库。同一笔交易里没有 `Undelegate` / `WithdrawCommission` / `WithdrawTipFee` / 退出时，按交易调用的函数补出佣金或小费提取（`extra.inferred`），金额取 `PushWithdrawEntry` 里的值。无法解释的，严格模式下停住事件同步。
+- 已同步过的库，首次启动时回填这两类日志（KV `STAKING_LEGACY_EVENTS`）。演练库回填出 26 次注入、1 次推断提取，和全链扫描一致。
+- 统计口径不变：`/validator/rewards`、`/community/tax` 只统计出块奖励，外部注入的部分在 `/events` 里单独查。`/fees` 基于链上佣金余额加提取记录，推断出的提取也计算在内。
+
+演练：9,960,000–9,979,999（停住的窗口）155 个检查点窗口全部 ok；48,600,000–48,619,999（严格模式，含 48,612,878 的注入）CL 逐 gwei 一致，318 个窗口全部 ok。
+
 ### 已定事项（2026-11-09）
 
 | 事项 | 结论 |

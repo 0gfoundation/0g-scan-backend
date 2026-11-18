@@ -150,7 +150,109 @@ export async function initStakingSync() {
     await backfillUpgrades();
     const rows = await StakingValidator.findAll({attributes: ['address'], raw: true});
     rows.forEach(r => ctx.validators.add(r.address));
+    await backfillLegacyEvents();
     console.log(`staking sync: ${ctx.validators.size} validators known, cursor ${await getStakingCursor()}`);
+}
+
+const SELECTOR = {
+    withdrawCommission: ethers.utils.id('withdrawCommission(address)').slice(0, 10),
+    withdrawTipFee: ethers.utils.id('withdrawTipFee(address)').slice(0, 10),
+    exit: ethers.utils.id('exit()').slice(0, 10),
+};
+/** events whose transaction explains a PushWithdrawEntry from the same validator */
+const EXPLAINS_PUSH = [StakingEventType.Undelegate, StakingEventType.WithdrawCommission, StakingEventType.WithdrawTipFee, StakingEventType.ValidatorExited];
+type Decoded = {log: RawLog, ev: DecodedStakingEvent};
+
+/**
+ * PushWithdrawEntry is never stored. One with no Undelegate, WithdrawCommission,
+ * WithdrawTipFee or exit in its transaction is a withdrawal an early
+ * implementation made without its event (mainnet: withdrawCommission(address)
+ * at 9,972,383 by 0x6bd0...5896's owner; WithdrawCommission only appears from
+ * 10,135,795). The called function tells which, and the entry's amount is the
+ * amount withdrawn, so it becomes that event, marked `extra.inferred`. Anything
+ * else is reported; strict mode stops there rather than drop it.
+ */
+async function inferWithdrawals(decoded: Decoded[], explained: (tx: string, validator: string) => Promise<boolean>): Promise<Decoded[]> {
+    const out: Decoded[] = [];
+    for (const d of decoded) {
+        if (d.ev.eventType !== StakingEventType.PushWithdrawEntry) {
+            out.push(d);
+            continue;
+        }
+        if (await explained(d.log.transactionHash, d.ev.validator)) {
+            continue;
+        }
+        const tx = await withRateRetry(() => ctx.provider.send('eth_getTransactionByHash', [d.log.transactionHash]));
+        const selector = (tx?.input || '').slice(0, 10);
+        const to = (tx?.to || '').toLowerCase();
+        const kind = to === d.ev.validator && selector === SELECTOR.withdrawCommission ? StakingEventType.WithdrawCommission
+            : to === d.ev.validator && selector === SELECTOR.withdrawTipFee ? StakingEventType.WithdrawTipFee : null;
+        if (kind != null) {
+            out.push({log: d.log, ev: {
+                eventType: kind, validator: d.ev.validator, account: String(tx.from).toLowerCase(), counterparty: d.ev.account,
+                amount: d.ev.amount, extra: {inferred: 'PushWithdrawEntry', selector},
+            }});
+            continue;
+        }
+        if (selector === SELECTOR.exit) {
+            continue;
+        }
+        const msg = `unexplained PushWithdrawEntry of ${d.ev.validator} in tx ${d.log.transactionHash} (to ${to}, selector ${selector})`;
+        if (stakingOption().strict) {
+            throw new StrictModeWait(`event sync stopped (strict mode): ${msg}`);
+        }
+        console.log(`staking sync: ${msg}, skipped`);
+        safeAddErrorLog('staking', 'push-withdraw', new Error(msg));
+    }
+    return out;
+}
+
+const KEY_LEGACY_EVENTS = 'STAKING_LEGACY_EVENTS';
+
+/**
+ * DistributeRewards and PushWithdrawEntry were added to the fetched topics
+ * later: a database synced before has neither the user-triggered
+ * distributions nor the inferred withdrawals, so they are loaded once up to
+ * the cursor. Whether a transaction already explains a PushWithdrawEntry is
+ * then answered from the stored events.
+ */
+async function backfillLegacyEvents() {
+    if (await KV.getString(KEY_LEGACY_EVENTS, '') === '1') {
+        return;
+    }
+    const cursor = await getStakingCursor();
+    const addresses = [...ctx.validators];
+    let decoded: Decoded[] = [];
+    for (let from = 1; from <= cursor; from += ctx.range) {
+        const to = Math.min(cursor, from + ctx.range - 1);
+        for (let i = 0; i < addresses.length; i += ADDRESS_CHUNK) {
+            for (const log of await getLogs(addresses.slice(i, i + ADDRESS_CHUNK), [TOPIC.DistributeRewards, TOPIC.PushWithdrawEntry], from, to)) {
+                decoded.push({log, ev: decodeStakingLog(log)});
+            }
+        }
+    }
+    decoded = await inferWithdrawals(decoded, async (tx, validator) => !!await StakingEvent.findOne({
+        raw: true, attributes: ['id'], where: {txHash: tx, validator, eventType: {[Op.in]: EXPLAINS_PUSH}},
+    }));
+    const times = await blockTimes([...new Set(decoded.map(d => d.log.blockNumber))]);
+    await StakingEvent.sequelize.transaction(async dbTx => {
+        for (const {log, ev} of decoded) {
+            await StakingEvent.findOrCreate({
+                where: {blockNumber: log.blockNumber, logIndex: log.logIndex, validator: ev.validator},
+                defaults: {
+                    blockNumber: log.blockNumber, blockHash: log.blockHash, createdAt: times.get(log.blockNumber),
+                    txHash: log.transactionHash, txIndex: log.transactionIndex, logIndex: log.logIndex,
+                    validator: ev.validator, eventType: ev.eventType, account: ev.account, counterparty: ev.counterparty,
+                    amount: ev.amount, extra: ev.extra,
+                },
+                transaction: dbTx,
+            });
+        }
+        await KV.upsert({key: KEY_LEGACY_EVENTS, value: '1'}, {transaction: dbTx});
+    });
+    const n = (t: StakingEventType) => decoded.filter(d => d.ev.eventType === t).length;
+    console.log(`staking sync: backfilled ${n(StakingEventType.DistributeRewards)} user-triggered distributions and `
+        + `${n(StakingEventType.WithdrawCommission) + n(StakingEventType.WithdrawTipFee)} inferred withdrawals up to ${cursor}`);
 }
 
 /**
@@ -464,6 +566,9 @@ async function syncWindow(from: number, to: number): Promise<WindowResult> {
     const newStyleExit = new Set(decoded.filter(d => d.ev.eventType === StakingEventType.Exited)
         .map(d => `${d.log.transactionHash}|${d.ev.validator}`));
     decoded = decoded.filter(d => d.ev.eventType !== StakingEventType.Exited);
+    // PushWithdrawEntry: kept only where it stands for a withdrawal that emitted no event
+    const explaining = new Set(decoded.filter(d => EXPLAINS_PUSH.includes(d.ev.eventType)).map(d => `${d.log.transactionHash}|${d.ev.validator}`));
+    decoded = await inferWithdrawals(decoded, async (tx, validator) => explaining.has(`${tx}|${validator}`));
     const exits = new Map<string, {owner: string, exitSettlement: string | null, implementation: string}>();
     for (const {log, ev} of decoded) {
         if (ev.eventType === StakingEventType.ValidatorExited) {
