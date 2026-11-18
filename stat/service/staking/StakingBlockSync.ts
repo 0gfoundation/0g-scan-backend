@@ -26,7 +26,6 @@ import {
     stakingRpcUrl,
     StrictModeWait,
     withStakingLock,
-    WITHDRAWAL_ACTIVATION_BLOCK,
 } from "./StakingSync";
 
 /**
@@ -237,9 +236,17 @@ async function clRewards(block: number): Promise<bigint | typeof BEFORE_ACTIVATI
     if (!/\/blocks\/[^/]+\/total_withdrawals\/?$/.test(url)) {
         return null;
     }
+    if (block < 1) {
+        // never ask for block 0: the consensus layer answers /blocks/0/ with the head
+        return BEFORE_ACTIVATION;
+    }
     const resp = await fetch(url.replace(/\/blocks\/[^/]+\/total_withdrawals\/?$/, `/blocks/${block}/total_withdrawals`));
     const json: any = await resp.json();
     if (json?.data?.rewards != null) {
+        // a figure for any other block (the head, for one) would poison the baseline
+        if (Number(json.data.number) !== block) {
+            throw new Error(`consensus layer total_withdrawals for ${block} answered block ${json.data.number}`);
+        }
         return BigInt(json.data.rewards);
     }
     if (json?.code === 404 && /before the withdrawal activation/i.test(json?.message || '')) {
@@ -250,13 +257,19 @@ async function clRewards(block: number): Promise<bigint | typeof BEFORE_ACTIVATI
 
 /**
  * The consensus layer's cumulative rewards up to the block before `start`,
- * what reconciliation subtracts. When `start` is the activation block there is
- * no such value, and the counter at `start` is not just that block's rewards:
- * it already holds everything accrued before activation (12,409,467.68 0G on
- * mainnet), none of it ever paid as withdrawals. So the baseline is then the
- * counter at `start` less that block's own withdrawals[0..2].
+ * what reconciliation subtracts. The counter is the sum of every block's
+ * withdrawals[0..2] since block 1, but the endpoint only answers from its
+ * "withdrawal activation" (mainnet 10,877,918; 404 before). So: 0 when starting
+ * at block 1; the counter at start - 1 when that is answered; and when start
+ * is the activation block itself, the counter there less that block's own
+ * withdrawals. A start between block 1 and activation has no baseline.
  */
 async function clBaseline(start: number): Promise<bigint | null> {
+    // the counter sums withdrawals[0..2] from block 1 (checked exactly against mainnet:
+    // block 1 pays 0, then 1,140,794,586 gwei a block up to 10,877,918), so it is 0 before block 1
+    if (start <= 1) {
+        return BigInt(0);
+    }
     const before = await clRewards(start - 1);
     if (before !== BEFORE_ACTIVATION) {
         return before;
@@ -321,7 +334,8 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
         }
         return true;
     });
-    return {reward, slashes, otherFoundation, unparsed: reward == null && number >= WITHDRAWAL_ACTIVATION_BLOCK};
+    // every block from 1 carries withdrawals[0..2]
+    return {reward, slashes, otherFoundation, unparsed: reward == null && number >= 1};
 }
 
 type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint, undistributed: bigint,

@@ -73,7 +73,11 @@ export function stakingOption(): Required<StakingOption> {
     };
 }
 
-/** mainnet's first block with withdrawals; the consensus layer 404s before it */
+/**
+ * Mainnet's consensus-layer "withdrawal activation": total_withdrawals answers
+ * 404 below it. Not where withdrawals begin -- every block from 1 carries
+ * withdrawals[0..2] (block 1 paying 0) -- so it is not the collection start.
+ */
 export const WITHDRAWAL_ACTIVATION_BLOCK = 10_877_918;
 const FOUNDATION_ADDRESS = '0x711b0ecb072c27de0e50c9944d7195a51b202522';
 
@@ -81,7 +85,8 @@ export function blockRewardOption() {
     const o = ConfigInstance.staking?.blockRewards || {};
     return {
         enabled: !!o.enabled,
-        startBlock: o.startBlock ?? WITHDRAWAL_ACTIVATION_BLOCK,
+        // every block from 1 carries the rewards; starting later leaves cumulative figures short
+        startBlock: o.startBlock ?? 1,
         // 20 x 2 in flight stays under the RPC's ~50 calls per IP and window
         batchSize: o.batchSize ?? 20,
         concurrency: o.concurrency ?? 2,
