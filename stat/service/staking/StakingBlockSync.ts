@@ -111,6 +111,81 @@ async function taxRateHolds(blocks: number[]): Promise<boolean> {
     return true;
 }
 
+/**
+ * Which address received the community tax, block by block. The tax goes to
+ * the Staking contract's communityPoolAddress, which setCommunityPoolAddress
+ * changes without an event (mainnet: 0x711b…2522 up to 6,587,819, 0x51e0…04c7
+ * from 6,587,820), so the history is read from state and every change bisected
+ * to its block. The pool of block b is the one at the end of b: the tax is sent
+ * after b's transactions. A change and its reversal both inside one checked
+ * span go unnoticed, as with the commission rates.
+ */
+const KEY_POOLS = 'STAKING_COMMUNITY_POOLS';
+
+export interface CommunityPoolHistory {
+    /** in block order; each pool holds from its fromBlock to the next one's */
+    pools: {address: string, fromBlock: number, approx?: boolean}[]
+    /** the history is known up to this block */
+    checkedTo: number
+}
+
+export async function communityPoolHistory(transaction?: Transaction): Promise<CommunityPoolHistory | null> {
+    const row = await KV.findByPk(KEY_POOLS, {raw: true, transaction});
+    return row?.value ? JSON.parse(row.value) : null;
+}
+
+async function poolAt(block: number): Promise<string> {
+    const staking = contract(stakingOption().contract, ['function communityPoolAddress() view returns (address)']);
+    const a = await stateRead(() => staking.communityPoolAddress({blockTag: block}), `communityPoolAddress() at ${block}`);
+    return String(a).toLowerCase();
+}
+
+/** the history extended to `to`, not yet saved; null when nothing could be read */
+async function trackCommunityPool(to: number, strict: boolean): Promise<CommunityPoolHistory | null> {
+    const h = await communityPoolHistory();
+    const pools = h ? [...h.pools] : [];
+    try {
+        let lo: number, loVal: string;
+        if (h) {
+            lo = h.checkedTo;
+            loVal = pools[pools.length - 1].address;
+        } else {
+            lo = blockRewardOption().startBlock;
+            loVal = await poolAt(lo);
+            pools.push({address: loVal, fromBlock: lo});
+        }
+        if (to <= lo) {
+            return {pools, checkedTo: lo};
+        }
+        while (await poolAt(to) !== loVal) {
+            // the first block in (lo, to] whose pool is not loVal
+            let hi = to;
+            while (hi - lo > 1) {
+                const m = Math.floor((lo + hi) / 2);
+                if (await poolAt(m) === loVal) lo = m; else hi = m;
+            }
+            loVal = await poolAt(hi);
+            pools.push({address: loVal, fromBlock: hi});
+            lo = hi;
+            console.log(`staking blocks: community pool is ${loVal} from block ${hi}`);
+        }
+        return {pools, checkedTo: to};
+    } catch (e) {
+        if (strict || !(e instanceof StrictModeWait)) {
+            throw e;
+        }
+        // no historical state: take the pool at `to`, and mark a change found there as approximate
+        const now = await poolAt(to).catch(() => null);
+        if (now == null) {
+            return null;
+        }
+        if (!pools.length || pools[pools.length - 1].address !== now) {
+            pools.push({address: now, fromBlock: pools.length ? to : blockRewardOption().startBlock, approx: true});
+        }
+        return {pools, checkedTo: to};
+    }
+}
+
 interface SlashShares {
     validator: string
     blockNumber: number
@@ -518,6 +593,7 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
     if (strict && !await taxRateHolds(cursor === opt.startBlock - 1 ? [cursor, to] : [to])) {
         return false;
     }
+    const pools = await trackCommunityPool(to, strict);
     const slashShares = strict && slashes.length ? await slashedShares(slashes) : [];
     const blockTimeOf = new Map(slashes.map(s => [s.blockNumber, s.createdAt]));
 
@@ -539,6 +615,9 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
             if (merged.length > seen.length) {
                 await KV.upsert({key: KEY_OTHER_FOUNDATION, value: JSON.stringify(merged)}, {transaction: dbTx});
             }
+        }
+        if (pools) {
+            await KV.upsert({key: KEY_POOLS, value: JSON.stringify(pools)}, {transaction: dbTx});
         }
         await applySlashedShares(slashShares, blockTimeOf, dbTx);
         await KV.saveNumber(KEY_CURSOR, to, dbTx);

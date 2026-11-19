@@ -11,7 +11,7 @@ import {
     StakingSelfDelegation,
 } from "../../model/Staking";
 import {validatorRpcUrl} from "../ZGSupply";
-import {getBlockRewardCursor, otherFoundationAddresses, reconcileBlockRewards} from "./StakingBlockSync";
+import {communityPoolHistory, getBlockRewardCursor, otherFoundationAddresses, reconcileBlockRewards} from "./StakingBlockSync";
 import {commissionCheckOnce} from "./StakingCheck";
 import {reconcileAllShares} from "./StakingRefresher";
 import {staticProvider, withRateRetry} from "./StakingRpc";
@@ -162,6 +162,13 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
     await safely('community tax rate', async () => {
         const seen = await KV.getString('STAKING_COMMUNITY_TAX_RATE_SEEN', '');
         add('community tax rate', seen === String(opt.communityTaxRate) ? 'pass' : 'fail', `chain ${seen || '(never read)'}, configured ${opt.communityTaxRate}`);
+    });
+    await safely('community pool history', async () => {
+        const h = await communityPoolHistory();
+        const approx = h ? h.pools.filter(p => p.approx).length : 0;
+        const ok = h && h.pools[0]?.fromBlock === opt.startBlock && h.checkedTo === blockCursor && !approx;
+        add('community pool history', ok ? 'pass' : 'fail', !h ? 'never tracked' : `${h.pools.map(p => `${p.address} from ${p.fromBlock}`).join(', ')}; `
+            + `checked to ${h.checkedTo} (cursor ${blockCursor})${approx ? `, ${approx} change(s) only approximately placed` : ''}`);
     });
     return {pass: !checks.some(c => c.status === 'fail'), checks};
 }

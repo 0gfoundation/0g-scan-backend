@@ -399,7 +399,7 @@ group by validator;
 | 量 | 定义 | 去向 |
 |---|---|---|
 | **validator 奖励** `reward` | `withdrawals[0].amount` | 本块出块 validator 的合约地址 |
-| **社区税** `communityTax` | `reward × communityTaxRate / 1,000,000`，目前固定 10%（`communityTaxRate = 100000`） | validator 合约当场转给 Staking 合约的 `communityPoolAddress()` = `0x51e0…04c7` |
+| **社区税** `communityTax` | `reward × communityTaxRate / 1,000,000`，目前固定 10%（`communityTaxRate = 100000`） | validator 合约当场转给 Staking 合约的 `communityPoolAddress()`：主网块 6,587,819 及之前是 `0x711b…2522`，6,587,820 起是 `0x51e0…04c7`（见"社区池地址的历史"） |
 | **佣金** `commission` | 满足自质押门槛时为 `reward × commissionRate / 1,000,000`，否则为 0（见下） | 留在 validator 合约里，owner 以后用 `withdrawCommission` 提取 |
 | **委托人奖励** `delegatorReward` | `reward − communityTax − commission` | 计入池子，按 shares 分给所有委托人（含 owner） |
 | restaking 奖励 | `withdrawals[1].amount` | 地址不固定，多数块为 0；采集保存，本期不出接口 |
@@ -533,6 +533,10 @@ group by validator;
 ```json
 {
   "communityPool": "0x51e0232fa953fea9bb9218b369472b06117c04c7",
+  "communityPools": [
+    {"address": "0x711b…2522", "fromBlock": 1, "toBlock": 6587819, "cumulative": {"tax": "…", "blockCount": 6587818}, "range": {"tax": "0", "blockCount": 0}},
+    {"address": "0x51E0…04c7", "fromBlock": 6587820, "toBlock": null, "cumulative": {"tax": "…", "blockCount": …}, "range": {"tax": "…", "blockCount": …}}
+  ],
   "communityTaxRate": 100000,
   "asOfBlock": 49260867, "asOfTime": 1793500000,
   "cumulative": {"tax": "…", "blockCount": 38382891},
@@ -541,7 +545,7 @@ group by validator;
 }
 ```
 
-`communityTaxRate` 是当前费率。`validator` 可选，给了就只统计该 validator 缴的税。`byValidator` 的统计范围和 `range` 相同，没给时间段就是累计。
+`communityPool` 是当前的社区池；`communityPools` 按社区池分段，给出每段的块范围和收到的税，累计和时间段各一份（2026-11-19 新增，见"社区池地址的历史"）。`communityTaxRate` 是当前费率。`validator` 可选，给了就只统计该 validator 缴的税。`byValidator` 的统计范围和 `range` 相同，没给时间段就是累计。
 
 **（3）基金会奖励** —— `GET /foundation/rewards?start=&end=&interval=`
 
@@ -817,6 +821,16 @@ group by validator;
 - 统计口径不变：`/validator/rewards`、`/community/tax` 只统计出块奖励，外部注入的部分在 `/events` 里单独查。`/fees` 基于链上佣金余额加提取记录，推断出的提取也计算在内。
 
 演练：9,960,000–9,979,999（停住的窗口）155 个检查点窗口全部 ok；48,600,000–48,619,999（严格模式，含 48,612,878 的注入）CL 逐 gwei 一致，318 个窗口全部 ok。
+
+### 社区池地址的历史（2026-11-19）
+
+一份基金会地址 `0x711b…2522` 的收入报告里有一项"社区税"，这才发现社区池换过地址：Staking 合约的 `communityPoolAddress()` 在主网块 6,587,819 及之前是 `0x711b…2522`，6,587,820 起是 `0x51e0…04c7`。`setCommunityPoolAddress` 不发事件。原来 `/community/tax` 的税额是对的，但只返回当前的社区池，看起来像全部社区税都进了 `0x51e0`。
+
+- **记录：** 逐块采集每轮读一次本轮末块的 `communityPoolAddress()`，和已知的最后一个不同就二分到块，结果存 KV `STAKING_COMMUNITY_POOLS`（`pools: [{address, fromBlock}]`、`checkedTo`），和游标在同一个事务里写。块 b 的税付给 b 结束时的社区池（奖励分配在交易之后）。第一次运行从 `startBlock` 读起，已部署的库下一轮就会补齐全部历史。严格模式下读不到历史状态就等待；非严格模式退回只读最新块，在那里发现的变更标 `approx`。同一段里改过去又改回来的变更发现不了，和佣金费率一样。
+- **接口：** `/community/tax` 新增 `communityPools`，每段带 `fromBlock`、`toBlock`（当前社区池为 null）和这段收到的税，累计和时间段各一份；`validator` 参数照样生效。分段以块号为界：一秒有好几块，所以先把块范围换成时间范围，用日汇总表加两端零头的老办法算，再把边界那一秒里不属于这段的块减掉。
+- **report：** 新增一项 `community pool history`：历史从 `startBlock` 记起、跟到游标，没有近似的变更。
+- **不统计的部分：** 撤销委托到期付款失败（收款地址拒收）时，validator 合约把这笔钱转给社区池（`ValidatorContract.sol` `_processFailedWithdrawStack`）。这是系统调用，没有交易，日志也取不到，不在 `/community/tax` 里。
+- **演练：** 6,587,000–6,588,999 二分出切换块 6,587,820；两段的累计、时间段、`validator` 过滤都和逐块表求和逐 wei 一致；人为把切换点放在和前一块同一秒的 6,587,005，两段也都对。
 
 ### 已定事项（2026-11-09）
 

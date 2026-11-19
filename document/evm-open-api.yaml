@@ -1185,7 +1185,7 @@ paths:
     get:
       tags:
         - 'Staking'
-      description: "Community tax: 10% of each block's withdrawals[0], which the validator contract sends to the Staking contract's communityPoolAddress (`communityPool` in the response). Cumulative and over [start, end), with a per-validator breakdown over the same span. Figures come from each block's withdrawals[0..2] and slashed array, collected from `startBlock` up to `asOfBlock` (both in the response); cumulative means over that span. Amounts are wei."
+      description: "Community tax: 10% of each block's withdrawals[0], which the validator contract sends to the Staking contract's communityPoolAddress. `communityPool` is the pool now; the pool has changed over time (on mainnet 0x711b…2522 up to block 6,587,819, 0x51E0…04c7 from 6,587,820), so `communityPools` lists every pool with its block span (`toBlock` null for the current one) and the tax it received, cumulative and, with a range, over the range; a pool marked `approximate` had its first block placed without historical state. `communityPools` is null until the pools have been tracked. Only the per-block tax is counted: what a validator sends the pool when it cannot pay out a matured withdrawal is not. Cumulative and over [start, end), with a per-validator breakdown over the same span. Figures come from each block's withdrawals[0..2] and slashed array, collected from `startBlock` up to `asOfBlock` (both in the response); cumulative means over that span. Amounts are wei."
       parameters:
         - name: validator
           in: query
