@@ -2,7 +2,7 @@ import {ethers} from "ethers";
 import {Op, QueryTypes} from "sequelize";
 import {KV} from "../../model/KV";
 import {StakingBlockReward, StakingBlockSlash, StakingRestakingDaily, StakingRewardDaily, StakingValidator} from "../../model/Staking";
-import {otherFoundationAddresses} from "./StakingBlockSync";
+import {communityPoolHistory, otherFoundationAddresses} from "./StakingBlockSync";
 import {staticProvider} from "./StakingRpc";
 import {blockRewardOption, stakingOption, stakingRpcUrl} from "./StakingSync";
 
@@ -244,6 +244,67 @@ async function communityPoolAddress(): Promise<string> {
     return communityPool;
 }
 
+const blockTime = async (n: number) => (await StakingBlockReward.findByPk(n, {raw: true, attributes: ['createdAt']}))?.createdAt;
+
+/**
+ * Totals of blocks [lo, hi] that also fall in [from, to) (ms). Block bounds
+ * become time bounds, and since several blocks share a second, the blocks of
+ * a boundary second outside [lo, hi] are taken out again.
+ */
+async function blockSpanTotals(lo: number, hi: number, validator: string | undefined, from?: number, to?: number): Promise<Totals> {
+    const [tLo, tHi] = await Promise.all([blockTime(lo), blockTime(hi)]);
+    if (!tLo || !tHi) {
+        return empty();
+    }
+    const start = Math.max(from ?? 0, new Date(tLo).getTime());
+    const end = Math.min(to ?? Infinity, new Date(tHi).getTime() + 1000);
+    if (start >= end) {
+        return empty();
+    }
+    let t = total(await rangeGrouped('validator', validator, start, end));
+    const outside = async (second: number, cond: string, bound: number) => {
+        const [r]: any[] = await StakingBlockReward.sequelize.query(
+            `select ${SUM_COLS} from ${StakingBlockReward.getTableName()}
+             where createdAt = ? and ${cond}${validator ? ' and validator = ?' : ''}`,
+            {type: QueryTypes.SELECT, replacements: [new Date(second), bound, ...(validator ? [validator] : [])]});
+        return fromRow(r);
+    };
+    const minus = (a: Totals, b: Partial<Totals>): Totals => ({
+        ...a, blockCount: a.blockCount - (b.blockCount ?? 0), communityTax: a.communityTax - (b.communityTax ?? ZERO),
+    });
+    if (start === new Date(tLo).getTime()) t = minus(t, await outside(start, 'blockNumber < ?', lo));
+    if (end === new Date(tHi).getTime() + 1000) t = minus(t, await outside(end - 1000, 'blockNumber > ?', hi));
+    return t;
+}
+
+/**
+ * The community tax split by the pool that received it, cumulative and, with
+ * a range, over it too; null until the block sync has tracked the pools.
+ */
+async function taxByPool(cursor: number | null, validator: string | undefined, range: {from: number, to: number} | null) {
+    const h = await communityPoolHistory();
+    if (!h || cursor == null) {
+        return null;
+    }
+    const startBlock = blockRewardOption().startBlock;
+    return Promise.all(h.pools.map(async (p, i) => {
+        const next = h.pools[i + 1];
+        const toBlock = next ? next.fromBlock - 1 : null;
+        const lo = Math.max(p.fromBlock, startBlock), hi = Math.min(toBlock ?? cursor, cursor);
+        const fmt = (t: Totals) => ({tax: t.communityTax.toString(), blockCount: t.blockCount});
+        const [cum, inRange] = await Promise.all([
+            lo <= hi ? blockSpanTotals(lo, hi, validator) : empty(),
+            range ? (lo <= hi ? blockSpanTotals(lo, hi, validator, range.from, range.to) : empty()) : null,
+        ]);
+        return {
+            address: checksum(p.address), fromBlock: p.fromBlock, toBlock,
+            ...(p.approx ? {approximate: true} : {}),
+            cumulative: fmt(cum),
+            ...(inRange ? {range: fmt(inRange)} : {}),
+        };
+    }));
+}
+
 /** (2) community tax */
 export async function getCommunityTax(opt: RangeOpt & {validator?: string}) {
     const head = await asOf();
@@ -259,6 +320,7 @@ export async function getCommunityTax(opt: RangeOpt & {validator?: string}) {
         .map(([address, t]) => ({validator: checksum(address), moniker: monikers.get(address) ?? null, ...fmt(t)}));
     return {
         communityPool: await communityPoolAddress(),
+        communityPools: await taxByPool(head.asOfBlock, opt.validator, range),
         communityTaxRate: Number(blockRewardOption().communityTaxRate),
         ...head,
         ...(opt.validator ? {validator: checksum(opt.validator)} : {}),

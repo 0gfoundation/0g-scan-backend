@@ -26,7 +26,6 @@ import {
     stakingRpcUrl,
     StrictModeWait,
     withStakingLock,
-    WITHDRAWAL_ACTIVATION_BLOCK,
 } from "./StakingSync";
 
 /**
@@ -112,6 +111,81 @@ async function taxRateHolds(blocks: number[]): Promise<boolean> {
     return true;
 }
 
+/**
+ * Which address received the community tax, block by block. The tax goes to
+ * the Staking contract's communityPoolAddress, which setCommunityPoolAddress
+ * changes without an event (mainnet: 0x711b…2522 up to 6,587,819, 0x51e0…04c7
+ * from 6,587,820), so the history is read from state and every change bisected
+ * to its block. The pool of block b is the one at the end of b: the tax is sent
+ * after b's transactions. A change and its reversal both inside one checked
+ * span go unnoticed, as with the commission rates.
+ */
+const KEY_POOLS = 'STAKING_COMMUNITY_POOLS';
+
+export interface CommunityPoolHistory {
+    /** in block order; each pool holds from its fromBlock to the next one's */
+    pools: {address: string, fromBlock: number, approx?: boolean}[]
+    /** the history is known up to this block */
+    checkedTo: number
+}
+
+export async function communityPoolHistory(transaction?: Transaction): Promise<CommunityPoolHistory | null> {
+    const row = await KV.findByPk(KEY_POOLS, {raw: true, transaction});
+    return row?.value ? JSON.parse(row.value) : null;
+}
+
+async function poolAt(block: number): Promise<string> {
+    const staking = contract(stakingOption().contract, ['function communityPoolAddress() view returns (address)']);
+    const a = await stateRead(() => staking.communityPoolAddress({blockTag: block}), `communityPoolAddress() at ${block}`);
+    return String(a).toLowerCase();
+}
+
+/** the history extended to `to`, not yet saved; null when nothing could be read */
+async function trackCommunityPool(to: number, strict: boolean): Promise<CommunityPoolHistory | null> {
+    const h = await communityPoolHistory();
+    const pools = h ? [...h.pools] : [];
+    try {
+        let lo: number, loVal: string;
+        if (h) {
+            lo = h.checkedTo;
+            loVal = pools[pools.length - 1].address;
+        } else {
+            lo = blockRewardOption().startBlock;
+            loVal = await poolAt(lo);
+            pools.push({address: loVal, fromBlock: lo});
+        }
+        if (to <= lo) {
+            return {pools, checkedTo: lo};
+        }
+        while (await poolAt(to) !== loVal) {
+            // the first block in (lo, to] whose pool is not loVal
+            let hi = to;
+            while (hi - lo > 1) {
+                const m = Math.floor((lo + hi) / 2);
+                if (await poolAt(m) === loVal) lo = m; else hi = m;
+            }
+            loVal = await poolAt(hi);
+            pools.push({address: loVal, fromBlock: hi});
+            lo = hi;
+            console.log(`staking blocks: community pool is ${loVal} from block ${hi}`);
+        }
+        return {pools, checkedTo: to};
+    } catch (e) {
+        if (strict || !(e instanceof StrictModeWait)) {
+            throw e;
+        }
+        // no historical state: take the pool at `to`, and mark a change found there as approximate
+        const now = await poolAt(to).catch(() => null);
+        if (now == null) {
+            return null;
+        }
+        if (!pools.length || pools[pools.length - 1].address !== now) {
+            pools.push({address: now, fromBlock: pools.length ? to : blockRewardOption().startBlock, approx: true});
+        }
+        return {pools, checkedTo: to};
+    }
+}
+
 interface SlashShares {
     validator: string
     blockNumber: number
@@ -187,8 +261,9 @@ export async function otherFoundationAddresses(transaction?: Transaction): Promi
     return row?.value ? JSON.parse(row.value) : [];
 }
 
-export async function getBlockRewardCursor(): Promise<number> {
-    return (await KV.getNumber(KEY_CURSOR)) ?? blockRewardOption().startBlock - 1;
+export async function getBlockRewardCursor(transaction?: Transaction): Promise<number> {
+    const row = await KV.findByPk(KEY_CURSOR, {raw: true, transaction});
+    return row?.value ? parseInt(row.value) : blockRewardOption().startBlock - 1;
 }
 
 /** rate-limit rejections are retried inside postBatch; this retries the rest (dropped connections, a lagging node) */
@@ -237,9 +312,17 @@ async function clRewards(block: number): Promise<bigint | typeof BEFORE_ACTIVATI
     if (!/\/blocks\/[^/]+\/total_withdrawals\/?$/.test(url)) {
         return null;
     }
+    if (block < 1) {
+        // never ask for block 0: the consensus layer answers /blocks/0/ with the head
+        return BEFORE_ACTIVATION;
+    }
     const resp = await fetch(url.replace(/\/blocks\/[^/]+\/total_withdrawals\/?$/, `/blocks/${block}/total_withdrawals`));
     const json: any = await resp.json();
     if (json?.data?.rewards != null) {
+        // a figure for any other block (the head, for one) would poison the baseline
+        if (Number(json.data.number) !== block) {
+            throw new Error(`consensus layer total_withdrawals for ${block} answered block ${json.data.number}`);
+        }
         return BigInt(json.data.rewards);
     }
     if (json?.code === 404 && /before the withdrawal activation/i.test(json?.message || '')) {
@@ -250,13 +333,19 @@ async function clRewards(block: number): Promise<bigint | typeof BEFORE_ACTIVATI
 
 /**
  * The consensus layer's cumulative rewards up to the block before `start`,
- * what reconciliation subtracts. When `start` is the activation block there is
- * no such value, and the counter at `start` is not just that block's rewards:
- * it already holds everything accrued before activation (12,409,467.68 0G on
- * mainnet), none of it ever paid as withdrawals. So the baseline is then the
- * counter at `start` less that block's own withdrawals[0..2].
+ * what reconciliation subtracts. The counter is the sum of every block's
+ * withdrawals[0..2] since block 1, but the endpoint only answers from its
+ * "withdrawal activation" (mainnet 10,877,918; 404 before). So: 0 when starting
+ * at block 1; the counter at start - 1 when that is answered; and when start
+ * is the activation block itself, the counter there less that block's own
+ * withdrawals. A start between block 1 and activation has no baseline.
  */
 async function clBaseline(start: number): Promise<bigint | null> {
+    // the counter sums withdrawals[0..2] from block 1 (checked exactly against mainnet:
+    // block 1 pays 0, then 1,140,794,586 gwei a block up to 10,877,918), so it is 0 before block 1
+    if (start <= 1) {
+        return BigInt(0);
+    }
     const before = await clRewards(start - 1);
     if (before !== BEFORE_ACTIVATION) {
         return before;
@@ -321,7 +410,8 @@ function parseBlock(b: any, warn: (msg: string) => void): Parsed {
         }
         return true;
     });
-    return {reward, slashes, otherFoundation, unparsed: reward == null && number >= WITHDRAWAL_ACTIVATION_BLOCK};
+    // every block from 1 carries withdrawals[0..2]
+    return {reward, slashes, otherFoundation, unparsed: reward == null && number >= 1};
 }
 
 type Daily = {blockCount: number, reward: bigint, communityTax: bigint, commission: bigint, undistributed: bigint,
@@ -504,6 +594,7 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
     if (strict && !await taxRateHolds(cursor === opt.startBlock - 1 ? [cursor, to] : [to])) {
         return false;
     }
+    const pools = await trackCommunityPool(to, strict);
     const slashShares = strict && slashes.length ? await slashedShares(slashes) : [];
     const blockTimeOf = new Map(slashes.map(s => [s.blockNumber, s.createdAt]));
 
@@ -525,6 +616,9 @@ export async function stakingBlockSyncOnce(): Promise<boolean> {
             if (merged.length > seen.length) {
                 await KV.upsert({key: KEY_OTHER_FOUNDATION, value: JSON.stringify(merged)}, {transaction: dbTx});
             }
+        }
+        if (pools) {
+            await KV.upsert({key: KEY_POOLS, value: JSON.stringify(pools)}, {transaction: dbTx});
         }
         await applySlashedShares(slashShares, blockTimeOf, dbTx);
         await KV.saveNumber(KEY_CURSOR, to, dbTx);

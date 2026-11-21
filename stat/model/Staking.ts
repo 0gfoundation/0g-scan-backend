@@ -24,6 +24,20 @@ export enum StakingEventType {
     /** not stored any more: fetched only to tell exit implementations apart; rows from before stay */
     Exited = 25,
     /**
+     * A reward distribution triggered by an ordinary transaction: early
+     * implementations let anyone send rewards to a validator (mainnet
+     * 0x6bd0...5896 at 9,971,416). `amount` is the sum, `extra` the split
+     * {tax, rewards, commission}. The per-block distributions are system calls,
+     * whose logs eth_getLogs never returns, so every row is one of these.
+     */
+    DistributeRewards = 26,
+    /**
+     * Decoded but never stored: early implementations withdrew commission and
+     * tip fees without WithdrawCommission / WithdrawTipFee, leaving only this
+     * log; the sync turns such a one into the missing withdrawal (StakingSync).
+     */
+    PushWithdrawEntry = 27,
+    /**
      * The validator beacon's Upgraded(implementation): every validator proxy
      * runs the new implementation from this block on. `validator` holds the
      * beacon address, `account` the implementation, and `extra` what the

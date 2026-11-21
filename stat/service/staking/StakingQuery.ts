@@ -45,6 +45,7 @@ export const EVENT_TYPE_NAMES: {[name: string]: StakingEventType} = {
     withdrawal_fee_changed: StakingEventType.WithdrawalFeeInGweiChanged,
     withdraw_commission: StakingEventType.WithdrawCommission,
     withdraw_tip_fee: StakingEventType.WithdrawTipFee,
+    distribute_rewards: StakingEventType.DistributeRewards,
     // no longer collected; kept so rows indexed before the change stay queryable
     exited: StakingEventType.Exited,
 };

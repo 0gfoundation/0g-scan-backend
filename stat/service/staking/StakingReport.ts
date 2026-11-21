@@ -1,4 +1,4 @@
-import {QueryTypes} from "sequelize";
+import {QueryTypes, Transaction} from "sequelize";
 import {KV} from "../../model/KV";
 import {
     StakingBlockReward,
@@ -11,7 +11,7 @@ import {
     StakingSelfDelegation,
 } from "../../model/Staking";
 import {validatorRpcUrl} from "../ZGSupply";
-import {getBlockRewardCursor, otherFoundationAddresses, reconcileBlockRewards} from "./StakingBlockSync";
+import {communityPoolHistory, getBlockRewardCursor, otherFoundationAddresses, reconcileBlockRewards} from "./StakingBlockSync";
 import {commissionCheckOnce} from "./StakingCheck";
 import {reconcileAllShares} from "./StakingRefresher";
 import {staticProvider, withRateRetry} from "./StakingRpc";
@@ -34,9 +34,19 @@ interface Check {
 
 const HEAD_LAG = 100;
 
-async function one(sql: string, replacements: any[] = []): Promise<any> {
-    const [row]: any[] = await StakingBlockReward.sequelize.query(sql, {type: QueryTypes.SELECT, replacements});
+async function one(sql: string, replacements: any[] = [], transaction?: Transaction): Promise<any> {
+    const [row]: any[] = await StakingBlockReward.sequelize.query(sql, {type: QueryTypes.SELECT, replacements, transaction});
     return row;
+}
+
+/**
+ * Runs reads against one consistent snapshot. The sync keeps writing while the
+ * report runs (minutes, with the reconciliations), and it moves the block
+ * cursor, the rows and the pool history in one transaction; comparing any of
+ * them with a cursor read at another moment fails on a correct database.
+ */
+function snapshot<T>(fn: (t: Transaction) => Promise<T>): Promise<T> {
+    return StakingBlockReward.sequelize.transaction({isolationLevel: Transaction.ISOLATION_LEVELS.REPEATABLE_READ}, fn);
 }
 
 export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}> {
@@ -91,10 +101,13 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
     // per-block data
     add('blocks caught up', eventCursor - blockCursor <= HEAD_LAG ? 'pass' : 'fail', `block cursor ${blockCursor}, event cursor ${eventCursor}`);
     await safely('block coverage', async () => {
-        const row = await one(`select count(*) as n, min(blockNumber) as lo, max(blockNumber) as hi from ${StakingBlockReward.getTableName()}`);
-        const expected = blockCursor - opt.startBlock + 1;
-        const ok = Number(row.n) === expected && Number(row.lo) === opt.startBlock && Number(row.hi) === blockCursor;
-        add('block coverage', ok ? 'pass' : 'fail', `${row.n} rows for ${expected} blocks ${opt.startBlock}-${blockCursor} (stored ${row.lo}-${row.hi})`);
+        const [row, cursor] = await snapshot(async t => [
+            await one(`select count(*) as n, min(blockNumber) as lo, max(blockNumber) as hi from ${StakingBlockReward.getTableName()}`, [], t),
+            await getBlockRewardCursor(t),
+        ]);
+        const expected = cursor - opt.startBlock + 1;
+        const ok = Number(row.n) === expected && Number(row.lo) === opt.startBlock && Number(row.hi) === cursor;
+        add('block coverage', ok ? 'pass' : 'fail', `${row.n} rows for ${expected} blocks ${opt.startBlock}-${cursor} (stored ${row.lo}-${row.hi})`);
     });
     await safely('consensus-layer reconciliation', async () => {
         const r = await reconcileBlockRewards();
@@ -103,15 +116,13 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
     await safely('daily totals', async () => {
         const cols = ['reward', 'communityTax', 'commission', 'undistributed', 'restakingReward', 'foundationReward'];
         const sums = cols.map(c => `cast(coalesce(sum(${c}), 0) as char) as ${c}`).join(', ');
-        const [d, b] = await Promise.all([
-            one(`select cast(coalesce(sum(blockCount), 0) as char) as n, ${sums} from ${StakingRewardDaily.getTableName()}`),
-            one(`select count(*) as n, ${sums} from ${StakingBlockReward.getTableName()}`),
+        const [d, b, rd, rb] = await snapshot(async t => [
+            await one(`select cast(coalesce(sum(blockCount), 0) as char) as n, ${sums} from ${StakingRewardDaily.getTableName()}`, [], t),
+            await one(`select count(*) as n, ${sums} from ${StakingBlockReward.getTableName()}`, [], t),
+            await one(`select cast(coalesce(sum(blockCount), 0) as char) as n, cast(coalesce(sum(amount), 0) as char) as a from ${StakingRestakingDaily.getTableName()}`, [], t),
+            await one(`select count(*) as n, cast(coalesce(sum(restakingReward), 0) as char) as a from ${StakingBlockReward.getTableName()} where restakingReward > 0`, [], t),
         ]);
         const bad = ['n', ...cols].filter(c => String(d[c]) !== String(b[c]));
-        const [rd, rb] = await Promise.all([
-            one(`select cast(coalesce(sum(blockCount), 0) as char) as n, cast(coalesce(sum(amount), 0) as char) as a from ${StakingRestakingDaily.getTableName()}`),
-            one(`select count(*) as n, cast(coalesce(sum(restakingReward), 0) as char) as a from ${StakingBlockReward.getTableName()} where restakingReward > 0`),
-        ]);
         if (String(rd.n) !== String(rb.n) || String(rd.a) !== String(rb.a)) bad.push('restaking daily');
         add('daily totals', bad.length ? 'fail' : 'pass', bad.length ? `differ from the per-block table: ${bad.join(', ')}` : 'both daily tables equal the per-block table');
     });
@@ -126,7 +137,8 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
                 sum(status = 'mismatch') as mismatch, sum(status = 'unknown') as unknown, count(distinct blockNumber) as points
             from ${StakingCommissionCheck.getTableName()}`);
         const fromStart = Number(row.lo) <= opt.startBlock - 1;
-        const ok = fromStart && Number(row.hi) === blockCursor && !Number(row.mismatch) && !Number(row.unknown);
+        // the live sync may already have closed a later window
+        const ok = fromStart && Number(row.hi) >= blockCursor && !Number(row.mismatch) && !Number(row.unknown);
         add('commission checkpoints', ok ? 'pass' : 'fail',
             `${row.points} checkpoints ${row.lo}-${row.hi}${fromStart ? '' : ` (not from ${opt.startBlock - 1}: earlier blocks unchecked)`}; `
             + `${Number(row.ok || 0)} ok, ${Number(row.mismatch || 0)} mismatch, ${Number(row.unknown || 0)} unknown`);
@@ -162,6 +174,13 @@ export async function accuracyReport(): Promise<{pass: boolean, checks: Check[]}
     await safely('community tax rate', async () => {
         const seen = await KV.getString('STAKING_COMMUNITY_TAX_RATE_SEEN', '');
         add('community tax rate', seen === String(opt.communityTaxRate) ? 'pass' : 'fail', `chain ${seen || '(never read)'}, configured ${opt.communityTaxRate}`);
+    });
+    await safely('community pool history', async () => {
+        const [h, cursor] = await snapshot(async t => [await communityPoolHistory(t), await getBlockRewardCursor(t)] as const);
+        const approx = h ? h.pools.filter(p => p.approx).length : 0;
+        const ok = h && h.pools[0]?.fromBlock === opt.startBlock && h.checkedTo === cursor && !approx;
+        add('community pool history', ok ? 'pass' : 'fail', !h ? 'never tracked' : `${h.pools.map(p => `${p.address} from ${p.fromBlock}`).join(', ')}; `
+            + `checked to ${h.checkedTo} (cursor ${cursor})${approx ? `, ${approx} change(s) only approximately placed` : ''}`);
     });
     return {pass: !checks.some(c => c.status === 'fail'), checks};
 }

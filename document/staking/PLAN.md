@@ -193,7 +193,7 @@ staking?: {
   | `_STAKING_ENABLED=true` | `staking.enabled` | 不设就不生成 `staking` 段 |
   | `_STAKING_GENESIS` | `staking.genesis` | `mainnet` / `testnet` / `none`，默认 `mainnet` |
   | `_STAKING_BLOCK_REWARDS=true` | `staking.blockRewards.enabled` | 默认关闭 |
-  | `_STAKING_BLOCK_REWARDS_START` | `blockRewards.startBlock` | 空则从 10,877,918 开始 |
+  | `_STAKING_BLOCK_REWARDS_START` | `blockRewards.startBlock` | 空则从块 1 开始 |
   | `_STAKING_FOUNDATION_ADDRESS` | `blockRewards.foundationAddress` | 空则用主网的 `0x711b…2522` |
 
   这只用于新搭建的环境：`run.sh` 只在 `Prod.js` 不存在时才生成它。
@@ -399,7 +399,7 @@ group by validator;
 | 量 | 定义 | 去向 |
 |---|---|---|
 | **validator 奖励** `reward` | `withdrawals[0].amount` | 本块出块 validator 的合约地址 |
-| **社区税** `communityTax` | `reward × communityTaxRate / 1,000,000`，目前固定 10%（`communityTaxRate = 100000`） | validator 合约当场转给 Staking 合约的 `communityPoolAddress()` = `0x51e0…04c7` |
+| **社区税** `communityTax` | `reward × communityTaxRate / 1,000,000`，目前固定 10%（`communityTaxRate = 100000`） | validator 合约当场转给 Staking 合约的 `communityPoolAddress()`：主网块 6,587,819 及之前是 `0x711b…2522`，6,587,820 起是 `0x51e0…04c7`（见"社区池地址的历史"） |
 | **佣金** `commission` | 满足自质押门槛时为 `reward × commissionRate / 1,000,000`，否则为 0（见下） | 留在 validator 合约里，owner 以后用 `withdrawCommission` 提取 |
 | **委托人奖励** `delegatorReward` | `reward − communityTax − commission` | 计入池子，按 shares 分给所有委托人（含 owner） |
 | restaking 奖励 | `withdrawals[1].amount` | 地址不固定，多数块为 0；采集保存，本期不出接口 |
@@ -459,7 +459,7 @@ group by validator;
 
 ### 采集方式
 
-- 新的循环 `StakingBlockSync`，游标存在 KV 里（`STAKING_BLOCK_REWARD_BLOCK`），从 withdrawal 激活块 **10,877,918** 开始。
+- 新的循环 `StakingBlockSync`，游标存在 KV 里（`STAKING_BLOCK_REWARD_BLOCK`），从块 1 开始（2026-11-19 更正：原先写的是 withdrawal 激活块 10,877,918，见"起点更正"）。
 - **游标不能超过 `StakingSync` 的事件游标**：佣金要用到 `CommissionRateChanged`、owner 的委托事件和 `OwnershipTransferred`，这些事件必须先落库。
 - 每次用 JSON-RPC batch 请求 100 个块（`eth_getBlockByNumber(n, false)`），只取 `withdrawals` 和 `slashed`，一批写一个事务。上限到 `latest - confirmations`。
 - 回灌量：截至 2026-11-04 约 3,840 万块（10,877,918 → 49,258,809）。按每秒 10 个 batch（1,000 块/秒）估算约 11 小时，实际速度取决于 RPC 限流。逐日对账回灌约 380 天 × 100 个 validator × 每天 2 次 `eth_call`，量很小。
@@ -533,6 +533,10 @@ group by validator;
 ```json
 {
   "communityPool": "0x51e0232fa953fea9bb9218b369472b06117c04c7",
+  "communityPools": [
+    {"address": "0x711b…2522", "fromBlock": 1, "toBlock": 6587819, "cumulative": {"tax": "…", "blockCount": 6587818}, "range": {"tax": "0", "blockCount": 0}},
+    {"address": "0x51E0…04c7", "fromBlock": 6587820, "toBlock": null, "cumulative": {"tax": "…", "blockCount": …}, "range": {"tax": "…", "blockCount": …}}
+  ],
   "communityTaxRate": 100000,
   "asOfBlock": 49260867, "asOfTime": 1793500000,
   "cumulative": {"tax": "…", "blockCount": 38382891},
@@ -541,7 +545,7 @@ group by validator;
 }
 ```
 
-`communityTaxRate` 是当前费率。`validator` 可选，给了就只统计该 validator 缴的税。`byValidator` 的统计范围和 `range` 相同，没给时间段就是累计。
+`communityPool` 是当前的社区池；`communityPools` 按社区池分段，给出每段的块范围和收到的税，累计和时间段各一份（2026-11-19 新增，见"社区池地址的历史"）。`communityTaxRate` 是当前费率。`validator` 可选，给了就只统计该 validator 缴的税。`byValidator` 的统计范围和 `range` 相同，没给时间段就是累计。
 
 **（3）基金会奖励** —— `GET /foundation/rewards?start=&end=&interval=`
 
@@ -590,7 +594,7 @@ group by validator;
 | `OpenStakingService.ts` / `ESpaceApiRouter` / swagger | `GET /validator/rewards`、`/community/tax`、`/foundation/rewards`、`/restaking/rewards`（2026-11-17）、`/slashes`、`/validator/blocks`（每块带 `restakingAddress`）；`/validators` 和 `/validator` 带累计 `rewards` |
 | `StakingCheck.ts` | 佣金检查点对账、社区税率检查、新鲜度告警；每轮逐块采集后调用 |
 | `StakingMain.ts` | `staking.blockRewards.enabled` 时随 `token_x` 启动；命令行 `blocks`、`check`（立即在游标处打一个检查点）、`check-commission <validator> <from> <to>` |
-| `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`）、`checkIntervalSec`（默认 3600）、`freshnessAlertSec`（默认 600） |
+| `StatConfig.staking.blockRewards` | `enabled`、`startBlock`（默认 1，原为 10,877,918）、`batchSize`（默认 50）、`concurrency`、`foundationAddress`、`communityTaxRate`（默认 100000）、`clTotalWithdrawalsUrl`（默认 `validatorRpc`）、`checkIntervalSec`（默认 3600）、`freshnessAlertSec`（默认 600） |
 
 与设计的差别：
 - 只把"是否达标"存成时间线表（`staking_self_delegation`）。佣金费率每次从事件推出，社区税率用配置值，所以没有通用的 `staking_rate_timeline`。
@@ -752,7 +756,7 @@ group by validator;
 
 **主网上线流程**：
 1. 专用归档节点（不限流、能读任意历史状态），`ether.url` 指向它；`staking.strict = true`；
-2. 事件从块 1、区块奖励从 10,877,918 全量回灌。回灌中有任何不一致都会停住，用 `check-commission` 定位、修正后重启；
+2. 事件和区块奖励都从块 1 全量回灌。回灌中有任何不一致都会停住，用 `check-commission` 定位、修正后重启；
 3. 回灌完成后跑 `report`，全部 PASS 才对前端开放；另外可以用 `diff` 命令和 Xangle 的导出数据做一次交叉核对。
 
 ### 归档节点与主网演练（2026-11-18）
@@ -775,16 +779,65 @@ group by validator;
   各段的数据覆盖、日汇总、罚没、基金会地址、税率检查也全部通过。"事件/区块追上"两项失败是分段演练本身造成的（采的是历史区间，演练期间链头也在走）。
 
 **演练发现并修复的三个问题**（都会在线上全量回灌时出错，而公共 RPC 和已有数据的库把它们掩盖了）：
-1. **激活块的 CL 基准值**：共识层在激活块 10,877,918 处的累计值一开始就是 12,409,468.82 0G，激活前的块返回 404。激活前累积的奖励一次性计入了这个计数，但从来没有作为 withdrawals 发出。原来在 404 时把基准值当成 0，于是这一大笔都算进了差额。现在从激活块开始采集时，基准值取"起始块的累计值减去起始块自己的 withdrawals[0..2]"（`clBaseline`）。
+1. **激活块的 CL 基准值**：共识层在激活块 10,877,918 处的累计值一开始就是 12,409,468.82 0G，激活前的块返回 404。原来在 404 时把基准值当成 0，于是这一大笔都算进了差额。现在从激活块开始采集时，基准值取"起始块的累计值减去起始块自己的 withdrawals[0..2]"（`clBaseline`）。（2026-11-19 更正：这一大笔不是"从未发出的奖励"，而是块 2 到 10,877,917 按块发出的奖励之和；采集应从块 1 开始，见"起点更正"。）
 2. **佣金费率依赖 refresher**：没有 `CommissionRateChanged` 的 validator，模型原来用 `staking_validator.commissionRate`，而这一列由 refresher 写入。逐块采集比 refresher 先跑时，这些 validator 的佣金全按 0 算。现在改为读本轮最后一块的链上 `commissionRate()`，并缓存；到事件游标为止都没变过，所以对之前所有块都适用。
 3. **分配回滚**：`_distributeRewards` 要求社区税率 + 佣金费率 ≤ 100%，否则回滚。0g-geth 是先把奖励加到 validator 合约的余额上，再调用分配，所以回滚后奖励留在合约里，没有计入社区税、佣金和委托人奖励中的任何一项。主网上只有 `0x47d2…7de5` 在块 12,885,933 之前费率是 100%。现在这种块记社区税 0、佣金 0，整块奖励计入新列 `undistributed`（逐块表和日汇总表，migDB 加列）；委托人奖励 = 奖励 − 社区税 − 佣金 − 未分配，接口返回 `undistributed`。R1 里块 10,889,103 验证通过：链上 `commission`、`rewards` 不变，合约余额正好增加了这一块的奖励。
+
+### 起点更正与共识层块 0 问题（2026-11-19）
+
+**区块奖励应从块 1 开始，不是 10,877,918。**
+- 执行层从块 1 起每块都有 `withdrawals[0..2]`：块 1 金额为 0；从块 2 起到块 1,090 万之前，每块固定 1,140,794,586 gwei（出块奖励 1,014,039,632 + 基金会奖励 126,754,954）。
+- 10,877,918 只是共识层 `total_withdrawals` 接口开始返回数据的块（它称之为 "withdrawal activation"，更早的块返回 404）。这个值是早先做供应量时沿用下来的，没有在执行层核实过。
+- 共识层的累计值是从块 1 起所有 `withdrawals[0..2]` 之和：它在块 10,877,918 处的 12,409,468,820,557,362 gwei，正好等于 1,140,794,586 × 10,877,917（块 2 到 10,877,918），在 10,878,000 处也逐 gwei 相等。所以演练时说的"激活前累积、从未作为 withdrawals 发出的奖励"是**错的**：它们都按块发出了。从 10,877,918 开始采集，会漏掉块 2 到 10,877,917 的约 1,088 万块（1,240.95 万 0G 奖励及对应的社区税、佣金）。
+- 主网的 `StakingActivationTime`（2025-05-07）早于主网块 1（2025-08-23），所以从创世起奖励就经过 Staking 合约分配，早期区间走同一套逻辑。主网部署后核对过：块 1–1,093,000 里 4 个创世 validator 的佣金都和链上一致；块 1–1,345,000 的奖励合计和"块 1 为 0、之后每块 1,140,794,586 gwei"逐 gwei 一致。
+- 默认起点已改为 1。CL 基准值：起点为 1 时是 0；起点在 2 和激活块之间时没有基准值（这种起点不支持对账）。逐块游标还没到激活块时，共识层查不到数据，对账跳过；到了之后，就对从块 1 起的全部数据对账。
+
+**共识层接口把 `/blocks/0/` 当成链头。** 主网刚部署时起点是 1，旧代码去查块 0 作为基准值，拿到的是链头的累计值（106,325,329,469,393,509 gwei），存进了 `STAKING_BLOCK_REWARD_CL_BASE`。逐块游标到达 10,877,918 后，对账就会对不上。已在到达前把这个值手工改成 0（对账每次都从库里读，不用重启）。代码现在从不查块 0，并且检查共识层返回的块号必须等于请求的块号。
+
+### 早期实现改费率不发事件（2026-11-19，主网严格模式停住后发现）
+
+主网从块 1 回灌时，逐块采集在块 8,276,000 停住：佣金检查点发现 `0x33f5…225f` 不一致，按 10% 算了 0.1014 0G，链上只计提了 0.000507 0G（0.05%）。原因：
+- 它在 8,192,910 创建时费率是 500。块 8,284,294 里，`0xc77d…` 直接调用 `setCommissionRate(uint32)`（selector `0x2d54da73`）改成 100000，交易成功，但**没有任何日志**。当时的实现改费率不发事件，`CommissionRateChanged` 是后来的版本才加的。
+- 它的第一条 `CommissionRateChanged` 在 14,682,377（旧值 100000）。模型原来只靠事件推算费率，在第一条事件之前用事件里的旧值，于是把 8,272,755 那一块按 10% 算了。
+
+修正：费率改为从链上状态读取（`StakingCommission.trackRate`），不再依赖事件。每轮读一次每个出块 validator 在本轮最后一块的 `commissionRate()`，和上次读到的值比较；不同就二分查找变更所在的块。块 b 的变更是交易，对块 b 自己的奖励就已生效，读块 b 的状态正好得到这个值。费率在一轮之内变了又变回来的情况会漏掉，由佣金检查点兜底。
+
+主网恢复：发布新代码后，清空区块奖励相关的表和游标，从块 1 重新采集。事件、份额、validator 表不用动。
+
+### 外部注入奖励与不发事件的佣金提取（2026-11-19，主网严格模式第二次停住）
+
+逐块采集在块 9,977,000 停住：佣金检查点发现 `0x6bd0…5896` 不一致。逐块佣金本身是对的（6 次出块，每块的链上增量都和记录一致），原因在两笔交易：
+- **外部注入奖励：** 块 9,971,416，owner 调用一个可以付款的函数（selector `0x6f4a2cd0`），附带 0.5222 0G。合约按奖励分配，并发出 `DistributeRewards(tax, rewards, commission)`：社区税 0.05222、委托人奖励 0.418、佣金 0.05222。这是普通交易发出的日志，`eth_getLogs` 能取到。每块的奖励分配是系统调用，它的 `DistributeRewards` 取不到（这一点不变）。
+- **不发事件的佣金提取：** 块 9,972,383，owner 调用 `withdrawCommission(address)`（`0x16c58d04`）提走全部 0.56938 0G，只有 `PushWithdrawEntry`，没有 `WithdrawCommission`。
+
+检查点原来只把出块佣金算作预期计提、只把 `WithdrawCommission` 算作提取，两笔都漏了。主网全链扫描结果：
+- 普通交易触发的 `DistributeRewards`：26 次，12 个 validator，从块 5,536,977 到 48,612,878，佣金合计 0.4973 0G。现在的实现也还能注入；
+- 没有事件的提取：只有 9,972,383 这一次。`WithdrawCommission` 从 10,135,795 才开始出现。
+
+修正：
+- 采集 `DistributeRewards`（新事件类型 26，`/events` 类型名 `distribute_rewards`，`extra` 里是税、委托人奖励、佣金）；佣金检查点把其中的佣金算进预期计提；新公式下，注入奖励的块也重新判断一次达标（rewards 增加了）。
+- 采集 `PushWithdrawEntry`，但不入库。同一笔交易里没有 `Undelegate` / `WithdrawCommission` / `WithdrawTipFee` / 退出时，按交易调用的函数补出佣金或小费提取（`extra.inferred`），金额取 `PushWithdrawEntry` 里的值。无法解释的，严格模式下停住事件同步。
+- 已同步过的库，首次启动时回填这两类日志（KV `STAKING_LEGACY_EVENTS`）。演练库回填出 26 次注入、1 次推断提取，和全链扫描一致。
+- 统计口径不变：`/validator/rewards`、`/community/tax` 只统计出块奖励，外部注入的部分在 `/events` 里单独查。`/fees` 基于链上佣金余额加提取记录，推断出的提取也计算在内。
+
+演练：9,960,000–9,979,999（停住的窗口）155 个检查点窗口全部 ok；48,600,000–48,619,999（严格模式，含 48,612,878 的注入）CL 逐 gwei 一致，318 个窗口全部 ok。
+
+### 社区池地址的历史（2026-11-19）
+
+一份基金会地址 `0x711b…2522` 的收入报告里有一项"社区税"，这才发现社区池换过地址：Staking 合约的 `communityPoolAddress()` 在主网块 6,587,819 及之前是 `0x711b…2522`，6,587,820 起是 `0x51e0…04c7`。`setCommunityPoolAddress` 不发事件。原来 `/community/tax` 的税额是对的，但只返回当前的社区池，看起来像全部社区税都进了 `0x51e0`。
+
+- **记录：** 逐块采集每轮读一次本轮末块的 `communityPoolAddress()`，和已知的最后一个不同就二分到块，结果存 KV `STAKING_COMMUNITY_POOLS`（`pools: [{address, fromBlock}]`、`checkedTo`），和游标在同一个事务里写。块 b 的税付给 b 结束时的社区池（奖励分配在交易之后）。第一次运行从 `startBlock` 读起，已部署的库下一轮就会补齐全部历史。严格模式下读不到历史状态就等待；非严格模式退回只读最新块，在那里发现的变更标 `approx`。同一段里改过去又改回来的变更发现不了，和佣金费率一样。
+- **接口：** `/community/tax` 新增 `communityPools`，每段带 `fromBlock`、`toBlock`（当前社区池为 null）和这段收到的税，累计和时间段各一份；`validator` 参数照样生效。分段以块号为界：一秒有好几块，所以先把块范围换成时间范围，用日汇总表加两端零头的老办法算，再把边界那一秒里不属于这段的块减掉。
+- **report：** 新增一项 `community pool history`：历史从 `startBlock` 记起、跟到游标，没有近似的变更。
+- **不统计的部分：** 撤销委托到期付款失败（收款地址拒收）时，validator 合约把这笔钱转给社区池（`ValidatorContract.sol` `_processFailedWithdrawStack`）。这是系统调用，没有交易，日志也取不到，不在 `/community/tax` 里。
+- **演练：** 6,587,000–6,588,999 二分出切换块 6,587,820；两段的累计、时间段、`validator` 过滤都和逐块表求和逐 wei 一致；人为把切换点放在和前一块同一秒的 6,587,005，两段也都对。
 
 ### 已定事项（2026-11-09）
 
 | 事项 | 结论 |
 |---|---|
 | 前端兼容 | 前端改成调新接口，后端不做 Xangle 兼容层 |
-| 主网区块奖励回灌 | 全部回灌，`blockRewards.startBlock` 用默认值 10,877,918 |
+| 主网区块奖励回灌 | 全部回灌，从块 1 开始（2026-11-19 更正，原为 10,877,918） |
 | 升级 validator 实现的块号 | 不再需要合约团队提供，同步时从 beacon 的 `Upgraded` 日志探测（见"二期 B 实现与验证"第 3 点）。主网的达标公式在块 37,026,750 切换 |
 | 归档节点 | 待定 |
 | Xangle 服务下线时间 | 待定 |
