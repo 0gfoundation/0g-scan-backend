@@ -261,8 +261,9 @@ export async function otherFoundationAddresses(transaction?: Transaction): Promi
     return row?.value ? JSON.parse(row.value) : [];
 }
 
-export async function getBlockRewardCursor(): Promise<number> {
-    return (await KV.getNumber(KEY_CURSOR)) ?? blockRewardOption().startBlock - 1;
+export async function getBlockRewardCursor(transaction?: Transaction): Promise<number> {
+    const row = await KV.findByPk(KEY_CURSOR, {raw: true, transaction});
+    return row?.value ? parseInt(row.value) : blockRewardOption().startBlock - 1;
 }
 
 /** rate-limit rejections are retried inside postBatch; this retries the rest (dropped connections, a lagging node) */
