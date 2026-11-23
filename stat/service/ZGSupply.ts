@@ -3,7 +3,7 @@ import {sumValidatorBalanceBigInt, ValidatorResponse} from "../model/ZG";
 import {parseEther} from "ethers/lib/utils";
 import {SupplyInfo} from "js-conflux-sdk/dist/types/rpc/types/formatter";
 import {ConfigInstance} from "../config/StatConfig";
-import {TOKEN_RELEASE_SCHEDULE} from "./TokenReleaseSchedule";
+import {INFLATION_TIMING_RESERVE, TOKEN_RELEASE_SCHEDULE} from "./TokenReleaseSchedule";
 import {Conflux} from "js-conflux-sdk";
 
 /*
@@ -112,24 +112,19 @@ import {Conflux} from "js-conflux-sdk";
 // }
 
 export interface ScheduleRow {
-	/** The schedule's own Timeline label: "TGE", then "1" upwards. Carried for reference. */
+	/** The schedule's own month label, e.g. "Nov-26". Carried for reference. */
 	timeline?: string;
-	/** The date this unlock lands, YYYY-MM-DD. */
+	/** The date this row takes effect, YYYY-MM-DD, at 00:00 UTC. */
 	date: string;
-	/**
-	 * Cumulative token allocation unlocked by this date, in whole 0G -- the vesting
-	 * columns of the finance schedule, without its staking reward estimate. Rewards are
-	 * measured rather than estimated, so the estimate is left out and `sumBlockReward`
-	 * stands in its place.
-	 */
-	tokenAllocation: string;
+	/** Amount still locked from this date, in whole 0G, as finance's schedule states it. */
+	locked: string;
 }
 
 /**
- * The release schedule row in force: the latest unlock that has already happened.
+ * The release schedule row in force: the latest one whose date has arrived.
  *
  * Past the final row the last one holds, so the table running out needs no special case --
- * allocation is fully unlocked by then and only issuance still moves.
+ * nothing is locked by then and only the reserve still comes off.
  */
 export function releaseSchedule(now = new Date()): {row?: ScheduleRow, message?: string} {
 	// Dates are YYYY-MM-DD, so they sort and compare as plain strings. UTC, to keep the
@@ -167,22 +162,23 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 	// took circulating down 73% in October while the chain itself was fine.
 	const issued = ZGGenesisSupply + blockReward;
 
-	//     circulating = token allocation unlocked so far + everything minted so far
+	//     circulating = total - (locked this month + inflation timing reserve)
 	//
-	// Two halves, each from whoever actually knows it. Finance owns the allocation
-	// schedule -- vesting, treasury and unlock terms are written down there and nowhere
-	// else -- and the chain owns issuance, which it reports to the block. The schedule
-	// carries an estimate of issuance too, in its staking rewards column; that column is
-	// deliberately not used, since the real figure is right here.
+	// Finance's definition, written the way they state it. The total is the chain's and
+	// the locked amount is finance's -- vesting, treasury and unlock terms are written down
+	// in their schedule and nowhere else -- so each half comes from whoever knows it.
+	// Taken from the same `issued` as totalIssued, so total - circulating is exactly the
+	// schedule's figure within one snapshot, which is how finance checks it.
 	//
-	// Not `total - sumContracts`, which is what this did before. That subtracted a list of
-	// nine contract addresses hard-coded in this file, last updated whenever it was
-	// written; against the September 2026 schedule it read 276M high, because addresses
-	// added since were never added to the list. The schedule already accounts for every
-	// locked allocation, so there is nothing left for that list to do.
+	// Not `total - sumContracts`, which this was once. That subtracted a list of nine
+	// contract addresses hard-coded in this file and never updated; against the September
+	// 2026 schedule it read 276M high. The schedule accounts for every locked allocation,
+	// so there is nothing left for that list to do.
 	const {row: schedule, message: scheduleMessage} = releaseSchedule();
+	const scheduleLocked = schedule && BigInt(parseEther(schedule.locked));
+	const scheduleReserve = BigInt(parseEther(INFLATION_TIMING_RESERVE));
 	const remain = schedule
-		? BigInt(parseEther(schedule.tokenAllocation)) + blockReward
+		? issued - scheduleLocked - scheduleReserve
 		: undefined;
 
 	return {
@@ -198,7 +194,8 @@ export async function calculateEvmPosSupply(balanceOfZero: bigint): Promise<Supp
 		totalIssued: issued,
 		scheduleTimeline: schedule?.timeline,
 		scheduleDate: schedule?.date,
-		scheduleTokenAllocation: schedule && BigInt(parseEther(schedule.tokenAllocation)),
+		scheduleLocked,
+		scheduleReserve: schedule && scheduleReserve,
 		withdrawalMessage,
 		validatorMessage,
 		scheduleMessage,
